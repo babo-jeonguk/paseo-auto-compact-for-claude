@@ -1,9 +1,17 @@
 {
   "name": "paseo-auto-compact-for-claude",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
   "description": "Schedule compaction of large idle Claude conversations in Paseo",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/babo-jeonguk/paseo-auto-compact-for-claude.git"
+  },
+  "homepage": "https://github.com/babo-jeonguk/paseo-auto-compact-for-claude#readme",
+  "bugs": {
+    "url": "https://github.com/babo-jeonguk/paseo-auto-compact-for-claude/issues"
+  },
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test --test-isolation=none server/*.test.ts tests/*.test.mjs",
