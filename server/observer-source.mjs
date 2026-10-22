@@ -94,9 +94,15 @@ export function registerObserver(on, config) {
   let heartbeat;
   let requestStartedAt = null;
   let ordinaryTurnId = null;
+  // A later main step proves that an SDK follow-up was folded into this turn.
+  // Keep that evidence ephemeral until a successful completion commits it.
+  let pendingCurrentTurnInputs = 0;
+  let absorbedCurrentTurnInputs = 0;
   const supersede = () => {
     if (state.compact?.status === 'running') state.compact.status = 'unknown';
   };
+  const isActiveOrdinaryTurn = e => ordinaryTurnId !== null && e.turnId === ordinaryTurnId &&
+    state.activeTurns.includes(e.turnId);
   on('session.start', async ($, e, next) => {
     state.sessionId = await $.session.id();
     await save($);
@@ -117,10 +123,14 @@ export function registerObserver(on, config) {
       state.revision++;
       // These engine deliveries already enter the running main turn. A user's
       // prompt can carry the same turnId while still waiting for its next turn.
-      const delivered = ordinaryTurnId !== null && e.turnId === ordinaryTurnId &&
-        state.activeTurns.includes(e.turnId) && e.wait !== true &&
+      const activeOrdinaryTurn = isActiveOrdinaryTurn(e);
+      const delivered = activeOrdinaryTurn && e.wait !== true &&
         ['task-notification', 'peer', 'peer-send-message'].includes(e.origin?.kind);
-      if (!e.text.trim().startsWith('/') && !delivered) state.pendingInputs++;
+      if (!e.text.trim().startsWith('/') && !delivered) {
+        state.pendingInputs++;
+        if (activeOrdinaryTurn && e.origin?.kind === 'sdk')
+          pendingCurrentTurnInputs++;
+      }
       state.cacheRequest = null;
       state.ordinaryEndedAt = null;
       state.ordinaryRevision = null;
@@ -133,6 +143,8 @@ export function registerObserver(on, config) {
     if (e.agentId === undefined && !/^\/compact(?:\s|$)/.test(e.text.trim())) {
       ordinaryTurnId = e.turnId;
       requestStartedAt = null;
+      pendingCurrentTurnInputs = 0;
+      absorbedCurrentTurnInputs = 0;
       if (state.pendingInputs === 0) state.revision++;
       // Claude can batch several submitted inputs (including task notifications)
       // into one main turn. Child turns and /compact do not consume that batch.
@@ -144,6 +156,10 @@ export function registerObserver(on, config) {
   });
   on('turn.step', async function* ($, e, next) {
     if (!state.activeTurns.includes(e.turnId)) state.activeTurns.push(e.turnId);
+    if (e.agentId === undefined && e.turnId === ordinaryTurnId) {
+      absorbedCurrentTurnInputs += pendingCurrentTurnInputs;
+      pendingCurrentTurnInputs = 0;
+    }
     const startedAt = await $.clock.now();
     const policy = e.agentId === undefined ? await cachePolicy($) : null;
     if (e.agentId === undefined) {
@@ -161,13 +177,19 @@ export function registerObserver(on, config) {
   on('turn.complete', async ($, e, next) => {
     state.activeTurns = state.activeTurns.filter(id => id !== e.turnId);
     if (e.agentId === undefined) {
+      const ordinaryCompletion = e.turnId === ordinaryTurnId;
       if (e.isAborted || e.reason !== 'answer') state.cacheRequest = null;
       // Without a model-request observation, completion is not a cache clock.
       if (requestStartedAt === null) state.cacheRequest = null;
-      if (e.turnId === ordinaryTurnId && !e.isAborted && e.reason === 'answer') {
+      if (ordinaryCompletion && !e.isAborted && e.reason === 'answer') {
+        state.pendingInputs = Math.max(0, state.pendingInputs - absorbedCurrentTurnInputs);
         state.ordinaryEndedAt = await $.clock.now();
         state.ordinaryRevision = state.revision;
         ordinaryTurnId = null;
+      }
+      if (ordinaryCompletion) {
+        pendingCurrentTurnInputs = 0;
+        absorbedCurrentTurnInputs = 0;
       }
     }
     await save($);

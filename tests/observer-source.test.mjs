@@ -118,7 +118,24 @@ test('notifications and peer reports delivered into the active main turn are not
   }
 });
 
-test('delivered reports do not consume a real user prompt queued over the same main turn', async () => {
+test('a user prompt absorbed into a later step of the active main turn is no longer queued', async () => {
+  const f = fixture(); await f.start();
+  await f.event('prompt.submit', { text: 'initial input', origin: { kind: 'sdk' } });
+  await f.event('turn.start', { text: 'initial input', turnId: 'main' });
+  await f.step('main');
+  await f.event('prompt.submit', {
+    text: 'follow-up handled by this turn', origin: { kind: 'sdk' }, turnId: 'main', wait: true,
+  });
+  assert.equal(f.ledger().pendingInputs, 1);
+  await f.step('main');
+  await f.event('turn.complete', { turnId: 'main', reason: 'answer', isAborted: false });
+  assert.equal(f.ledger().pendingInputs, 0);
+  assert.deepEqual(f.ledger().activeTurns, []);
+  f.request();
+  assert.equal((await f.event('classic.PreCompact', { trigger: 'manual' })).block, undefined);
+});
+
+test('a later main step absorbs SDK user input while delivered reports do not change its count', async () => {
   for (const wait of [false, true]) {
     const f = fixture(); await f.start();
     await f.event('turn.start', { text: 'initial input', turnId: 'main' });
@@ -126,13 +143,25 @@ test('delivered reports do not consume a real user prompt queued over the same m
     await f.event('prompt.submit', { text: 'completed work report', origin: { kind: 'peer' }, turnId: 'main', wait: false });
     assert.equal(f.ledger().pendingInputs, 1, 'only the user request is still queued');
     await f.step('main');
+    assert.equal(f.ledger().pendingInputs, 1, 'absorption is committed only by successful completion');
     await f.event('turn.complete', { turnId: 'main', reason: 'answer', isAborted: false });
-    assert.equal(f.ledger().pendingInputs, 1);
-    f.request();
-    assert((await f.event('classic.PreCompact', { trigger: 'manual' })).block);
-    await f.event('turn.start', { text: 'next user request', turnId: 'next-main' });
     assert.equal(f.ledger().pendingInputs, 0);
+    f.request();
+    assert.equal((await f.event('classic.PreCompact', { trigger: 'manual' })).block, undefined);
   }
+});
+
+test('SDK input submitted after the final main step remains queued for the next turn', async () => {
+  const f = fixture(); await f.start();
+  await f.event('turn.start', { text: 'initial input', turnId: 'main' });
+  await f.step('main');
+  await f.event('prompt.submit', {
+    text: 'next user request', origin: { kind: 'sdk' }, turnId: 'main', wait: true,
+  });
+  await f.event('turn.complete', { turnId: 'main', reason: 'answer', isAborted: false });
+  assert.equal(f.ledger().pendingInputs, 1);
+  f.request();
+  assert((await f.event('classic.PreCompact', { trigger: 'manual' })).block);
 });
 
 test('unbound, foreign, waiting and unknown-origin submissions remain pending until a main turn starts', async () => {
