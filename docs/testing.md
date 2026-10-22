@@ -34,6 +34,7 @@ The automatic timer test first verifies real **55- and 50-minute reservation val
 | Skip/Undo | Original due time restored; stale undo rejected after new input |
 | New input | Busy state suppresses old work; completed input earns a new reservation |
 | Background agents | Two completion notifications can share one main turn without leaving phantom pending input |
+| In-turn delivery | A background command completes during the main turn; the native transcript confirms absorption and automatic scheduling remains available |
 | Automatic compact | Real timer, native completion and same session; no repeated idle compaction |
 | Manual compact | Explicit Compact now completes in the same session |
 | Input overlap | Compaction is cancelled or remains unconfirmed; the user's own response remains on the timeline |
@@ -44,7 +45,7 @@ The automatic timer test first verifies real **55- and 50-minute reservation val
 | Downtime | An already-due reservation expires when the plugin returns |
 | Daemon recovery | OFF persists; reopening the same conversation supports a fresh reservation |
 
-Some rows are grouped into one scenario. The fast suite separately covers clock jumps/sleep, late delivery, permissions, model changes, corrupted state, UI status/countdown formatting and negative dispatch cases. A negative runner test verifies that Linux cannot be reported as a Windows execution and unrun scenarios cannot be counted as passed.
+Some rows are grouped into one scenario. The fast suite separately covers clock jumps/sleep, late delivery, permissions, model changes, corrupted state, UI status/countdown formatting and negative dispatch cases. It also distinguishes reports delivered into a main turn from queued SDK/user prompts, foreign or completed turns, explicit waiting, and aborted/error turns. A negative runner test verifies that Linux cannot be reported as a Windows execution and unrun scenarios cannot be counted as passed.
 
 This does not measure Anthropic's real cache lifetime, billing savings or summary quality. It does not open a browser or verify Electron/mobile UI rendering. Passing controlled input-overlap cases does not prove every possible race in Paseo's public send API is eliminated.
 

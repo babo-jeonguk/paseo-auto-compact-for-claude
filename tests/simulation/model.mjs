@@ -4,7 +4,7 @@ import { once } from 'node:events';
 // Only the external model is simulated. Paseo, Claude, the installed plugin,
 // native transcripts and the automatic timer remain real.
 export async function startModel() {
-  let ttl = '1h', nextGate, nextAgentBatch = false, count = 0;
+  let ttl = '1h', nextGate, nextAgentBatch = false, notificationStep = 0, count = 0;
   const held = new Set();
   const requests = [];
   const server = createServer(async (req, res) => {
@@ -18,6 +18,8 @@ export async function startModel() {
       const body = JSON.parse(text);
       const agentBatch = nextAgentBatch && body.tools?.some(tool => tool.name === 'Agent');
       if (agentBatch) nextAgentBatch = false;
+      const shellTool = body.tools?.find(tool => tool.name === 'Bash' || tool.name === 'PowerShell');
+      const deliveredNotificationStep = notificationStep && shellTool ? notificationStep-- : 0;
       const id = ++count, mode = ttl;
       // Keep test diagnostics metadata-only, even though all inputs are synthetic.
       const entry = { id, ttl: mode, answered: false, cancelled: false };
@@ -58,6 +60,19 @@ export async function startModel() {
         events.splice(1, 3, ...blocks);
         events.find(event => event.type === 'message_delta').delta.stop_reason = 'tool_use';
       }
+      if (deliveredNotificationStep) {
+        const background = deliveredNotificationStep === 2;
+        const input = { command: `node -e "setTimeout(() => {}, ${background ? 1500 : 4000})"`,
+          description: background ? 'Synthetic background notification' : 'Wait for synthetic notification',
+          ...(background ? { run_in_background: true } : {}) };
+        events.splice(1, 3,
+          { type: 'content_block_start', index: 0, content_block: {
+            type: 'tool_use', id: `simulation_notification_${id}`, name: shellTool.name, input: {},
+          } },
+          { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: JSON.stringify(input) } },
+          { type: 'content_block_stop', index: 0 });
+        events.find(event => event.type === 'message_delta').delta.stop_reason = 'tool_use';
+      }
       res.setHeader('Content-Type', 'text/event-stream');
       res.end(events.map(e => `event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`).join(''));
     } catch (error) { res.writeHead(500).end(String(error)); }
@@ -68,6 +83,7 @@ export async function startModel() {
     get count() { return count; },
     setTtl(value) { ttl = value; },
     notifyAgentsNext() { nextAgentBatch = true; },
+    notifyDuringTurnNext() { notificationStep = 2; },
     holdNext() {
       if (nextGate) throw new Error('A request gate is already armed');
       let arrived, release;

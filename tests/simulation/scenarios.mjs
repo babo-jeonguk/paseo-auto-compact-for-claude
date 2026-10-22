@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import { waitFor } from './fixture.mjs';
 
 const scheduled = (f, id, source) => waitFor(async () => {
@@ -45,6 +46,30 @@ export const scenarios = [
       assert.notEqual(row.status, 'busy');
       assert.notEqual(row.busyReason, 'input');
       assert.equal(row.inputIdleSince, null);
+      await f.rpc('toggle', { agentId: id, enabled: false });
+    },
+  },
+  {
+    name: 'a background notification absorbed into the active turn leaves no pending input and can schedule',
+    async run({ fixture: f, model }) {
+      const id = await f.agent();
+      await f.client.setAgentMode(id, 'bypassPermissions');
+      model.notifyDuringTurnNext();
+      await f.send(id, 'MID_TURN_NOTIFICATION: run the synthetic waits and then reply without other tools.');
+      const ledger = await waitFor(async () => {
+        const state = await f.ledger(id), agent = await f.refresh(id);
+        return state.revision >= 2 && state.ordinaryEndedAt && state.transcriptPath &&
+          !state.activeTurns.length && agent.status === 'idle' && !agent.activeTurn ? state : null;
+      }, 'background notification handled within the main turn');
+      const transcript = (await readFile(ledger.transcriptPath, 'utf8')).split('\n').flatMap(line => {
+        try { return [JSON.parse(line)]; } catch { return []; }
+      });
+      assert(transcript.some(row => row.type === 'queue-operation' && row.reason === 'absorbed_mid_turn'),
+        'The notification must actually be absorbed into this turn, rather than handled by a fresh turn');
+      assert.equal(ledger.pendingInputs, 0, 'an already delivered notification must not remain queued');
+      const row = await scheduled(f, id);
+      assert.equal(row.inputIdleSince, null);
+      assert.notEqual(row.busyReason, 'input');
       await f.rpc('toggle', { agentId: id, enabled: false });
     },
   },

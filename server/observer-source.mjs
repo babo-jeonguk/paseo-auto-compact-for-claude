@@ -61,7 +61,12 @@ export function registerObserver(on, config) {
   on('prompt.submit', async ($, e, next) => {
     if (!/^\/compact(?:\s|$)/.test(e.text.trim())) {
       state.revision++;
-      if (!e.text.trim().startsWith('/')) state.pendingInputs++;
+      // These engine deliveries already enter the running main turn. A user's
+      // prompt can carry the same turnId while still waiting for its next turn.
+      const delivered = ordinaryTurnId !== null && e.turnId === ordinaryTurnId &&
+        state.activeTurns.includes(e.turnId) && e.wait !== true &&
+        ['task-notification', 'peer', 'peer-send-message'].includes(e.origin?.kind);
+      if (!e.text.trim().startsWith('/') && !delivered) state.pendingInputs++;
       state.cacheRequest = null;
       state.ordinaryEndedAt = null;
       state.ordinaryRevision = null;

@@ -87,6 +87,88 @@ test('child and compact turns cannot consume input waiting for the next main tur
   assert.equal(f.ledger().pendingInputs, 1);
 });
 
+test('notifications and peer reports delivered into the active main turn are not queued input', async () => {
+  for (const kind of ['task-notification', 'peer', 'peer-send-message']) {
+    const f = fixture(); await f.start();
+    await f.event('prompt.submit', { text: 'initial input', origin: { kind: 'sdk' } });
+    await f.event('turn.start', { text: 'initial input', turnId: 'main' });
+    await f.step('main');
+    const revision = f.ledger().revision;
+    await f.event('prompt.submit', { text: 'completed work report', origin: { kind }, turnId: 'main', wait: false });
+    assert.equal(f.ledger().pendingInputs, 0, `${kind} is already delivered to this turn`);
+    assert.equal(f.ledger().revision, revision + 1);
+    assert.equal(f.ledger().cacheRequest, null, 'delivered reports still invalidate prior cache evidence');
+    await f.step('main');
+    await f.event('turn.complete', { turnId: 'main', reason: 'answer', isAborted: false });
+    assert.equal(f.ledger().pendingInputs, 0);
+    assert.deepEqual(f.ledger().activeTurns, []);
+    assert.equal(f.ledger().ordinaryRevision, f.ledger().revision);
+    f.request();
+    assert.equal((await f.event('classic.PreCompact', { trigger: 'manual' })).block, undefined);
+  }
+});
+
+test('delivered reports do not consume a real user prompt queued over the same main turn', async () => {
+  for (const wait of [false, true]) {
+    const f = fixture(); await f.start();
+    await f.event('turn.start', { text: 'initial input', turnId: 'main' });
+    await f.event('prompt.submit', { text: 'next user request', origin: { kind: 'sdk' }, turnId: 'main', wait });
+    await f.event('prompt.submit', { text: 'completed work report', origin: { kind: 'peer' }, turnId: 'main', wait: false });
+    assert.equal(f.ledger().pendingInputs, 1, 'only the user request is still queued');
+    await f.step('main');
+    await f.event('turn.complete', { turnId: 'main', reason: 'answer', isAborted: false });
+    assert.equal(f.ledger().pendingInputs, 1);
+    f.request();
+    assert((await f.event('classic.PreCompact', { trigger: 'manual' })).block);
+    await f.event('turn.start', { text: 'next user request', turnId: 'next-main' });
+    assert.equal(f.ledger().pendingInputs, 0);
+  }
+});
+
+test('unbound, foreign, waiting and unknown-origin submissions remain pending until a main turn starts', async () => {
+  for (const delivery of [
+    { origin: { kind: 'peer' } },
+    { origin: { kind: 'peer' }, turnId: 'other', wait: false },
+    { origin: { kind: 'peer' }, turnId: 'main', wait: true },
+    { origin: { kind: 'unclassified' }, turnId: 'main', wait: false },
+    { origin: { kind: 'plugin', name: 'synthetic' }, turnId: 'main', wait: false },
+  ]) {
+    const f = fixture(); await f.start();
+    await f.event('turn.start', { text: 'initial input', turnId: 'main' });
+    await f.event('prompt.submit', { text: 'queued input', ...delivery });
+    await f.step('main');
+    await f.event('turn.complete', { turnId: 'main', reason: 'answer', isAborted: false });
+    assert.equal(f.ledger().pendingInputs, 1);
+  }
+});
+
+test('a child or finished main turn cannot accept reports on behalf of the active main turn', async () => {
+  const f = fixture(); await f.start();
+  await f.event('turn.start', { text: 'initial input', turnId: 'main' });
+  await f.event('turn.start', { text: 'child input', turnId: 'child', agentId: 'agent' });
+  await f.event('prompt.submit', { text: 'child report', origin: { kind: 'peer' }, turnId: 'child', wait: false });
+  assert.equal(f.ledger().pendingInputs, 1);
+  await f.event('turn.complete', { turnId: 'child', agentId: 'agent', reason: 'answer' });
+  await f.step('main');
+  await f.event('turn.complete', { turnId: 'main', reason: 'answer', isAborted: false });
+  await f.event('prompt.submit', { text: 'late report', origin: { kind: 'peer' }, turnId: 'main', wait: false });
+  assert.equal(f.ledger().pendingInputs, 2);
+});
+
+test('aborted or failed turns cannot discard queued input or publish cache evidence after a delivered report', async () => {
+  for (const reason of ['aborted', 'error']) {
+    const f = fixture(); await f.start();
+    await f.event('turn.start', { text: 'initial input', turnId: 'main' });
+    await f.event('prompt.submit', { text: 'completed work report', origin: { kind: 'peer' }, turnId: 'main', wait: false });
+    await f.event('prompt.submit', { text: 'next user request', origin: { kind: 'sdk' }, turnId: 'main', wait: true });
+    await f.step('main');
+    await f.event('turn.complete', { turnId: 'main', reason, isAborted: reason === 'aborted' });
+    assert.equal(f.ledger().pendingInputs, 1);
+    assert.equal(f.ledger().cacheRequest, null);
+    assert.equal(f.ledger().ordinaryEndedAt, null);
+  }
+});
+
 test('observer records effective TTL policy with force/env/settings precedence and no invented usage fields', async () => {
   for (const [env, settings, expected] of [
     [{}, {}, { ttl: null, source: 'default' }],

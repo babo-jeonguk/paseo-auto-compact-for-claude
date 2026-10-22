@@ -24,10 +24,11 @@ const LedgerSchema = z.object({
 type Ledger = z.infer<typeof LedgerSchema> & { cache: Awaited<ReturnType<ReturnType<typeof createCacheReader>>>;
   cacheDeadline: number | null };
 const ManifestSchema = z.object({ launchId: z.string().uuid(), build: z.string() });
-// The batch-counting fix keeps the same ledger and reservation-guard contract.
+// The input-counting fixes keep the same ledger and reservation-guard contract.
 // Keep already-open sessions observable while they adopt the fix on reopen.
 const compatibleBuilds = new Set([observerAsset.version,
-  'af6c6639f8c3058a73d5e982e308b69f5572fc6439a0c8fea61c1ca629ef4239']);
+  'af6c6639f8c3058a73d5e982e308b69f5572fc6439a0c8fea61c1ca629ef4239',
+  '8a6c0217779bc4f83c7029c8170c35da8d2ed8028622019f4a09808491dff90f']);
 
 export function createObserver(options: { home?: string; now?: () => number } = {}) {
   const base = join(options.home ?? process.env.PASEO_HOME ?? join(homedir(), '.paseo'),
