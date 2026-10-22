@@ -1,0 +1,52 @@
+name: Check
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run check
+  simulation:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+          - os: windows-latest
+            platform: win32
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            tests/simulation/package-lock.json
+      - run: npm ci --ignore-scripts
+      - run: npm ci --prefix tests/simulation --ignore-scripts --no-audit --no-fund
+      - run: npm run test:simulation -- --expect-platform ${{ matrix.platform }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: simulation-${{ matrix.platform }}
+          path: test-results/
+          if-no-files-found: error

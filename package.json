@@ -1,0 +1,46 @@
+{
+  "name": "paseo-auto-compact-for-claude",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Schedule compaction of large idle Claude conversations in Paseo",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test --test-isolation=none server/*.test.ts tests/*.test.mjs",
+    "check": "npm run check:observer && npm run typecheck && npm test",
+    "prepack": "npm run build:observer && npm run check",
+    "build:observer": "node scripts/build-observer.mjs",
+    "check:observer": "node scripts/build-observer.mjs --check",
+    "test:simulation": "node --no-maglev tests/simulation/run.mjs",
+    "test:update": "npm run check && npm run test:simulation --"
+  },
+  "devDependencies": {
+    "@getpaseo/client": "0.12.0",
+    "@getpaseo/plugin": "0.12.0",
+    "@getpaseo/protocol": "0.12.0",
+    "@tanstack/react-query": "^5.90.11",
+    "@types/node": "^22.20.4",
+    "@types/react": "~19.2.0",
+    "react": "19.1.0",
+    "react-native": "0.81.5",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.3",
+    "zod": "^4.4.3"
+  },
+  "files": [
+    "paseo-plugin.json",
+    "assets",
+    "index.client.tsx",
+    "index.server.ts",
+    "client",
+    "server",
+    "shared",
+    "scripts",
+    "README.md",
+    "OVERVIEW.md",
+    "docs",
+    "THIRD_PARTY_NOTICES.md",
+    "!**/*.test.ts",
+    "!tests"
+  ]
+}

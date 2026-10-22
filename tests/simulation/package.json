@@ -1,0 +1,9 @@
+{
+  "name": "auto-compact-simulation-tools",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@anthropic-ai/claude-code": "2.1.306",
+    "@getpaseo/cli": "0.12.0"
+  }
+}
