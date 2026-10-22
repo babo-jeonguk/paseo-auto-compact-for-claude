@@ -71,11 +71,19 @@ export default function contribute(server: PluginServerContext) {
     server.on("agent.created", (_event, { paseo }) => host.attach(paseo)),
     server.before("agent.session_open", async ({ request }, { paseo }) => {
       host.attach(paseo);
-      const { config } = await paseo.config.get();
-      if (request.purpose === "interactive") await scheduler.invalidate(request.agentId);
+      // Plugin failures must not keep a conversation from opening; without an
+      // observer the controls ask the user to reopen the session.
+      if (request.purpose === "interactive")
+        await scheduler.invalidate(request.agentId).catch(report);
       // Add a Claude Mod to this session's environment; never rewrite provider
       // commands or configure, discover, adopt or share another plugin's runtime.
-      return observer.prepareSession(request, claudeProvider(config.providers, request.provider));
+      try {
+        const { config } = await paseo.config.get();
+        return await observer.prepareSession(request, claudeProvider(config.providers, request.provider));
+      } catch (error) {
+        report(error);
+        return request;
+      }
     }),
     settings.subscribe(() => {
       void scheduler.tick(host.connected()).catch(report);
