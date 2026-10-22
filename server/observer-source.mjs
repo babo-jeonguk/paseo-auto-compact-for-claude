@@ -75,9 +75,11 @@ export function registerObserver(on, config) {
       ordinaryTurnId = e.turnId;
       requestStartedAt = null;
       if (state.pendingInputs === 0) state.revision++;
+      // Claude can batch several submitted inputs (including task notifications)
+      // into one main turn. Child turns and /compact do not consume that batch.
+      state.pendingInputs = 0;
     }
     if (!state.activeTurns.includes(e.turnId)) state.activeTurns.push(e.turnId);
-    state.pendingInputs = Math.max(0, state.pendingInputs - 1);
     await save($);
     return next(e);
   });

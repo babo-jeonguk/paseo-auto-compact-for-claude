@@ -10,7 +10,7 @@ The default SDK-bundled executable may not support Mods. Select a compatible nat
 
 When an interactive Claude session opens, the plugin adds its observer Mod to that session's `CLAUDE_CODE_PLUGIN_DIRS`, preserving other plugin paths and provider environment values. It does not change the configured Claude command. Start or reopen the session after installing or updating the plugin; a running process cannot load a new observer retroactively. History-only sessions are unchanged.
 
-Paseo's public `send('/compact')` starts compaction. The observer records native activity and compaction completion in small local files. It neither launches Claude nor forwards its input/output.
+Paseo's public `send('/compact')` starts compaction. The observer records native activity and compaction completion in small local files. It neither launches Claude nor forwards its input/output. A main turn consumes the batch of inputs submitted before it starts, including combined background-task notifications. Child turns and compact commands do not consume pending main-session input.
 
 ## Conversation status
 

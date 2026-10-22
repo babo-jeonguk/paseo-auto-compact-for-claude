@@ -4,7 +4,7 @@ import { once } from 'node:events';
 // Only the external model is simulated. Paseo, Claude, the installed plugin,
 // native transcripts and the automatic timer remain real.
 export async function startModel() {
-  let ttl = '1h', nextGate, count = 0;
+  let ttl = '1h', nextGate, nextAgentBatch = false, count = 0;
   const held = new Set();
   const requests = [];
   const server = createServer(async (req, res) => {
@@ -16,6 +16,8 @@ export async function startModel() {
       }
       if (!req.url.startsWith('/v1/messages')) { res.writeHead(404).end(); return; }
       const body = JSON.parse(text);
+      const agentBatch = nextAgentBatch && body.tools?.some(tool => tool.name === 'Agent');
+      if (agentBatch) nextAgentBatch = false;
       const id = ++count, mode = ttl;
       // Keep test diagnostics metadata-only, even though all inputs are synthetic.
       const entry = { id, ttl: mode, answered: false, cancelled: false };
@@ -42,6 +44,20 @@ export async function startModel() {
         { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: 18 } },
         { type: 'message_stop' },
       ];
+      if (agentBatch) {
+        const blocks = [0, 1].flatMap(index => [
+          { type: 'content_block_start', index, content_block: {
+            type: 'tool_use', id: `simulation_agent_${id}_${index}`, name: 'Agent', input: {},
+          } },
+          { type: 'content_block_delta', index, delta: { type: 'input_json_delta', partial_json: JSON.stringify({
+            subagent_type: 'Explore', run_in_background: true, description: 'Synthetic activity check',
+            prompt: 'Reply briefly without tools or reading files.',
+          }) } },
+          { type: 'content_block_stop', index },
+        ]);
+        events.splice(1, 3, ...blocks);
+        events.find(event => event.type === 'message_delta').delta.stop_reason = 'tool_use';
+      }
       res.setHeader('Content-Type', 'text/event-stream');
       res.end(events.map(e => `event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`).join(''));
     } catch (error) { res.writeHead(500).end(String(error)); }
@@ -51,6 +67,7 @@ export async function startModel() {
     url: `http://127.0.0.1:${server.address().port}`, requests,
     get count() { return count; },
     setTtl(value) { ttl = value; },
+    notifyAgentsNext() { nextAgentBatch = true; },
     holdNext() {
       if (nextGate) throw new Error('A request gate is already armed');
       let arrived, release;

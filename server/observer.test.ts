@@ -30,7 +30,7 @@ async function fixture() {
   await save();
   const agent: Observation = { agentId: 'a', title: null, workspace: home, provider: 'claude',
     revision: new Date(time).toISOString(), tokens: 210_000, eligible: true, idle: true, sessionId: 'native-a' };
-  return { home, request, prepared, observer, agent, ledger, save, directory,
+  return { home, request, prepared, observer, agent, ledger, save, directory, parent, manifest,
     advance(ms: number) { time += ms; }, close: () => rm(home, { recursive: true, force: true }) };
 }
 
@@ -46,6 +46,20 @@ test('observer session preparation preserves provider environment and ignores hi
     assert.match((await f.observer.readiness(f.agent, 4_600_000))!, /exceeds/);
     f.advance(61_000);
     assert.match((await f.observer.readiness(f.agent))!, /unavailable/);
+  } finally { await f.close(); }
+});
+
+test('the compatible pre-fix observer stays readable during rollout; unknown builds stay rejected', async () => {
+  const f = await fixture();
+  try {
+    const manifestPath = join(f.parent, 'current.json');
+    await writeFile(manifestPath, JSON.stringify({ ...f.manifest,
+      build: 'af6c6639f8c3058a73d5e982e308b69f5572fc6439a0c8fea61c1ca629ef4239' }));
+    assert(await f.observer.read('a'));
+    f.ledger.pendingInputs = 1; await f.save();
+    await assert.rejects(f.observer.prepare(f.agent, false, 1_030_000), /still working/);
+    await writeFile(manifestPath, JSON.stringify({ ...f.manifest, build: 'unknown-build' }));
+    assert.equal(await f.observer.read('a'), null);
   } finally { await f.close(); }
 });
 

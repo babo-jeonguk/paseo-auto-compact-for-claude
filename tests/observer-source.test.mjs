@@ -22,7 +22,11 @@ function fixture(env = {}, settings = {}) {
       preparedAt: time, expiresAt: time + 30_000, ...overrides }));
   };
   const usage = { input_tokens: 100, cache_read_input_tokens: 100, cache_creation_input_tokens: 0 };
-  return { event, ledger, request, files,
+  const step = async (turnId = 'user-1') => {
+    const generator = hooks.get('turn.step')($, { turnId }, async function* () { return { usage }; });
+    while (!(await generator.next()).done) {}
+  };
+  return { event, step, ledger, request, files,
     advance(ms) { time += ms; },
     async start() { await event('session.start'); },
     async ordinary(reported = usage, responseDelay = 0) {
@@ -48,6 +52,39 @@ test('observer records native ordinary completion, request-time cache evidence a
   assert.equal(f.ledger().ordinaryRevision, 1);
   assert.deepEqual(f.ledger().activeTurns, []);
   assert(!f.files.get('/ledger').includes('ordinary input'));
+});
+
+test('one main turn consumes a batch of task notifications without leaving phantom pending input', async () => {
+  const f = fixture(); await f.start();
+  for (let i = 0; i < 2; i++)
+    await f.event('prompt.submit', { text: `task notification ${i}`, origin: { kind: 'task-notification' } });
+  await f.event('turn.start', { text: 'batched task notifications', turnId: 'notifications' });
+  await f.step('notifications');
+  await f.event('turn.complete', { turnId: 'notifications', isAborted: false, reason: 'answer' });
+  assert.equal(f.ledger().pendingInputs, 0);
+  assert.deepEqual(f.ledger().activeTurns, []);
+  assert.equal(f.ledger().ordinaryRevision, f.ledger().revision);
+  f.request();
+  assert.equal((await f.event('classic.PreCompact', { trigger: 'manual' })).block, undefined);
+});
+
+test('child and compact turns cannot consume input waiting for the next main turn', async () => {
+  const f = fixture(); await f.start(); await f.ordinary();
+  await f.event('prompt.submit', { text: 'new user input', origin: { kind: 'sdk' } });
+  await f.event('turn.start', { text: 'child work', turnId: 'child', agentId: 'child-1' });
+  assert.equal(f.ledger().pendingInputs, 1);
+  await f.event('turn.complete', { turnId: 'child', agentId: 'child-1', reason: 'answer' });
+  await f.event('turn.start', { text: '/compact', turnId: 'compact' });
+  assert.equal(f.ledger().pendingInputs, 1);
+  await f.event('turn.complete', { turnId: 'compact', reason: 'answer' });
+  f.request();
+  assert((await f.event('classic.PreCompact', { trigger: 'manual' })).block);
+  await f.event('turn.start', { text: 'new user input', turnId: 'main-2' });
+  assert.equal(f.ledger().pendingInputs, 0);
+  await f.event('prompt.submit', { text: 'input arriving after the batch started' });
+  await f.step('main-2');
+  await f.event('turn.complete', { turnId: 'main-2', isAborted: false, reason: 'answer' });
+  assert.equal(f.ledger().pendingInputs, 1);
 });
 
 test('observer records effective TTL policy with force/env/settings precedence and no invented usage fields', async () => {

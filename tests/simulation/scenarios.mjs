@@ -29,6 +29,26 @@ export const scenarios = [
     },
   },
   {
+    name: 'batched background-agent notifications finish without phantom pending input',
+    async run({ fixture: f, model }) {
+      const id = await f.agent();
+      model.notifyAgentsNext();
+      await f.send(id, 'AGENT_BATCH: use the requested background agents, then reply without further tools.');
+      const ledger = await waitFor(async () => {
+        const state = await f.ledger(id);
+        const agent = await f.refresh(id);
+        return state.revision >= 3 && state.ordinaryEndedAt && state.activeTurns.length === 0 &&
+          agent.status === 'idle' && !agent.activeTurn ? state : null;
+      }, 'both background notifications consumed by the main session');
+      assert.equal(ledger.pendingInputs, 0, 'all input was answered, so no pending-input warning should remain');
+      const row = await f.row(id);
+      assert.notEqual(row.status, 'busy');
+      assert.notEqual(row.busyReason, 'input');
+      assert.equal(row.inputIdleSince, null);
+      await f.rpc('toggle', { agentId: id, enabled: false });
+    },
+  },
+  {
     name: '50-minute automatic delay is preserved; manual compaction works below the token threshold',
     async run({ fixture: f, id, baseline }) {
       await f.settings({ idleMinutes: 50 });

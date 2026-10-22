@@ -7,6 +7,7 @@ import { createServer } from 'node:net';
 import { createRequire } from 'node:module';
 import { join, dirname, delimiter } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { createHash } from 'node:crypto';
 
 export async function waitFor(fn, label, timeout = 45_000) {
   const until = Date.now() + timeout;
@@ -121,6 +122,12 @@ export async function startFixture({ root, plugin, tools, binary, model, reportD
     },
     async timeline(id) { return (await client.fetchAgentTimeline(id, { limit: 200 })).entries; },
     async refresh(id) { return (await client.fetchAgent(id)).agent; },
+    async ledger(id) {
+      const parent = join(home, 'plugin-data/auto-compact-for-claude/observers',
+        createHash('sha256').update(id).digest('hex'));
+      const manifest = JSON.parse(await readFile(join(parent, 'current.json'), 'utf8'));
+      return JSON.parse(await readFile(join(parent, manifest.launchId, 'ledger.json'), 'utf8'));
+    },
     async claudeSettings(values) { await writeFile(join(claude, 'settings.json'), JSON.stringify(values)); },
     async restart() { await stop(); await start(); },
     async close() { await stop(); },

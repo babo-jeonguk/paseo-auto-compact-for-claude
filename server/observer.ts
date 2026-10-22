@@ -24,6 +24,10 @@ const LedgerSchema = z.object({
 type Ledger = z.infer<typeof LedgerSchema> & { cache: Awaited<ReturnType<ReturnType<typeof createCacheReader>>>;
   cacheDeadline: number | null };
 const ManifestSchema = z.object({ launchId: z.string().uuid(), build: z.string() });
+// The batch-counting fix keeps the same ledger and reservation-guard contract.
+// Keep already-open sessions observable while they adopt the fix on reopen.
+const compatibleBuilds = new Set([observerAsset.version,
+  'af6c6639f8c3058a73d5e982e308b69f5572fc6439a0c8fea61c1ca629ef4239']);
 
 export function createObserver(options: { home?: string; now?: () => number } = {}) {
   const base = join(options.home ?? process.env.PASEO_HOME ?? join(homedir(), '.paseo'),
@@ -40,7 +44,7 @@ export function createObserver(options: { home?: string; now?: () => number } = 
     try {
       const parent = agentDirectory(agentId);
       const manifest = ManifestSchema.parse(JSON.parse(await readFile(join(parent, 'current.json'), 'utf8')));
-      if (manifest.build !== observerAsset.version) return null;
+      if (!compatibleBuilds.has(manifest.build)) return null;
       const directory = join(parent, manifest.launchId);
       const path = join(directory, 'ledger.json');
       const info = await lstat(path);
