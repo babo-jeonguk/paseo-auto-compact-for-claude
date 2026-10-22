@@ -30,7 +30,7 @@ export const scenarios = [
     },
   },
   {
-    name: 'batched background-agent notifications finish without phantom pending input',
+    name: 'batched background-agent notifications finish without phantom pending input and earn a new reservation',
     async run({ fixture: f, model }) {
       const id = await f.agent();
       model.notifyAgentsNext();
@@ -46,6 +46,8 @@ export const scenarios = [
       assert.notEqual(row.status, 'busy');
       assert.notEqual(row.busyReason, 'input');
       assert.equal(row.inputIdleSince, null);
+      // The notification turn ended after the user's turn and earns its own reservation.
+      await scheduled(f, id);
       await f.rpc('toggle', { agentId: id, enabled: false });
     },
   },

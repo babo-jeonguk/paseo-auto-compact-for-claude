@@ -33,7 +33,7 @@ The automatic timer test first verifies real **55- and 50-minute reservation val
 | Policies | Global, provider and per-conversation switches act independently |
 | Skip/Undo | Original due time restored; stale undo rejected after new input |
 | New input | Busy state suppresses old work; completed input earns a new reservation |
-| Background agents | Two completion notifications can share one main turn without leaving phantom pending input |
+| Background agents | Two completion notifications can share one main turn without leaving phantom pending input; that turn earns a new reservation without a new user message |
 | In-turn delivery | A background command completes during the main turn; the native transcript confirms absorption and automatic scheduling remains available |
 | Automatic compact | Real timer, native completion and same session; no repeated idle compaction |
 | Manual compact | Explicit Compact now completes in the same session |

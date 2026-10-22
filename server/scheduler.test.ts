@@ -681,3 +681,23 @@ test("a refused Compact now explains why", async () => {
   assert.match((await s.compactNow("a", revision)).detail, /[Ss]ettings/);
   assert.equal(f.calls, 0);
 });
+
+test("a later native turn without a new host message earns a reservation; the same activity never does", async () => {
+  const f = fixture();
+  f.agents[0].activityKey = "launch:generation:1";
+  const s = f.make();
+  await s.ready;
+  await s.observedTurn(f.agents[0]);
+  await s.invalidate("a");
+  assert.equal(f.state.jobs[0].status, "skipped");
+  f.advance(60_000);
+  await s.observedTurn(f.agents[0], f.time);
+  assert.equal(f.state.jobs[0].status, "skipped", "the same native activity is not rescheduled");
+  f.agents[0].activityKey = "launch:generation:3";
+  await s.observedTurn(f.agents[0], f.time);
+  assert.equal(f.state.jobs[0].status, "scheduled");
+  assert.equal(f.state.jobs[0].endedAt, f.time);
+  f.advance(55 * 60_000);
+  await s.tick();
+  assert.equal(f.calls, 1);
+});

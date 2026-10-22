@@ -209,8 +209,11 @@ export function createScheduler(options: {
           !agent.idle ||
           !agent.revision ||
           Date.parse(agent.revision) > endedAt ||
-          prior?.revision === agent.revision ||
-          (agent.activityKey && prior?.activityKey === agent.activityKey) ||
+          // Background notifications start native turns without a new host
+          // message, so native activity identifies work when it is available.
+          (agent.activityKey
+            ? prior?.activityKey === agent.activityKey
+            : prior?.revision === agent.revision) ||
           stopped
         )
           return;
