@@ -73,4 +73,4 @@ To change the tested Claude/Paseo version, edit `tests/simulation/package.json`,
 
 ## CI
 
-[Check workflow](../.github/workflows/check.yml) has native simulation jobs on **ubuntu-latest** and **windows-latest**, in addition to the existing fast checks. Pull requests, pushes and manual workflow dispatch run them and upload their reports/logs even when a test fails. No API secret is needed. The workflow must be in the root of the public plugin repository when that repository is initialized.
+[Check workflow](https://github.com/babo-jeonguk/paseo-auto-compact-for-claude/blob/main/.github/workflows/check.yml) has native simulation jobs on **ubuntu-latest** and **windows-latest**, in addition to fast checks on Linux, macOS and Windows. Pull requests, pushes and manual workflow dispatch run them and upload their reports/logs even when a test fails. No API secret is needed. [View workflow runs](https://github.com/babo-jeonguk/paseo-auto-compact-for-claude/actions/workflows/check.yml). Native macOS execution is not covered by the fast macOS checks.

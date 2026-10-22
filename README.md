@@ -22,13 +22,15 @@ Supported Claude versions and setup help: [troubleshooting](docs/runtime.md).
 
 ## Install
 
-On the machine running Paseo:
+On the machine running the Paseo daemon, install directly from the public GitHub repository. Git must be available on that machine:
 
 ```sh
-paseo plugin install /absolute/path/to/paseo-auto-compact-for-claude
+paseo plugin install github:babo-jeonguk/paseo-auto-compact-for-claude
 ```
 
-Enable it in **Settings → Plugins**, then start a Claude conversation. After a reply finishes, open the pill beside the message composer to see its schedule or why it is waiting.
+Or paste `github:babo-jeonguk/paseo-auto-compact-for-claude` into **Settings → Plugins → Plugin source** and select **Install plugin**. Turn on **Enable plugins** and enable **Auto Compact for Claude**, then start or reopen a Claude conversation. After a reply finishes, open the pill beside the message composer to see its schedule or why it is waiting.
+
+This is a direct GitHub installation and works before registry approval. It does not require cloning the repository or installing npm dependencies yourself. Paseo supplies the runtime libraries. See [Paseo's plugin source documentation](https://paseo.sh/docs/plugins/publishing#share-through-github-or-git).
 
 The plugin adds a Claude Mod when a session opens and sends `/compact` through Paseo. Start or reopen a session after installation. [Setup and compatibility](docs/runtime.md).
 
@@ -58,6 +60,16 @@ Near a scheduled time, skip or turn automation off and wait for confirmation bef
 Open **Settings** from the pill to change the host-wide defaults: **automation on, 200,000 tokens, 55 minutes after a reply finishes**, with all Claude providers enabled. [View settings](assets/settings.png).
 
 Automatic compaction uses TTL metadata from the session transcript, then explicit Claude settings. If TTL is unavailable, scheduling stays enabled using a one-hour assumption. A known five-minute window cannot cover a 55-minute delay. Installing or updating does not schedule old conversations; expired reservations are not replayed. Compaction consumes tokens and may lose detail; cache hits and savings are not guaranteed.
+
+## Update
+
+Review and apply available updates on the daemon machine:
+
+```sh
+paseo plugin update auto-compact-for-claude
+```
+
+Review the proposed commit before confirming. Direct GitHub updates follow the repository's default branch. Reopen Claude sessions after an observer update so they load the new version; reloading a plugin cannot replace the observer in an already running Claude process. For a local development installation, see [development](docs/development.md).
 
 ## Remove
 

@@ -1,8 +1,10 @@
 # Development
 
-Use Node 24+ from this directory:
+Clone the public plugin repository, then use Node 24+ from its directory:
 
 ```sh
+git clone https://github.com/babo-jeonguk/paseo-auto-compact-for-claude.git
+cd paseo-auto-compact-for-claude
 npm ci --ignore-scripts
 npm run build:observer
 npm run check
@@ -16,16 +18,28 @@ npm run check
 
 Provider commands, process launchers, IPC sockets and other plugins' runtime inventories are outside this package. See [execution limits and migration](runtime.md).
 
-## Packaging
+## Local installation
+
+From this checkout, install the development directory on an isolated test daemon:
+
+```sh
+paseo plugin install .
+```
+
+After editing installed files, run `paseo plugin reload auto-compact-for-claude`. Existing Claude sessions need to reopen to load a changed observer; their provider command is preserved. For ordinary use, follow the [GitHub installation instructions](../README.md#install).
+
+## Packaging and releases
 
 ```sh
 npm pack --dry-run --ignore-scripts
-npm pack --pack-destination /path/to/artifacts
+npm pack
 ```
 
-The package includes the client, server, embedded observer, documentation and screenshots. Keep public links and assets within this directory. `prepack` rebuilds the observer and runs checks. The package is currently private.
+The package includes the client, server, embedded observer, documentation and screenshots. Keep public links and assets within this directory. `prepack` rebuilds the observer and runs checks. `npm pack` writes a versioned `.tgz` into the current directory.
 
-For a directory installation, update the installed files and run `paseo plugin reload auto-compact-for-claude`. Existing Claude sessions need to reopen to load a changed observer; their provider command is preserved.
+Distribution uses the public GitHub repository and GitHub Releases. `private: true` prevents accidental npm publication; it does not restrict the public Git repository or installation through Paseo. Release versions in `package.json` and `package-lock.json` must agree, and Git tags use the `v` prefix. A specific published tag can be selected with the install command's `--ref` option.
+
+Text files use LF line endings on every OS. Keep `.gitattributes` in the checkout: the embedded observer's source hash and generated-file check must remain identical on Windows.
 
 For each update, run `npm run test:update`. It combines these fast checks with the repeatable native Linux/Windows simulation. See [simulation setup, coverage and reports](testing.md).
 
