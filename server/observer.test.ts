@@ -54,7 +54,8 @@ test('the compatible pre-fix observer stays readable during rollout; unknown bui
   try {
     const manifestPath = join(f.parent, 'current.json');
     for (const build of ['af6c6639f8c3058a73d5e982e308b69f5572fc6439a0c8fea61c1ca629ef4239',
-      '8a6c0217779bc4f83c7029c8170c35da8d2ed8028622019f4a09808491dff90f']) {
+      '8a6c0217779bc4f83c7029c8170c35da8d2ed8028622019f4a09808491dff90f',
+      '7d9c570c36bcad4db9ef816c0b704c5b0d01d12c7522b215cdfbbfc160c86648']) {
       await writeFile(manifestPath, JSON.stringify({ ...f.manifest, build }));
       assert(await f.observer.read('a'));
       f.ledger.pendingInputs = 1; await f.save();

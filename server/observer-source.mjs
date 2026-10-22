@@ -29,6 +29,54 @@ async function cachePolicy($) {
   return { ttl: null, source: 'default' };
 }
 
+async function admit($, trigger) {
+  let request;
+  try { request = JSON.parse(await $.fs.read(configuration.request)); } catch {}
+  const now = await $.clock.now();
+  // Unrequested/manual/CLI compaction is observed but cannot complete an
+  // automatic operation. The host also pins the public send's message/turn id.
+  if (request?.status === 'cancelled' && request.id && trigger !== 'auto') {
+    state.compact = { id: request.id, status: 'failed', revision: state.revision, reason: 'Reservation cancelled' };
+    await save($);
+    return 'Reservation cancelled';
+  }
+  let reason = null;
+  if (!request || request.status !== 'prepared' || trigger === 'auto' || state.compact?.id === request.id)
+    state.compact = { id: null, status: 'running', revision: state.revision };
+  else {
+    if (request.launchId !== state.launchId || request.generation !== state.generation ||
+        request.sessionId !== state.sessionId) reason = 'Claude session changed';
+    else if (request.revision !== state.revision || state.activeTurns.length || state.pendingInputs)
+      reason = 'New conversation activity';
+    else if (now > request.expiresAt || now < request.preparedAt) reason = 'Reservation expired';
+    else if (request.requireCache && (request.clockEpoch !== state.clockEpoch ||
+        !Number.isFinite(request.cacheDeadline) || now >= request.cacheDeadline - 30_000))
+      reason = 'Cache window passed';
+    state.compact = { id: request.id, status: reason ? 'failed' : 'running',
+      revision: state.revision, reason };
+  }
+  state.cacheRequest = null;
+  state.ordinaryEndedAt = null;
+  state.ordinaryRevision = null;
+  await save($);
+  return reason;
+}
+
+// The live window reports no fill from just after a compaction until the
+// next response; a cancelled or no-op /compact leaves the old fill in place.
+async function confirm($, operation) {
+  const deadline = await $.clock.now() + 10_000;
+  const timer = await $.clock.every(500, async () => {
+    if (state.compact !== operation || operation.status !== 'running') return timer.cancel();
+    const reset = (await $.session.usage()).context.tokens === undefined;
+    if (!reset && await $.clock.now() < deadline) return;
+    timer.cancel();
+    operation.status = reset ? 'completed' : 'failed';
+    if (!reset) operation.reason = 'Claude returned without completing compaction';
+    await save($);
+  });
+}
+
 export function registerObserver(on, config) {
   configuration = config;
   writes = Promise.resolve();
@@ -134,57 +182,42 @@ export function registerObserver(on, config) {
     await save($);
     return next(e);
   });
+  // Team/Enterprise policy plugins run first and continue classic.* and
+  // session.compact past user-tier plugins, so this Mod never sees PreCompact
+  // or PostCompact there. command.run reaches every tier and wraps /compact.
+  let command = null;
   on('classic.PreCompact', async ($, e, next) => {
-    let request;
-    try { request = JSON.parse(await $.fs.read(configuration.request)); } catch {}
-    const now = await $.clock.now();
-    // Unrequested/manual/CLI compaction is observed but cannot complete an
-    // automatic operation. The host also pins the public send's message/turn id.
-    if (request?.status === 'cancelled' && request.id && e.trigger !== 'auto') {
-      state.compact = { id: request.id, status: 'failed', revision: state.revision, reason: 'Reservation cancelled' };
-      await save($);
-      return { block: 'Reservation cancelled' };
-    }
-    if (!request || request.status !== 'prepared' || e.trigger === 'auto' || state.compact?.id === request.id) {
-      state.compact = { id: null, status: 'running', revision: state.revision };
-      state.cacheRequest = null;
-      state.ordinaryEndedAt = null;
-      state.ordinaryRevision = null;
-      await save($);
+    if (command) {
+      command.classic = true;
       return next(e);
     }
-    let reason = null;
-    if (request.launchId !== state.launchId || request.generation !== state.generation ||
-        request.sessionId !== state.sessionId) reason = 'Claude session changed';
-    else if (request.revision !== state.revision || state.activeTurns.length || state.pendingInputs)
-      reason = 'New conversation activity';
-    else if (now > request.expiresAt || now < request.preparedAt) reason = 'Reservation expired';
-    else if (request.requireCache && (request.clockEpoch !== state.clockEpoch ||
-        !Number.isFinite(request.cacheDeadline) || now >= request.cacheDeadline - 30_000))
-      reason = 'Cache window passed';
-    state.compact = { id: request.id, status: reason ? 'failed' : 'running',
-      revision: state.revision, reason };
-    state.cacheRequest = null;
-    state.ordinaryEndedAt = null;
-    state.ordinaryRevision = null;
-    await save($);
-    if (reason) return { block: reason };
-    return next(e);
+    const reason = await admit($, e.trigger);
+    return reason ? { block: reason } : next(e);
   }).catch(async () => ({ block: 'Auto Compact could not verify the reservation' }));
   on('classic.PostCompact', async ($, e, next) => {
     if (state.compact?.status === 'running') state.compact.status = 'completed';
     await save($);
     return next(e);
   });
-  on('command.run', async ($, e, next) => {
-    const result = await next(e);
-    // Claude can run PreCompact and then return "not enough messages" without
-    // PostCompact. A command returning is never evidence of actual compaction.
-    if (e.command === 'compact' && state.compact?.status === 'running') {
-      state.compact.status = 'failed';
-      state.compact.reason = 'Claude returned without completing compaction';
-      await save($);
+  on('command.run', { command: 'compact' }, async ($, e, next) => {
+    const reason = await admit($, 'manual');
+    if (reason) return { text: reason };
+    const operation = state.compact;
+    const filled = (await $.session.usage()).context.tokens !== undefined;
+    const current = command = { classic: false };
+    let result;
+    try { result = await next(e); } finally { command = null; }
+    if (state.compact === operation && operation.status === 'running') {
+      if (!current.classic && filled) await confirm($, operation);
+      else {
+        // Claude can run PreCompact and then return "not enough messages"
+        // without PostCompact. A command returning is never evidence of compaction.
+        operation.status = current.classic ? 'failed' : 'unknown';
+        operation.reason = current.classic ? 'Claude returned without completing compaction'
+          : 'Compaction completion could not be observed';
+        await save($);
+      }
     }
     return result;
-  });
+  }).catch(async () => ({ text: 'Auto Compact could not verify the reservation' }));
 }

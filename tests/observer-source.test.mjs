@@ -3,16 +3,22 @@ import { test } from 'node:test';
 import { registerObserver } from '../server/observer-source.mjs';
 
 function fixture(env = {}, settings = {}) {
-  let time = 1_000_000;
+  let time = 1_000_000, contextTokens = 100_000;
   const hooks = new Map(), files = new Map();
-  let heartbeat;
+  const timers = new Set();
   const configuration = { launchId: 'launch-1', ledger: '/ledger', request: '/request' };
-  const $ = { clock: { now: async () => time, every: (_ms, fn) => { heartbeat = fn; return { cancel() { heartbeat = null; } }; } },
+  const $ = { clock: { now: async () => time, every: (_ms, fn) => {
+      const timer = { fn, cancel() { timers.delete(timer); } };
+      timers.add(timer); return timer;
+    } },
     fs: { write: async (p, v) => files.set(p, v), read: async p => files.get(p) ?? '{}' },
-    session: { id: async () => 'native-1' }, env: { get: async name => env[name] },
+    session: { id: async () => 'native-1',
+      usage: async () => ({ context: { window: 1_000_000, ...(contextTokens === undefined ? {} : { tokens: contextTokens }) } }) },
+    env: { get: async name => env[name] },
     settings: { read: async () => settings } };
-  registerObserver((name, fn) => { hooks.set(name, fn); return { catch() {} }; }, configuration);
-  const event = (name, input = {}) => hooks.get(name)($, input, async () => ({}));
+  registerObserver((name, ...rest) => { hooks.set(name, rest.at(-1)); return { catch() {} }; }, configuration);
+  const event = (name, input = {}, next = async () => ({})) => hooks.get(name)($, input, next);
+  const tick = async (ms = 500) => { time += ms; for (const timer of [...timers]) await timer.fn(); };
   const ledger = () => JSON.parse(files.get('/ledger'));
   const request = (overrides = {}) => {
     const state = ledger();
@@ -26,16 +32,19 @@ function fixture(env = {}, settings = {}) {
     const generator = hooks.get('turn.step')($, { turnId }, async function* () { return { usage }; });
     while (!(await generator.next()).done) {}
   };
-  return { event, step, ledger, request, files,
+  // Paseo's /compact runs as a command around Claude's compaction and hooks.
+  const compact = (inner = async () => {}) => event('command.run', { command: 'compact', args: '' },
+    async () => { await inner(); return {}; });
+  return { event, step, ledger, request, files, compact, tick,
     advance(ms) { time += ms; },
+    context(tokens) { contextTokens = tokens; },
     async start() { await event('session.start'); },
     async ordinary(reported = usage, responseDelay = 0) {
       await event('prompt.submit', { text: 'ordinary input' });
       await event('turn.start', { text: 'ordinary input', turnId: 'user-1' });
       const generator = hooks.get('turn.step')($, { turnId: 'user-1' }, async function* () {
         for (let elapsed = 0; elapsed < responseDelay; elapsed += 5000) {
-          time += Math.min(5000, responseDelay - elapsed);
-          await heartbeat?.();
+          await tick(Math.min(5000, responseDelay - elapsed));
         }
         return { usage: reported };
       });
@@ -236,11 +245,65 @@ test('delayed heartbeat preserves the request clock; backwards clocks and sessio
 
 test('a no-op compact or local slash command cannot leave the observer permanently busy', async () => {
   const f = fixture(); await f.start(); await f.ordinary();
-  await f.event('classic.PreCompact', { trigger: 'manual' });
-  await f.event('command.run', { command: 'compact' });
+  await f.compact(() => f.event('classic.PreCompact', { trigger: 'manual' }));
   assert.equal(f.ledger().compact.status, 'failed');
   await f.event('prompt.submit', { text: '/help' });
   assert.equal(f.ledger().pendingInputs, 0);
+});
+
+test('the /compact command guards a reservation even when policy plugins skip PreCompact', async () => {
+  for (const override of [{ expiresAt: 0 }, { status: 'cancelled' }, { generation: 'old' }, { revision: 0 }]) {
+    const f = fixture(); await f.start(); await f.ordinary(); f.request(override);
+    let ran = false;
+    const result = await f.compact(async () => { ran = true; });
+    assert(result.text, 'the command answers with the refusal instead of compacting');
+    assert.equal(ran, false);
+    assert.equal(f.ledger().compact.status, 'failed');
+  }
+});
+
+test('with classic hooks delivered, the command keeps one guard and PostCompact completes it', async () => {
+  const f = fixture(); await f.start(); await f.ordinary(); f.request();
+  await f.compact(async () => {
+    assert.equal((await f.event('classic.PreCompact', { trigger: 'manual' })).block, undefined);
+    assert.equal(f.ledger().compact.status, 'running');
+    await f.event('classic.PostCompact', { trigger: 'manual' });
+  });
+  assert.deepEqual(f.ledger().compact, { id: 'operation-1', status: 'completed', revision: 1, reason: null });
+});
+
+test('with classic hooks skipped by an organization policy, a reset context window completes the receipt', async () => {
+  const f = fixture(); await f.start(); await f.ordinary(); f.request();
+  await f.compact();
+  assert.equal(f.ledger().compact.status, 'running', 'a returning command alone is not completion');
+  await f.tick();
+  assert.equal(f.ledger().compact.status, 'running');
+  f.context(undefined);
+  await f.tick();
+  assert.deepEqual(f.ledger().compact, { id: 'operation-1', status: 'completed', revision: 1, reason: null });
+});
+
+test('with classic hooks skipped, an unchanged context window fails and new input makes it unknown', async () => {
+  const f = fixture(); await f.start(); await f.ordinary(); f.request();
+  await f.compact();
+  for (let i = 0; i < 19; i++) await f.tick();
+  assert.equal(f.ledger().compact.status, 'running');
+  await f.tick();
+  assert.equal(f.ledger().compact.status, 'failed');
+  assert.equal(f.ledger().compact.reason, 'Claude returned without completing compaction');
+  const overlap = fixture(); await overlap.start(); await overlap.ordinary(); overlap.request();
+  await overlap.compact();
+  await overlap.event('prompt.submit', { text: 'new work' });
+  overlap.context(undefined);
+  await overlap.tick();
+  assert.equal(overlap.ledger().compact.status, 'unknown');
+});
+
+test('without a context reading before /compact, completion stays unknown rather than guessed', async () => {
+  const f = fixture(); await f.start(); await f.ordinary(); f.request();
+  f.context(undefined);
+  await f.compact();
+  assert.equal(f.ledger().compact.status, 'unknown');
 });
 
 test('a model switch invalidates an old reservation without reusing the previous model cache clock', async () => {
