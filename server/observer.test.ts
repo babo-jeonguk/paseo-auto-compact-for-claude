@@ -104,12 +104,15 @@ test('opening a session removes closed or long-idle launches of that conversatio
   const f = await fixture();
   try {
     const day = 24 * 60 * 60_000;
+    // File times before 1970 are not applied on Windows; use a present-day clock.
+    const present = Date.now();
+    f.advance(present);
+    const ago = (ms: number) => new Date(1_000_000 + present - ms);
     const launch = async (id: string, ledger: object, ageMs: number) => {
       const directory = join(f.parent, id);
       await mkdir(join(directory, 'mod'), { recursive: true });
       await writeFile(join(directory, 'ledger.json'), JSON.stringify(ledger));
-      const at = new Date(1_000_000 - ageMs);
-      await utimes(join(directory, 'ledger.json'), at, at);
+      await utimes(join(directory, 'ledger.json'), ago(ageMs), ago(ageMs));
     };
     await launch('closed', { ...f.ledger, closed: true }, 0);
     await launch('idle', { ...f.ledger }, day + 1);
@@ -117,7 +120,7 @@ test('opening a session removes closed or long-idle launches of that conversatio
     await launch('recent', { ...f.ledger }, day - 60_000);
     await mkdir(join(f.parent, 'preparing'));
     await mkdir(join(f.parent, 'abandoned'));
-    await utimes(join(f.parent, 'abandoned'), new Date(1_000_000 - day - 1), new Date(1_000_000 - day - 1));
+    await utimes(join(f.parent, 'abandoned'), ago(day + 1), ago(day + 1));
     const other = await f.observer.prepareSession({ ...f.request, agentId: 'b' }, true);
     await f.observer.prepareSession(f.request, true);
     const current = JSON.parse(await readFile(join(f.parent, 'current.json'), 'utf8')).launchId;
