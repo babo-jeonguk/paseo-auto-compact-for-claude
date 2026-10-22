@@ -139,6 +139,8 @@ export function ConversationControls({
         if (result.status === "completed") toast.show("Conversation compacted", { variant: "success" });
         else toast.error(result.status === "unknown"
           ? "Check the conversation before trying again."
+          : result.status === "blocked"
+          ? `${result.detail}.`
           : "Couldn’t compact. Check the conversation.");
       }
     },

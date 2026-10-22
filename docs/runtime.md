@@ -42,7 +42,7 @@ Near a scheduled time, skip or turn automation off and wait for confirmation bef
 
 Paseo can also report a user's turn complete before its response arrives when input overlaps compaction. This plugin checks native activity rather than trusting that early idle state, marks ambiguous compact results unknown, and does not retry them. It does not change Paseo's completion reporting to other callers.
 
-**Undo skip** restores the original deadline without changing automation settings. New activity, a changed session or delay, expiry, and an attempted operation prevent restoration. **Compact now** ignores the automatic token threshold and does not require context usage data. It may run outside the automatic cache window; keep the conversation idle first.
+**Undo skip** restores the original deadline without changing automation settings. New activity, a changed session or delay, expiry, and an attempted operation prevent restoration. **Compact now** ignores the global, provider and conversation automation switches and the automatic token threshold, and does not require context usage data. It may run outside the automatic cache window; keep the conversation idle first.
 
 ## Upgrading from the previous execution path
 

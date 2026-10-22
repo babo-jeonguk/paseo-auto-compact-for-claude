@@ -325,21 +325,18 @@ export function createScheduler(options: {
           settings(),
           gateway.refresh(agentId),
         ]);
-        if (
-          !config ||
-          !agent ||
-          !allowed(agent, config) ||
-          !agent.idle ||
-          agent.revision !== revision
-        ) {
-          return {
-            result: {
-              status: "blocked" as const,
-              detail:
-                "Session changed or is unavailable/busy",
-            },
-          };
-        }
+        // An explicit request is independent of automation switches, like the threshold.
+        const refused = !config
+          ? "Compact settings could not be read"
+          : !agent?.eligible
+          ? "This conversation is unavailable for compaction"
+          : agent.revision !== revision
+          ? "The conversation changed. Refresh and try again"
+          : !agent.idle
+          ? "The conversation is busy. Wait until it finishes"
+          : null;
+        if (refused || !agent)
+          return { result: { status: "blocked" as const, detail: refused! } };
         let job = state.jobs.find((job) => job.agentId === agentId);
         if (
           job &&

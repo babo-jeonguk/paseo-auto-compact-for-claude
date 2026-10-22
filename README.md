@@ -53,7 +53,7 @@ Open the pill for the current reason and any action needed. Cache TTL and exact 
 - **Automation switch:** enable or disable automatic compaction for this conversation.
 - **Skip this time:** cancel the current reservation without changing automation settings. The button stays visible and is disabled when there is no eligible schedule.
 - **Undo skip:** restore the original scheduled time while the reservation is still valid. New activity or an expired deadline prevents undo.
-- **Compact now:** compact after confirmation, regardless of the automatic token threshold or whether context usage is available. Keep the conversation idle and stop background work first.
+- **Compact now:** compact after confirmation, regardless of automation switches, the automatic token threshold or whether context usage is available. Keep the conversation idle and stop background work first.
 
 Near a scheduled time, skip or turn automation off and wait for confirmation before sending new work. During **Compacting…**, wait for completion.
 

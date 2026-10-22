@@ -648,3 +648,36 @@ test('a changed native generation invalidates undo and prevents dispatch despite
   assert.equal(f.calls, 0);
   assert.equal(f.state.jobs[0].status, 'skipped');
 });
+
+test("Compact now works whether automation is off globally, for the provider or for the conversation", async () => {
+  for (const change of [
+    { enabled: false },
+    { disabledProviders: ["claude"] },
+    { conversationOff: true },
+  ]) {
+    const f = fixture();
+    const s = f.make();
+    await s.ready;
+    if ("conversationOff" in change) await s.toggle("a", false);
+    else f.config = { ...DEFAULT_SETTINGS, ...change };
+    assert.equal((await s.compactNow("a", f.agents[0].revision!)).status, "completed");
+    assert.equal(f.calls, 1);
+  }
+});
+
+test("a refused Compact now explains why", async () => {
+  const f = fixture();
+  const s = f.make();
+  await s.ready;
+  const revision = f.agents[0].revision!;
+  assert.match((await s.compactNow("a", "stale")).detail, /changed/);
+  f.agents[0].idle = false;
+  assert.match((await s.compactNow("a", revision)).detail, /busy/);
+  f.agents[0].idle = true;
+  f.agents[0].eligible = false;
+  assert.match((await s.compactNow("a", revision)).detail, /unavailable/);
+  f.agents[0].eligible = true;
+  f.config = null;
+  assert.match((await s.compactNow("a", revision)).detail, /[Ss]ettings/);
+  assert.equal(f.calls, 0);
+});
