@@ -1,6 +1,6 @@
 import type { PluginSessionOpenRequest } from '@getpaseo/plugin/server';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, readFile, writeFile, rename, lstat } from 'node:fs/promises';
+import { mkdir, readFile, readdir, writeFile, rename, lstat, rm } from 'node:fs/promises';
 import { join, delimiter, sep } from 'node:path';
 import { homedir } from 'node:os';
 import { z } from 'zod';
@@ -60,6 +60,22 @@ export function createObserver(options: { home?: string; now?: () => number } = 
       return { ledger: { ...ledger, cache, cacheDeadline: cache?.deadline ?? null }, directory };
     } catch { return null; }
   }
+  // Each open writes a new launch. A running observer refreshes its ledger every
+  // few seconds, so a closed or day-old launch belongs to an ended process.
+  async function prune(parent: string, keep: string) {
+    for (const entry of await readdir(parent, { withFileTypes: true })) {
+      if (!entry.isDirectory() || entry.name === keep) continue;
+      const directory = join(parent, entry.name), path = join(directory, 'ledger.json');
+      try {
+        // A launch still being prepared may not have its ledger yet.
+        const info = await lstat(path).catch(() => lstat(directory));
+        const closed = info.isFile() && info.size <= 32_768 &&
+          JSON.parse(await readFile(path, 'utf8')).closed === true;
+        if (!closed && now() - info.mtimeMs < 24 * 60 * 60_000) continue;
+      } catch { continue; }
+      await rm(directory, { recursive: true, force: true }).catch(() => {});
+    }
+  }
   function reason(ledger: Ledger | undefined, agent: Observation, dueAt = now()) {
     if (!ledger || ledger.sessionId !== agent.sessionId)
       return 'Claude observer unavailable; start a new conversation session';
@@ -87,6 +103,7 @@ export function createObserver(options: { home?: string; now?: () => number } = 
       await writeFile(join(mod, 'hooks', 'register.mjs'), observerAsset.source + '\nexport function register(on) { registerObserver(on, ' +
         JSON.stringify(configuration) + '); }\n', { mode: 0o600 });
       await atomic(join(parent, 'current.json'), { launchId, build: observerAsset.version });
+      await prune(parent, launchId).catch(() => {});
       const existing = request.env.CLAUDE_CODE_PLUGIN_DIRS?.split(delimiter)
         .filter(path => path && !path.startsWith(parent + sep));
       return { ...request, env: { ...request.env,

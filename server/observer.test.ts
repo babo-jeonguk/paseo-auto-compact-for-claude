@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from 'node:fs/promises';
 import { join, delimiter } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createObserver } from './observer';
@@ -97,5 +97,33 @@ test('native receipt must match operation and revision; settling preserves subse
     const next = await f.observer.prepare(f.agent, true, 1_030_000);
     await f.observer.cancel(operation);
     assert.equal(JSON.parse(await readFile(join(f.directory, 'request.json'), 'utf8')).id, next.id);
+  } finally { await f.close(); }
+});
+
+test('opening a session removes closed or long-idle launches of that conversation only', async () => {
+  const f = await fixture();
+  try {
+    const day = 24 * 60 * 60_000;
+    const launch = async (id: string, ledger: object, ageMs: number) => {
+      const directory = join(f.parent, id);
+      await mkdir(join(directory, 'mod'), { recursive: true });
+      await writeFile(join(directory, 'ledger.json'), JSON.stringify(ledger));
+      const at = new Date(1_000_000 - ageMs);
+      await utimes(join(directory, 'ledger.json'), at, at);
+    };
+    await launch('closed', { ...f.ledger, closed: true }, 0);
+    await launch('idle', { ...f.ledger }, day + 1);
+    await launch('never-started', {}, day + 1);
+    await launch('recent', { ...f.ledger }, day - 60_000);
+    await mkdir(join(f.parent, 'preparing'));
+    await mkdir(join(f.parent, 'abandoned'));
+    await utimes(join(f.parent, 'abandoned'), new Date(1_000_000 - day - 1), new Date(1_000_000 - day - 1));
+    const other = await f.observer.prepareSession({ ...f.request, agentId: 'b' }, true);
+    await f.observer.prepareSession(f.request, true);
+    const current = JSON.parse(await readFile(join(f.parent, 'current.json'), 'utf8')).launchId;
+    const remaining = (await readdir(f.parent)).filter(name => name !== 'current.json').sort();
+    assert.deepEqual(remaining, [current, f.manifest.launchId, 'preparing', 'recent'].sort());
+    assert(other.env.CLAUDE_CODE_PLUGIN_DIRS.includes('observers'));
+    assert.equal((await readdir(join(f.home, 'plugin-data/auto-compact-for-claude/observers'))).length, 2);
   } finally { await f.close(); }
 });
