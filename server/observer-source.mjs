@@ -3,6 +3,9 @@
 let state;
 let configuration;
 let writes = Promise.resolve();
+// A cancelled request blocks one late plugin /compact. Claude cannot tell that
+// command from the user's own, so later ones run as unrequested compaction.
+let consumedCancelId = null;
 async function save($) {
   const now = await $.clock.now();
   if (state.updatedAt && now < state.updatedAt) {
@@ -35,10 +38,11 @@ async function admit($, trigger) {
   const now = await $.clock.now();
   // Unrequested/manual/CLI compaction is observed but cannot complete an
   // automatic operation. The host also pins the public send's message/turn id.
-  if (request?.status === 'cancelled' && request.id && trigger !== 'auto') {
+  if (request?.status === 'cancelled' && request.id && trigger !== 'auto' && consumedCancelId !== request.id) {
+    consumedCancelId = request.id;
     state.compact = { id: request.id, status: 'failed', revision: state.revision, reason: 'Reservation cancelled' };
     await save($);
-    return 'Reservation cancelled';
+    return 'Auto Compact cancelled its pending /compact. Run /compact again to compact manually.';
   }
   let reason = null;
   if (!request || request.status !== 'prepared' || trigger === 'auto' || state.compact?.id === request.id)
@@ -80,6 +84,7 @@ async function confirm($, operation) {
 export function registerObserver(on, config) {
   configuration = config;
   writes = Promise.resolve();
+  consumedCancelId = null;
   state = {
     version: 1, launchId: configuration.launchId, generation: crypto.randomUUID(),
     sessionId: null, updatedAt: 0, revision: 0, activeTurns: [], pendingInputs: 0,
@@ -95,6 +100,7 @@ export function registerObserver(on, config) {
   on('session.start', async ($, e, next) => {
     state.sessionId = await $.session.id();
     await save($);
+    heartbeat?.cancel();
     heartbeat = await $.clock.every(5_000, async () => save($));
     return next(e);
   });

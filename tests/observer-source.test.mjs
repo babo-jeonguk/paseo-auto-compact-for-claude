@@ -36,6 +36,7 @@ function fixture(env = {}, settings = {}) {
   const compact = (inner = async () => {}) => event('command.run', { command: 'compact', args: '' },
     async () => { await inner(); return {}; });
   return { event, step, ledger, request, files, compact, tick,
+    timers: () => timers.size,
     advance(ms) { time += ms; },
     context(tokens) { contextTokens = tokens; },
     async start() { await event('session.start'); },
@@ -312,4 +313,29 @@ test('a model switch invalidates an old reservation without reusing the previous
   assert.equal(f.ledger().ordinaryRevision, null);
   assert.equal(f.ledger().cacheRequest, null);
   assert((await f.event('classic.PreCompact', { trigger: 'manual' })).block);
+});
+
+test('a cancelled reservation blocks one late /compact, then the user can compact manually', async () => {
+  const f = fixture(); await f.start(); await f.ordinary();
+  f.files.set('/request', JSON.stringify({ id: 'operation-1', status: 'cancelled' }));
+  f.advance(3 * 3_600_000);
+  await f.ordinary();
+  let ran = false;
+  const late = await f.compact(async () => { ran = true; });
+  assert.match(late.text, /Run \/compact again/);
+  assert.equal(ran, false);
+  assert.deepEqual(f.ledger().compact, { id: 'operation-1', status: 'failed', revision: 2,
+    reason: 'Reservation cancelled' });
+  await f.compact(async () => { ran = true; });
+  assert.equal(ran, true, 'the user\'s own /compact is no longer blocked');
+  assert.equal(f.ledger().compact.id, null);
+  const classic = fixture(); await classic.start(); await classic.ordinary();
+  classic.files.set('/request', JSON.stringify({ id: 'operation-1', status: 'cancelled' }));
+  assert((await classic.event('classic.PreCompact', { trigger: 'manual' })).block);
+  assert.equal((await classic.event('classic.PreCompact', { trigger: 'manual' })).block, undefined);
+});
+
+test('a repeated session start keeps a single heartbeat', async () => {
+  const f = fixture(); await f.start(); await f.start();
+  assert.equal(f.timers(), 1);
 });
