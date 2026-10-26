@@ -14,8 +14,8 @@ Codex subscription sessions do not need this plugin: [caches are retained indefi
 
 ## Requirements
 
-- **Paseo 0.12 or later**. Paseo 0.12 and 0.13 are covered by the isolated native simulation suite. Both pass on Linux; CI also runs both on Windows. macOS needs native verification. [Test scope](docs/testing.md).
-- A Claude provider using a native Claude Code CLI that supports Mods. Tested with CLI **2.1.306**. Claude profiles are supported too.
+- **Paseo 0.12 or later**.
+- A Claude provider using a native Claude Code CLI that supports Mods. Claude profiles are supported too.
 - Paseo web app. Native mobile apps are unverified.
 
 Supported Claude versions and setup help: [troubleshooting](docs/runtime.md).
@@ -30,9 +30,7 @@ paseo plugin install github:babo-jeonguk/paseo-auto-compact-for-claude
 
 Or paste `github:babo-jeonguk/paseo-auto-compact-for-claude` into **Settings → Plugins → Plugin source** and select **Install plugin**. Turn on **Enable plugins** and enable **Auto Compact for Claude**, then start or reopen a Claude conversation. After a reply finishes, open the pill beside the message composer to see its schedule or why it is waiting.
 
-This is a direct GitHub installation and works before registry approval. It does not require cloning the repository or installing npm dependencies yourself. Paseo supplies the runtime libraries. See [Paseo's plugin source documentation](https://paseo.sh/docs/plugins/publishing#share-through-github-or-git).
-
-The plugin adds a Claude Mod when a session opens and sends `/compact` through Paseo. Start or reopen a session after installation. [Setup and compatibility](docs/runtime.md).
+This direct GitHub installation works before registry approval. Start or reopen a Claude conversation after installation. [Setup and compatibility](docs/runtime.md).
 
 ## Use
 
@@ -48,7 +46,7 @@ The pill uses five states:
 | **Compacting…** | Compaction is running; wait before sending a message. |
 | **Check compact** | Open the pill for the problem and next action, such as checking the conversation, reopening the session or correcting settings. |
 
-Open the pill for the current reason and any action needed. Cache TTL and exact reservation times are omitted. Brief refreshes and setting changes use a loading indicator; a persistent refresh failure needs attention. Pending input reported for at least a minute after a reply ended while the conversation is otherwise idle also needs attention; it is not proof that the input has been lost.
+Open the pill for the current reason and any action needed. Brief refreshes and setting changes use a loading indicator. If **Check compact** persists, open the pill for the suggested next step.
 
 - **Automation switch:** enable or disable automatic compaction for this conversation.
 - **Skip this time:** cancel the current reservation without changing automation settings. The button stays visible and is disabled when there is no eligible schedule.
@@ -59,7 +57,7 @@ Near a scheduled time, skip or turn automation off and wait for confirmation bef
 
 Open **Settings** from the pill to change the host-wide defaults: **automation on, 200,000 tokens, 55 minutes after a reply finishes**, with all Claude providers enabled. [View settings](assets/settings.png).
 
-Automatic compaction uses TTL metadata from the session transcript, then explicit Claude settings. If TTL is unavailable, scheduling stays enabled using a one-hour assumption. A known five-minute window cannot cover a 55-minute delay. Installing or updating does not schedule old conversations; expired reservations are not replayed. Compaction consumes tokens and may lose detail; cache hits and savings are not guaranteed.
+When the cache lifetime is unavailable, the plugin assumes one hour. A known five-minute cache window cannot cover the default 55-minute delay. Installing or updating does not schedule existing conversations retroactively. Compaction consumes tokens and may lose detail; cache hits and savings are not guaranteed.
 
 ## Update
 
@@ -69,7 +67,7 @@ Review and apply available updates on the daemon machine:
 paseo plugin update auto-compact-for-claude
 ```
 
-Review the proposed commit before confirming. Direct GitHub updates follow the repository's default branch. Reopen Claude sessions after an observer update so they load the new version; reloading a plugin cannot replace the observer in an already running Claude process. For a local development installation, see [development](docs/development.md).
+Review the proposed commit before confirming. Direct GitHub updates follow the repository's default branch. Reopen Claude sessions after an update so they use the new version.
 
 ## Remove
 
@@ -79,8 +77,6 @@ Turn automation off in Settings, then remove the plugin:
 paseo plugin remove auto-compact-for-claude
 ```
 
-Reopen remaining sessions when convenient to unload the observer. Upgrading from an older version that changed the launch command: see [migration](docs/runtime.md#upgrading-from-the-previous-execution-path).
+Reopen remaining sessions when convenient to finish removing the plugin.
 
-[Setup and troubleshooting](docs/runtime.md) · [Development](docs/development.md) · [Third-party notices](THIRD_PARTY_NOTICES.md)
-
-Maintainers: run `npm run test:update` after changes. [Repeatable Linux/Windows simulation](docs/testing.md).
+[Setup and troubleshooting](docs/runtime.md) · [Third-party notices](THIRD_PARTY_NOTICES.md)
