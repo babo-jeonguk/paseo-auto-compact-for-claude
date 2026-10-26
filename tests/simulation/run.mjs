@@ -14,7 +14,7 @@ import { scenarios } from './scenarios.mjs';
 const here = dirname(fileURLToPath(import.meta.url));
 const plugin = resolve(here, '../..');
 if (process.argv.includes('--help')) {
-  console.log('npm run test:simulation -- [--expect-platform linux|win32] [--claude /native/claude] [--tools /npm/prefix] [--report-dir /results]');
+  console.log('npm run test:simulation:0.12 -- [--expect-platform linux|win32] [--claude /native/claude] [--tools /npm/prefix] [--report-dir /results]');
   process.exit(0);
 }
 const value = (name, fallback) => {
@@ -23,7 +23,14 @@ const value = (name, fallback) => {
   if (!process.argv[at + 1] || process.argv[at + 1].startsWith('--')) throw new Error(`Missing value: ${name}`);
   return process.argv[at + 1];
 };
-const reportDir = resolve(value('--report-dir', join(plugin, 'test-results', `${process.platform}-${process.arch}`)));
+const paseoRequested = value('--paseo', '0.12.0');
+const paseoPackages = new Map([
+  ['0.12.0', '@getpaseo/cli-0-12'],
+  ['0.13.0', '@getpaseo/cli-0-13'],
+]);
+assert(paseoPackages.has(paseoRequested), `Unsupported Paseo simulation version: ${paseoRequested}`);
+const reportRoot = resolve(value('--report-dir', join(plugin, 'test-results', `${process.platform}-${process.arch}`)));
+const reportDir = join(reportRoot, `paseo-${paseoRequested}`);
 const tools = resolve(value('--tools', process.env.SIMULATION_TOOLS ?? here));
 await mkdir(reportDir, { recursive: true });
 const root = await mkdtemp(join(tmpdir(), 'Auto Compact simulation 한글 '));
@@ -45,7 +52,7 @@ for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, () => {
   void stop().finally(() => { process.exitCode = 1; });
 });
 try {
-  const accepted = new Set(['--expect-platform', '--claude', '--tools', '--report-dir']);
+  const accepted = new Set(['--paseo', '--expect-platform', '--claude', '--tools', '--report-dir']);
   for (let i = 2; i < process.argv.length; i += 2) {
     assert(accepted.has(process.argv[i]), `Unknown simulation option: ${process.argv[i]}`);
     assert(process.argv[i + 1] && !process.argv[i + 1].startsWith('--'), `Missing value: ${process.argv[i]}`);
@@ -54,7 +61,19 @@ try {
   const expected = value('--expect-platform', process.platform);
   assert.equal(process.platform, expected, 'Native OS mismatch: run this using that OS\'s Node executable');
   const requireTools = createRequire(join(tools, 'package.json'));
-  try { requireTools.resolve('@getpaseo/cli/package.json'); }
+  const alias = paseoPackages.get(paseoRequested);
+  let cliPackage;
+  const resolveCli = () => {
+    try { return requireTools.resolve(`${alias}/package.json`); }
+    catch {
+      const candidate = requireTools.resolve('@getpaseo/cli/package.json');
+      const installed = requireTools(candidate).version;
+      if (installed !== paseoRequested)
+        throw new Error(`Simulation tools have Paseo ${installed}; expected ${paseoRequested}`);
+      return candidate;
+    }
+  };
+  try { cliPackage = resolveCli(); }
   catch {
     if (tools !== here) throw new Error('Simulation tools unavailable at --tools');
     const npm = process.env.npm_execpath;
@@ -64,8 +83,11 @@ try {
       const child = spawn(process.execPath, [npm, 'ci', '--prefix', here, '--ignore-scripts', '--no-audit', '--no-fund'], { stdio: 'inherit', windowsHide: true });
       child.on('error', reject); child.on('exit', code => code === 0 ? resolve() : reject(new Error(`Tool installation exited ${code}`)));
     });
+    cliPackage = resolveCli();
   }
-  report.paseo = JSON.parse(await readFile(requireTools.resolve('@getpaseo/cli/package.json'), 'utf8')).version;
+  report.paseo = JSON.parse(await readFile(cliPackage, 'utf8')).version;
+  assert.equal(report.paseo, paseoRequested, 'Resolved Paseo version does not match the requested version');
+  report.appVersion = report.paseo;
   let binary = value('--claude', process.env.SIMULATION_CLAUDE_BINARY);
   if (!binary) {
     const vendor = `@anthropic-ai/claude-code-${process.platform}-${process.arch}`;
@@ -77,13 +99,14 @@ try {
   console.log(`Native ${process.platform}/${process.arch}; Node ${process.version}; Paseo ${report.paseo}; Claude ${report.claude}`);
   for (const path of ['index.server.ts', 'server/cache.ts', 'server/observer.ts', 'server/observer-source.mjs',
     'server/observer-assets.generated.ts', 'server/gateway.ts', 'server/scheduler.ts', 'shared/settings.ts',
-    'server/model.ts', 'server/store.ts', 'server/timeline.ts', 'shared/rpc.ts', 'shared/providers.ts', 'paseo-plugin.json', 'package.json'])
+    'server/model.ts', 'server/store.ts', 'shared/rpc.ts', 'shared/providers.ts', 'paseo-plugin.json', 'package.json'])
     report.sourceFiles[path] = sha(await readFile(join(plugin, path)));
   report.simulationFiles = {};
-  for (const path of ['run.mjs', 'fixture.mjs', 'model.mjs', 'scenarios.mjs', 'package.json', 'package-lock.json'])
+  for (const path of ['matrix.mjs', 'run.mjs', 'fixture.mjs', 'model.mjs', 'scenarios.mjs', 'package.json', 'package-lock.json'])
     report.simulationFiles[path] = sha(await readFile(join(here, path)));
   model = await startModel();
-  fixture = await startFixture({ root, plugin, tools, binary, model, reportDir });
+  fixture = await startFixture({ root, plugin, cliPackage, appVersion: report.appVersion,
+    binary, model, reportDir });
   context = { fixture, model };
   for (const scenario of scenarios) {
     const started = Date.now();

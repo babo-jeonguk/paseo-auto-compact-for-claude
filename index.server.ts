@@ -2,7 +2,6 @@ import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { createGateway } from "./server/gateway";
 import { createScheduler } from "./server/scheduler";
 import { createStore } from "./server/store";
-import { isCompactCommandTurn } from "./server/timeline";
 import { createObserver } from "./server/observer";
 import { claudeProvider } from "./shared/providers";
 import {
@@ -52,7 +51,9 @@ export default function contribute(server: PluginServerContext) {
         host.ended(event);
         return;
       }
-      if (isCompactCommandTurn(event.timeline)) return;
+      // Paseo 0.13 no longer includes history in this event. Observe native
+      // activity instead; the scheduler deduplicates the unchanged activity
+      // identity produced by a manual compact on both Paseo 0.12 and 0.13.
       void observe().catch(report);
     }),
     ...(

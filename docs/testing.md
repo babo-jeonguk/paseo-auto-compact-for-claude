@@ -14,11 +14,11 @@ npm run test:update
 
 In Windows PowerShell, `npm.cmd run test:update` also works when execution policy blocks `npm.ps1`. Run with **Windows Node** to test Windows; WSL Node tests Linux. The runner records `process.platform`, architecture, OS release, Node/Claude/Paseo versions and product source hashes.
 
-The command runs type checks, the fast regression suite and the native simulation. On first use it installs the pinned simulation tools from `tests/simulation/package-lock.json`. This needs network access and can take several minutes. Later runs reuse them. Nothing is installed globally and no Claude login is required.
+The command runs type checks, the fast regression suite and the native simulation once with Paseo **0.12.0** and once with **0.13.0**. On first use it installs both pinned Paseo toolchains and Claude from `tests/simulation/package-lock.json`. This needs network access and can take several minutes. Later runs reuse them. Nothing is installed globally and no Claude login is required.
 
 ## What is real and what is simulated
 
-The simulation starts stock **Paseo 0.12.0**, native **Claude Code 2.1.306**, and this checkout's actual plugin. Only model responses come from a synthetic loopback HTTP server. Native transcript creation, Mod loading, public RPC, settings persistence, process restart and automatic timers run normally. The fixture reports a 500k context to a 1M model so the real 400k threshold can be exercised without sending a huge prompt.
+Each simulation starts stock **Paseo 0.12.0 or 0.13.0**, native **Claude Code 2.1.306**, and this checkout's actual plugin. The client handshake uses the selected toolchain's real version. Only model responses come from a synthetic loopback HTTP server. Native transcript creation, Mod loading, public RPC, settings persistence, process restart and automatic timers run normally. The fixture reports a 500k context to a 1M model so the real 400k threshold can be exercised without sending a huge prompt.
 
 Each run uses temporary HOME/USERPROFILE, Claude settings, Paseo configuration, agents and ports. The native process receives a synthetic API key and a local model URL. Existing Paseo and Claude sessions/settings are not used. Successful runs stop their process trees and delete the temporary home. Failed runs retain the temporary path in `report.json` for diagnosis.
 
@@ -51,7 +51,7 @@ This does not measure Anthropic's real cache lifetime, billing savings or summar
 
 ## Reports and failure handling
 
-Results are written under `test-results/<platform>-<arch>/`:
+Results are written under `test-results/<platform>-<arch>/paseo-<version>/`:
 
 - `report.json`: OS/version/source fingerprints, per-scenario pass/fail/duration, model-request metadata, failure state and retained temporary path.
 - `junit.xml`: CI-compatible failures and explicit not-run cases.
@@ -65,14 +65,14 @@ Run only the native simulation:
 
 ```sh
 npm run test:simulation
-npm run test:simulation -- --expect-platform linux
-npm run test:simulation -- --expect-platform win32
+npm run test:simulation:0.12 -- --expect-platform linux
+npm run test:simulation:0.13 -- --expect-platform win32
 ```
 
-Use `--claude /absolute/native/claude`, `--tools /npm/prefix`, or `--report-dir /results` when needed. The tools prefix must contain the Paseo CLI and its dependencies. Overrides still use an isolated home and the local model server. `npm run test:simulation -- --help` lists the options.
+The first command runs both versions. The version-specific commands accept `--claude /absolute/native/claude`, `--tools /npm/prefix`, or `--report-dir /results`. A custom tools prefix may contain the matching ordinary `@getpaseo/cli` package or the versioned aliases used by this repository. Overrides still use an isolated home and the local model server. `npm run test:simulation:0.12 -- --help` lists the options.
 
-To change the tested Claude/Paseo version, edit `tests/simulation/package.json`, regenerate its lockfile with `npm install --prefix tests/simulation --ignore-scripts`, and run the full suite on both OSes. Commit both package and lockfile. Do not infer native compatibility from the unit suite alone.
+To change a tested Claude/Paseo version, edit its exact alias in `tests/simulation/package.json`, regenerate the lockfile with `npm install --prefix tests/simulation --ignore-scripts`, and run the full suite on both OSes. Commit both package and lockfile. Keep 0.12 in the matrix while it remains the declared minimum. Do not infer native compatibility from the unit suite alone.
 
 ## CI
 
-[Check workflow](https://github.com/babo-jeonguk/paseo-auto-compact-for-claude/blob/main/.github/workflows/check.yml) has native simulation jobs on **ubuntu-latest** and **windows-latest**, in addition to fast checks on Linux, macOS and Windows. Pull requests, pushes and manual workflow dispatch run them and upload their reports/logs even when a test fails. No API secret is needed. [View workflow runs](https://github.com/babo-jeonguk/paseo-auto-compact-for-claude/actions/workflows/check.yml). Native macOS execution is not covered by the fast macOS checks.
+[Check workflow](https://github.com/babo-jeonguk/paseo-auto-compact-for-claude/blob/main/.github/workflows/check.yml) has Paseo 0.12/0.13 native simulation jobs on **ubuntu-latest** and **windows-latest**, in addition to fast SDK 0.12/0.13 checks on Linux, macOS and Windows. Pull requests, pushes and manual workflow dispatch run them and upload their reports/logs even when a test fails. No API secret is needed. [View workflow runs](https://github.com/babo-jeonguk/paseo-auto-compact-for-claude/actions/workflows/check.yml). Native macOS execution is not covered by the fast macOS checks.
