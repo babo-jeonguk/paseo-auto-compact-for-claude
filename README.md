@@ -14,7 +14,7 @@ Codex subscription sessions do not need this plugin: [caches are retained indefi
 
 ## Requirements
 
-- **Paseo 0.12 or later**. The current execution path is tested on Linux and Windows with isolated native sessions; macOS needs native verification. [Test scope](docs/testing.md).
+- **Paseo 0.12 or later**. Paseo 0.12 and 0.13 are covered by the isolated native simulation suite. Both pass on Linux; CI also runs both on Windows. macOS needs native verification. [Test scope](docs/testing.md).
 - A Claude provider using a native Claude Code CLI that supports Mods. Tested with CLI **2.1.306**. Claude profiles are supported too.
 - Paseo web app. Native mobile apps are unverified.
 

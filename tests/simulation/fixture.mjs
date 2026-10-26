@@ -20,8 +20,9 @@ export async function waitFor(fn, label, timeout = 45_000) {
   throw new Error(`Timed out: ${label}${lastError ? ` (${lastError.message})` : ''}`);
 }
 
-export async function startFixture({ root, plugin, tools, binary, model, reportDir }) {
-  const requireTools = createRequire(join(tools, 'package.json'));
+export async function startFixture({ root, plugin, cliPackage, appVersion, binary, model, reportDir }) {
+  const requireTools = createRequire(cliPackage);
+  const cliRoot = dirname(cliPackage);
   const { DaemonClient } = await import(pathToFileURL(requireTools.resolve('@getpaseo/client/internal/daemon-client')));
   const { readLocalCredentialForTarget } = await import(pathToFileURL(requireTools.resolve('@getpaseo/server/daemon-control')));
   const { WebSocket } = requireTools('ws');
@@ -59,7 +60,7 @@ export async function startFixture({ root, plugin, tools, binary, model, reportD
     launchError = undefined;
     const log = openSync(join(reportDir, `daemon-${++generation}.log`), 'w');
     try {
-      daemon = spawn(process.execPath, ['--no-maglev', join(dirname(requireTools.resolve('@getpaseo/cli/package.json')), 'bin/paseo'),
+      daemon = spawn(process.execPath, ['--no-maglev', join(cliRoot, 'bin/paseo'),
         'daemon', 'run', '--home', home], { env: environment, stdio: ['ignore', log, log],
         detached: process.platform !== 'win32', windowsHide: true });
       daemon.on('error', error => { launchError = error; });
@@ -69,7 +70,7 @@ export async function startFixture({ root, plugin, tools, binary, model, reportD
       if (launchError) throw launchError;
       assert.equal(daemon.exitCode, null, 'Isolated Paseo daemon exited; inspect daemon log');
       const candidate = new DaemonClient({ url: `ws://${target}/ws`, clientId: 'auto-compact-simulation',
-        clientType: 'cli', appVersion: '0.12.0', connectTimeoutMs: 1000, reconnect: { enabled: false },
+        clientType: 'cli', appVersion, connectTimeoutMs: 1000, reconnect: { enabled: false },
         localCredential: async () => readLocalCredentialForTarget(home, target) ?? undefined,
         webSocketFactory: (url, options) => new WebSocket(url, options?.protocols, { headers: options?.headers }) });
       try { await candidate.connect(); client = candidate; return; }

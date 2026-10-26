@@ -11,6 +11,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+        paseo-sdk: [0.12.0, 0.13.0]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
@@ -20,6 +21,8 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci --ignore-scripts
+      - if: matrix.paseo-sdk == '0.13.0'
+        run: npm install --ignore-scripts --no-save --package-lock=false @getpaseo/client@0.13.0 @getpaseo/plugin@0.13.0 @getpaseo/protocol@0.13.0
       - run: npm run check
   simulation:
     strategy:
@@ -47,6 +50,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: simulation-${{ matrix.platform }}
+          name: simulation-${{ matrix.platform }}-paseo-0.12-0.13
           path: test-results/
           if-no-files-found: error
