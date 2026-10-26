@@ -45,7 +45,7 @@ test("plugin state or observer failures cannot prevent a Claude session from ope
     console.error = errors;
     if (previous === undefined) delete process.env.PASEO_HOME;
     else process.env.PASEO_HOME = previous;
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 });
   }
 });
 
@@ -84,6 +84,6 @@ test("turn-ended hooks use native activity without reading the deprecated timeli
     dispose();
     if (previous === undefined) delete process.env.PASEO_HOME;
     else process.env.PASEO_HOME = previous;
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 });
   }
 });
