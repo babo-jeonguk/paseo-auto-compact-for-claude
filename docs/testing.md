@@ -57,6 +57,8 @@ This does not measure Anthropic's real cache lifetime, billing savings or summar
 
 `npm run test:e2e` installs the released plugin from GitHub with the real `paseo` CLI, updates it to the ref under test, runs every scenario above against that install, then rolls back and forward again. It runs unchanged on Linux and Windows. See [tests/e2e/README.md](../tests/e2e/README.md).
 
+On 2026-10-28 it passed **24/24 on each of four runs**: Linux x64 (WSL2, Node 24.21.0) and Windows 11 build 26100 (Node 24.22.1, MinGit 2.56.0), each with Paseo 0.12.0 and 0.13.0 and Claude Code 2.1.306. Each run installed v1.0.2 (`6dfdb98`) from GitHub, updated to `durable-compaction-operations` at `0d06005`, sent 37 synthetic model requests and no other connection. Later commits on that branch change only tests and docs. The only plugin stderr was v1.0.2's expected refusal after rollback. On a heavily loaded Linux host, Paseo's own plugin start limit (about 40 seconds) was hit twice, by v1.0.2 and by this version alike; normal starts took 8–22 seconds there and 8–18 seconds on Windows.
+
 ## Optional browser validation
 
 `tests/simulation/browser.mjs` opens the packaged Paseo web client in a real Chromium browser against an isolated native daemon and the loopback model. It checks Skip, Undo, manual compact confirmation and recovery of the completed result after reloading the conversation. Browser validation is separate from the default native matrix and CI jobs.
