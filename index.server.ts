@@ -20,8 +20,12 @@ export default function contribute(server: PluginServerContext) {
   const settings = server.registerSettings(compactSettings);
   const observer = createObserver();
   const host = createGateway({ observer });
-  const report = (error: unknown) =>
-    console.error("[auto-compact-for-claude]", String(error));
+  // Paseo closes this plugin's API just before calling the cleanup below, so work in
+  // flight then fails with a closed client. Its durable state recovers on next start.
+  let disposed = false;
+  const report = (error: unknown) => {
+    if (!disposed) console.error("[auto-compact-for-claude]", String(error));
+  };
   const scheduler = createScheduler({
     store: createStore(),
     gateway: host.gateway,
@@ -135,6 +139,7 @@ export default function contribute(server: PluginServerContext) {
     void observe().catch(report);
   }, 10_000);
   return () => {
+    disposed = true;
     clearInterval(timer);
     scheduler.stop();
     host.stop();
