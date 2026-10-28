@@ -21,8 +21,9 @@ export async function waitFor(fn, label, timeout = 45_000) {
 }
 
 // `install` replaces the default checkout install, e.g. with a GitHub install through the CLI.
+// `launcher` replaces `paseo daemon run`, e.g. with the desktop app that starts its own daemon.
 export async function startFixture({ root, plugin, cliPackage, appVersion, binary, model, reportDir, webUi = false,
-  install, providerEnv: extraProviderEnv = {}, readyTimeoutMs = 90_000 }) {
+  install, launcher, providerEnv: extraProviderEnv = {}, readyTimeoutMs = 90_000 }) {
   const requireTools = createRequire(cliPackage);
   const cliRoot = dirname(cliPackage);
   const { DaemonClient } = await import(pathToFileURL(requireTools.resolve('@getpaseo/client/internal/daemon-client')));
@@ -60,13 +61,17 @@ export async function startFixture({ root, plugin, cliPackage, appVersion, binar
   let daemon, client, workspace, launchError, generation = 0;
   async function start() {
     launchError = undefined;
-    const log = openSync(join(reportDir, `daemon-${++generation}.log`), 'w');
+    const logPath = join(reportDir, `daemon-${++generation}.log`);
+    if (launcher) daemon = await launcher.start({ environment, home, target, logPath });
+    else {
+    const log = openSync(logPath, 'w');
     try {
       daemon = spawn(process.execPath, ['--no-maglev', join(cliRoot, 'bin/paseo'),
         'daemon', 'run', '--home', home], { env: environment, stdio: ['ignore', log, log],
         detached: process.platform !== 'win32', windowsHide: true });
       daemon.on('error', error => { launchError = error; });
     } finally { closeSync(log); }
+    }
     const until = Date.now() + readyTimeoutMs;
     while (Date.now() < until) {
       if (launchError) throw launchError;
@@ -82,6 +87,7 @@ export async function startFixture({ root, plugin, cliPackage, appVersion, binar
   }
   async function stop() {
     await client?.close().catch(() => {}); client = undefined;
+    if (daemon?.stop) { await daemon.stop(); daemon = undefined; return; }
     if (!daemon?.pid) return;
     const pid = daemon.pid;
     if (process.platform === 'win32') {

@@ -58,9 +58,46 @@ Each run writes `report.json` and the daemon logs to `<report-dir>/<platform>-pa
 
 Item 5 documents a one-way door: v1.0.2 reads only state version 1, so after a rollback automation stops until the newer version returns.
 
+## Desktop app
+
+`tests/e2e/desktop.mjs` runs the released **Paseo desktop app** (Electron) in an isolated home. The app starts its own daemon on its Electron runtime, so the plugin's server code runs there rather than on the system Node. The plugin is installed from GitHub at `--to`, and Playwright drives the app window through the Chrome DevTools protocol. Playwright's `_electron.launch` cannot be used: it adds `--inspect`, which the app's command-line passthrough rejects.
+
+Get the app of the same Paseo version from its [GitHub release](https://github.com/getpaseo/paseo/releases) and extract it; nothing is installed:
+
+| OS | Release asset | `--app` |
+|---|---|---|
+| Linux x64 | `Paseo-<version>-x64.tar.gz` | the extracted `Paseo-<version>-x64` directory |
+| Windows x64 | `Paseo-Setup-<version>-x64.zip` | the directory holding `Paseo.exe` |
+
+```sh
+xvfb-run -a -s '-screen 0 1440x900x24' npm run test:e2e:desktop -- --paseo 0.13.0 --app <dir> --to <ref>
+```
+
+Linux needs a display; `xvfb-run` provides one. On Windows the app window appears on the desktop for the few minutes of the run. The app uses `PASEO_HOME` for its daemon and `PASEO_ELECTRON_USER_DATA_DIR` for its own data, both temporary, and its daemon is stopped at the end.
+
+The run keeps the app at the version under test and its UI readable:
+
+- **No self-update.** The app checks for, downloads and on Windows installs its own updates. Its Chromium network goes to a second refusing proxy through `PASEO_ELECTRON_FLAGS`; loopback stays direct. The daemon is not proxied, so the GitHub install still works. The report lists the refused app connections, and an item checks that no update was downloaded.
+- **English UI.** `--lang=en-US`, so Paseo's own strings match the selectors on a non-English Windows.
+- **Startup retry.** The app waits 30 seconds for the daemon it starts. On a slow host it then shows "The local server failed to start" while that daemon is still starting. The run clicks Retry, as a user would, up to three times and records each in `appStartupRetries` with a screenshot.
+
+| # | Item |
+|---|---|
+| 1 | The app starts a desktop-managed daemon of the requested version, running on the app's Electron executable |
+| 2 | The plugin installs from GitHub at `--to` into that daemon |
+| 3 | A conversation the desktop daemon starts loads the observer and earns a 55-minute reservation |
+| 4 | Skip and Undo in the app window update the daemon |
+| 5 | Confirmed Compact now in the app window compacts once in the same session |
+| 6 | The window shows the last compaction after reload |
+| 7 | Closing the window quits the app and, by the app's default, its daemon; reopening starts a new daemon and shows the last compaction without resending |
+| 8 | The app downloaded no update of itself |
+| 9 | No plugin errors in the daemon log |
+
+The report adds the Electron and bundled Node versions, the daemon executable and screenshots.
+
 ## Not covered
 
 - Real model responses, cache lifetime and billing.
 - The web UI; `tests/simulation/browser.mjs` covers it on Linux.
-- The desktop and mobile apps.
+- The mobile apps.
 - Connected remote hosts.
