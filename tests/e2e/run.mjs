@@ -84,9 +84,14 @@ async function moveTo(ref, key) {
   if (expected) assert.equal(report.revisions[key], expected, `installed revision for ${ref}`);
   return output;
 }
+// The plugin's own stderr: its console.error reports and Paseo's load/hook failures for it.
 const pluginLog = async () => (await Promise.all([1, 2, 3, 4].map(n =>
   readFile(join(reportDir, `daemon-${n}.log`), 'utf8').catch(() => '')))).join('\n')
-  .split(/\r?\n/).filter(line => line.includes(PLUGIN) && /error|unreadable|fail/i.test(line));
+  .split(/\r?\n/).flatMap(line => { try { return [JSON.parse(line)]; } catch { return []; } })
+  .filter(entry => entry.pluginId === PLUGIN && entry.stream === 'stderr').map(entry => String(entry.message));
+// The fixture stops a daemon by signalling its whole process group, so the plugin can exit before
+// Paseo delivers agent.closed during that shutdown. That is the harness, not the plugin.
+const shutdownNoise = line => /^Lifecycle hook agent\.closed failed: Plugin process exited/.test(line);
 
 // ---- 1. install the release a user has ------------------------------------------------------------
 const legacy = {};
@@ -168,7 +173,7 @@ check(`updating to ${TO} again restores operation without replay`, async () => {
 // ---- 6. daemon log ------------------------------------------------------------------------------
 check('daemon log has no plugin errors apart from the rollback refusal', async () => {
   const lines = await pluginLog();
-  const unexpected = lines.slice(0, report.logBeforeRollback ?? lines.length)
+  const unexpected = lines.slice(0, report.logBeforeRollback ?? lines.length).filter(line => !shutdownNoise(line))
     .concat(lines.slice(report.logBeforeRollback ?? lines.length).filter(line => !/unreadable/i.test(line)));
   report.pluginErrorLines = lines.slice(0, 40);
   assert.deepEqual(unexpected, []);
