@@ -95,9 +95,37 @@ The run keeps the app at the version under test and its UI readable:
 
 The report adds the Electron and bundled Node versions, the daemon executable and screenshots.
 
+## Android app
+
+`tests/e2e/android.mjs` runs the released **Paseo Android app** in a fresh emulator. The app connects by **Direct connection** to an isolated daemon on this host, where the plugin is installed from GitHub at `--to`. Paseo sends the plugin's client bundle to every connected app, so the plugin's controls run natively there: React Native views on Hermes. That includes the operation-ID fallback in `client/compact-submission.ts`, which browsers never take. uiautomator drives the app; the daemon's state is the evidence.
+
+Requirements:
+
+- An Android SDK with `platform-tools`, `emulator`, `cmdline-tools` and the system image (default `system-images;android-34;google_apis;x86_64`), plus hardware acceleration (KVM on Linux).
+- The APK of the same Paseo version from its [GitHub release](https://github.com/getpaseo/paseo/releases): `paseo-v<version>-android.apk`.
+
+```sh
+npm run test:e2e:android -- --paseo 0.13.0 --apk paseo-v0.13.0-android.apk --to <ref>
+```
+
+The run creates its own AVD under `--avd-home` (a temporary directory by default) and leaves other AVDs alone. It wipes its data on every boot and stops the emulator at the end. `adb reverse` maps the device's `127.0.0.1:<port>` to the daemon, so no password, relay or network setup is needed. The emulator needs about 2 GB of memory. On a heavily loaded host its own watchdog may stop it ("detected a hanging thread"); the run then fails at that step and should be repeated when the host is quieter. The emulator sometimes reports its System UI as not responding; the run taps Wait and counts these in `anrDismissed`.
+
+| # | Item |
+|---|---|
+| 1 | The plugin installs from GitHub at `--to`, and a conversation earns a 55-minute reservation |
+| 2 | The app of the requested version installs and connects to the daemon by direct connection |
+| 3 | The plugin pill renders natively with the reservation countdown |
+| 4 | Skip and Undo in the native sheet update the daemon |
+| 5 | Confirmed Compact now on the device compacts once, with an operation ID the device generated |
+| 6 | The sheet shows the last compaction |
+| 7 | Force-stopping and reopening the app shows the last result and sends nothing |
+| 8 | No plugin errors in the daemon log |
+
+The report records the Android, app and emulator versions, and the screenshots.
+
 ## Not covered
 
 - Real model responses, cache lifetime and billing.
 - The web UI; `tests/simulation/browser.mjs` covers it on Linux.
-- The mobile apps.
+- iOS.
 - Connected remote hosts.

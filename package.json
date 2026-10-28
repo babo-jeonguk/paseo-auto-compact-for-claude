@@ -24,6 +24,7 @@
     "test:simulation:0.13": "node --no-maglev tests/simulation/run.mjs --paseo 0.13.0",
     "test:e2e": "node --no-maglev tests/e2e/run.mjs",
     "test:e2e:desktop": "node --no-maglev tests/e2e/desktop.mjs",
+    "test:e2e:android": "node --no-maglev tests/e2e/android.mjs",
     "test:update": "npm run check && npm run test:simulation --"
   },
   "devDependencies": {
