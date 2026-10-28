@@ -158,7 +158,10 @@ check(`updating to ${TO} again restores operation without replay`, async () => {
   const requests = model.count;
   await moveTo(TO, 'forward');
   await waitFor(async () => (await fixture.rpc('list').catch(() => null))?.rows, 'list after roll forward');
-  assert.equal((await fixture.row(legacy.off)).enabled, false);
+  assert((await readState()).disabled.includes(legacy.off), 'conversation OFF survives rollback');
+  // The daemon restart scenario left this conversation unopened; open it like a user would.
+  await fixture.client.refreshAgent(legacy.off);
+  assert.equal((await waitFor(() => fixture.row(legacy.off), 'reopened OFF conversation')).enabled, false);
   assert.equal(model.count, requests);
 });
 
