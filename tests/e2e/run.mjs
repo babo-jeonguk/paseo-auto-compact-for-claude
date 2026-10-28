@@ -68,7 +68,7 @@ const revisionOf = info => info?.installation?.currentRevision ?? info?.commit ?
 const remoteRevision = async ref => {
   if (!SOURCE.startsWith('git:')) return null;
   const url = `https://github.com/${SOURCE.slice(4)}.git`;
-  const { stdout } = await promisify(execFile)('git', ['ls-remote', url, ref, `${ref}^{}`], { windowsHide: true, timeout: 60_000 });
+  const { stdout } = await promisify(execFile)('git', ['ls-remote', url, ref, `${ref}^{}`], { windowsHide: true, timeout: 60_000, cwd: tmpdir() });
   const rows = stdout.trim().split('\n').filter(Boolean).map(line => line.split('\t'));
   return (rows.find(([, name]) => name.endsWith('^{}')) ?? rows[0])?.[0] ?? null;
 };
