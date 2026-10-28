@@ -53,6 +53,10 @@ The retention scenario deliberately edits only the isolated fixture state while 
 
 This does not measure Anthropic's real cache lifetime, billing savings or summary quality. The default native matrix does not open a browser. The optional browser check below covers the web client; Electron/mobile rendering remains outside that check. Passing controlled input-overlap cases does not prove every possible race in Paseo's public send API is eliminated.
 
+## Install and upgrade E2E
+
+`npm run test:e2e` installs the released plugin from GitHub with the real `paseo` CLI, updates it to the ref under test, runs every scenario above against that install, then rolls back and forward again. It runs unchanged on Linux and Windows. See [tests/e2e/README.md](../tests/e2e/README.md).
+
 ## Optional browser validation
 
 `tests/simulation/browser.mjs` opens the packaged Paseo web client in a real Chromium browser against an isolated native daemon and the loopback model. It checks Skip, Undo, manual compact confirmation and recovery of the completed result after reloading the conversation. Browser validation is separate from the default native matrix and CI jobs.

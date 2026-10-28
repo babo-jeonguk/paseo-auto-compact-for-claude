@@ -20,7 +20,9 @@ export async function waitFor(fn, label, timeout = 45_000) {
   throw new Error(`Timed out: ${label}${lastError ? ` (${lastError.message})` : ''}`);
 }
 
-export async function startFixture({ root, plugin, cliPackage, appVersion, binary, model, reportDir, webUi = false }) {
+// `install` replaces the default checkout install, e.g. with a GitHub install through the CLI.
+export async function startFixture({ root, plugin, cliPackage, appVersion, binary, model, reportDir, webUi = false,
+  install, providerEnv: extraProviderEnv = {}, readyTimeoutMs = 90_000 }) {
   const requireTools = createRequire(cliPackage);
   const cliRoot = dirname(cliPackage);
   const { DaemonClient } = await import(pathToFileURL(requireTools.resolve('@getpaseo/client/internal/daemon-client')));
@@ -46,7 +48,7 @@ export async function startFixture({ root, plugin, cliPackage, appVersion, binar
   const providerEnv = { ...environment, CLAUDE_CONFIG_DIR: claude,
     ANTHROPIC_API_KEY: 'synthetic-loopback-only', ANTHROPIC_AUTH_TOKEN: '', CLAUDE_CODE_OAUTH_TOKEN: '',
     ANTHROPIC_BASE_URL: model.url, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
-    DISABLE_AUTOUPDATER: '1', DISABLE_AUTO_COMPACT: '1' };
+    DISABLE_AUTOUPDATER: '1', DISABLE_AUTO_COMPACT: '1', ...extraProviderEnv };
   await writeFile(join(home, 'config.json'), JSON.stringify({ version: 1, pluginsEnabled: true,
     daemon: { listen: target, relay: { enabled: false }, mcp: { enabled: false } },
     features: { dictation: { enabled: false }, voiceMode: { enabled: false }, webUi: { enabled: webUi } },
@@ -65,7 +67,7 @@ export async function startFixture({ root, plugin, cliPackage, appVersion, binar
         detached: process.platform !== 'win32', windowsHide: true });
       daemon.on('error', error => { launchError = error; });
     } finally { closeSync(log); }
-    const until = Date.now() + 90_000;
+    const until = Date.now() + readyTimeoutMs;
     while (Date.now() < until) {
       if (launchError) throw launchError;
       assert.equal(daemon.exitCode, null, 'Isolated Paseo daemon exited; inspect daemon log');
@@ -95,6 +97,12 @@ export async function startFixture({ root, plugin, cliPackage, appVersion, binar
   const fixture = {
     root, home, claude, binary, target, get client() { return client; },
     rpc: (name, input = {}) => client.invokePluginRpc('auto-compact-for-claude', `auto-compact.${name}`, input),
+    // The real `paseo` CLI against this isolated daemon home.
+    async paseo(...args) {
+      const { stdout } = await promisify(execFile)(process.execPath, [join(cliRoot, 'bin/paseo'), ...args, '--home', home],
+        { env: environment, timeout: 300_000, windowsHide: true, maxBuffer: 16 * 1024 * 1024 });
+      return stdout;
+    },
     async settings(values) {
       const current = await client.invokePluginRpc('auto-compact-for-claude', 'settings.automation.read', {});
       if (!values) return current.values;
@@ -141,7 +149,8 @@ export async function startFixture({ root, plugin, cliPackage, appVersion, binar
   };
   try {
     await start();
-    assert.equal((await client.installDirectoryPlugin(plugin)).status, 'running');
+    if (install) await install(fixture);
+    else assert.equal((await client.installDirectoryPlugin(plugin)).status, 'running');
     workspace = (await client.createWorkspace({ source: { kind: 'directory', path: root }, title: 'Auto Compact simulation' })).workspace;
     return fixture;
   } catch (error) { await stop(); throw error; }
