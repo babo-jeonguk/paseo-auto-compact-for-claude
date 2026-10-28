@@ -1,7 +1,11 @@
 import { randomUUID } from "node:crypto";
+import { bounded } from "./deadline";
 import type { Settings } from "../shared/settings";
-import type { Row } from "../shared/rpc";
-import type { Gateway, Job, Observation, State, StateStore } from "./model";
+import { operationPending, type CompactTarget, type Row } from "../shared/rpc";
+import type { Gateway, Job, Observation, State, StateStore, StoredOperation } from "./model";
+
+import { createOperationWorker, recoverOperations, OPERATION_TIMEOUT_MS, inputFingerprint, operationStatus, publicOperation, sameActivity } from "./operations";
+import { HISTORY_RETENTION_MS, HISTORY_SWEEP_INTERVAL_MS, pruneOperationHistory, type OperationReceipts } from "./retention";
 
 // This is a delivery grace period, never a claim about the provider cache TTL.
 export const DELIVERY_WINDOW_MS = 5 * 60_000;
@@ -13,12 +17,17 @@ export function createScheduler(options: {
   gateway: Gateway;
   settings: () => Promise<Settings | null>;
   now?: () => number;
+  onError?: (error: unknown) => void;
+  receipts?: OperationReceipts;
 }) {
-  const { store, gateway, settings } = options;
+  const { store, gateway } = options;
+  const settings = () => bounded(options.settings(), 5_000);
+  const refresh = (id: string) => bounded(gateway.refresh(id), 5_000);
   const now = options.now ?? Date.now;
+  const onError = options.onError ?? (() => {});
   let tail: Promise<unknown> = Promise.resolve();
-  let active = false;
   let stopped = false;
+  let nextCleanupAt = -Infinity;
   const serialize = <T>(fn: () => Promise<T>): Promise<T> => {
     const result = tail.then(fn);
     tail = result.catch(() => {});
@@ -42,19 +51,42 @@ export function createScheduler(options: {
   }
   async function recover() {
     const state = await store.read();
-    const config = await settings();
+    const config = await settings().catch(() => null);
+    recoverOperations(state, now());
     for (const job of state.jobs) {
-      if (job.status === "running") {
+      if (job.status === "running" && !state.operations.some(entry => entry.id === job.operationId)) {
         job.status = "unknown";
         job.detail = "Plugin restarted during compaction; no automatic retry";
-      } else if (config && !terminal(job) && now() >= due(job, config)) {
+      } else if (config && !terminal(job) && job.status !== "running" && now() >= due(job, config)) {
         job.status = "expired";
         job.detail =
           "Reservation elapsed while plugin was stopped; waiting for new conversation activity";
       }
     }
     await store.write(state);
+    await cleanup();
   }
+  async function cleanup() {
+    if (stopped || !options.receipts) return;
+    const at = now();
+    if (at < nextCleanupAt && nextCleanupAt <= at + HISTORY_SWEEP_INTERVAL_MS) return;
+    try {
+      const state = await store.read();
+      const result = await pruneOperationHistory(state, at, options.receipts, onError);
+      if (result.changed) await store.write(state);
+      // Only sweep orphans after the authoritative state commit succeeds.
+      await options.receipts.sweep(state.operations, at - HISTORY_RETENTION_MS);
+      nextCleanupAt = result.backlog ? -Infinity : at + HISTORY_SWEEP_INTERVAL_MS;
+    } catch (error) { onError(error); }
+  }
+  const worker = createOperationWorker({ store, gateway, settings, now, onError,
+    update: change => serialize(async () => {
+      const state = await store.read();
+      const result = change(state);
+      await store.write(state);
+      return result;
+    }),
+  });
   const ready = serialize(recover);
 
   async function view(
@@ -63,6 +95,9 @@ export function createScheduler(options: {
     config: Settings | null
   ): Promise<Row> {
     const job = state.jobs.find((job) => job.agentId === agent.agentId);
+    const operations = state.operations.filter(operation => operation.agentId === agent.agentId);
+    const latestOperation = operations.at(-1) ?? null;
+    const activeOperation = operations.find(operationPending) ?? null;
     const enabled = !state.disabled.includes(agent.agentId);
     let status: Row["status"] = "blocked";
     let detail = "Waiting for an observed ordinary turn to finish";
@@ -101,10 +136,10 @@ export function createScheduler(options: {
         status = "blocked";
         detail = "A Claude observer is required for automatic compaction";
       } else if (gateway.readiness) {
-        const blocked = await gateway.readiness(
+        const blocked = await bounded(gateway.readiness(
           agent,
           job && config ? due(job, config) : undefined
-        );
+        ), 5_000);
         if (blocked) {
           status = "blocked";
           detail = blocked;
@@ -115,7 +150,11 @@ export function createScheduler(options: {
       status = "busy";
       detail = "Session running or waiting for permission";
     }
-    const skipped = reversibleSkip(job, agent, config);
+    if (activeOperation) {
+      status = "running";
+      detail = "Waiting for completed compaction boundary";
+    }
+    const skipped = activeOperation ? null : reversibleSkip(job, agent, config);
     if (status === 'scheduled' && agent.cache) {
       const { ttlMinutes, source } = agent.cache;
       detail += `; ${ttlMinutes}-minute cache ${source === 'default' ? 'assumed (TTL unavailable)' : `from ${source}`}`;
@@ -123,9 +162,12 @@ export function createScheduler(options: {
     return {
       ...agent,
       enabled,
+      target: { sessionId: agent.sessionId, activityKey: agent.activityKey ?? null },
+      activeOperation: activeOperation ? publicOperation(activeOperation) : null,
+      latestOperation: latestOperation ? publicOperation(latestOperation) : null,
       undoSkip: skipped ? { id: skipped.id, dueAt: skipped.dueAt } : null,
       dueAt:
-        job &&
+        !activeOperation && job &&
         config &&
         job.revision === agent.revision &&
         !terminal(job) &&
@@ -134,70 +176,36 @@ export function createScheduler(options: {
           : null,
       status,
       detail,
+      operationId: activeOperation?.id ?? job?.operationId ?? null,
     };
   }
 
-  async function reserve(job: Job, state: State) {
-    active = true;
+  async function reserve(job: Job, state: State, operation: StoredOperation) {
     job.status = "running";
     job.detail = "Waiting for completed compaction boundary";
     job.attemptedAt = now();
-    try {
-      await store.write(state);
-    } catch (error) {
-      active = false;
-      throw error;
-    }
+    job.operationId = operation.id;
+    state.operations.push(operation);
+    await store.write(state);
   }
-  async function execute(job: Job, agent: Observation, automatic: boolean) {
-    try {
-      let result;
-      try {
-        if (stopped) throw new Error("Plugin stopping");
-        const config = await settings();
-        result = await (automatic
-          ? gateway.automatic!(agent, {
-              expiresAt: config ? due(job, config) + DELIVERY_WINDOW_MS : now(),
-              allowed: async () => {
-                const [latest, state] = await Promise.all([settings(), store.read()]);
-                return !stopped && !!latest && latest.enabled && allowed(agent, latest) &&
-                  agent.tokens !== null && agent.tokens >= latest.threshold &&
-                  !state.disabled.includes(agent.agentId) && now() >= due(job, latest) &&
-                  now() <= due(job, latest) + DELIVERY_WINDOW_MS;
-              },
-            })
-          : gateway.compact(agent.agentId, agent));
-      } catch {
-        result = {
-          status: "unknown" as const,
-          detail: "Compaction result unknown; no automatic retry",
-        };
-      }
-      const outcome = result;
-      await serialize(async () => {
-        const state = await store.read();
-        const current = state.jobs.find(
-          (entry) =>
-            entry.agentId === job.agentId &&
-            entry.revision === job.revision &&
-            entry.attemptedAt === job.attemptedAt
-        );
-        if (current) {
-          current.status = outcome.status;
-          current.detail = outcome.detail;
-          await store.write(state);
-        }
-      });
-      return result;
-    } finally {
-      active = false;
-    }
+  function newOperation(job: Job, agent: Observation, kind: StoredOperation["kind"],
+    id: string = randomUUID(), fingerprint: string | null = null): StoredOperation {
+    return { id, agentId: job.agentId, revision: job.revision, kind,
+      target: { sessionId: agent.sessionId, activityKey: agent.activityKey ?? null },
+      inputFingerprint: fingerprint, state: "requested", createdAt: now(), updatedAt: now(), result: null,
+      deadlineAt: now() + OPERATION_TIMEOUT_MS, reservationEndedAt: job.endedAt, attempt: 0 };
   }
+  const existingResult = (operation: StoredOperation) => ({
+    status: operationStatus(operation), detail: operation.result?.message ?? "Compaction requested",
+    operationId: operation.id, operation: publicOperation(operation), code: "existing" as const,
+  });
 
   return {
     ready,
+    reconcile: worker.reconcile,
     stop() {
       stopped = true;
+      worker.stop();
     },
     // Hooks are queued, but the gateway marks own turns synchronously before calling this.
     observedTurn: (agent: Observation, endedAt = now()) =>
@@ -249,7 +257,7 @@ export function createScheduler(options: {
         const [state, config, agent] = await Promise.all([
           store.read(),
           settings(),
-          gateway.refresh(agentId),
+          refresh(agentId),
         ]);
         return agent?.eligible ? view(agent, state, config) : null;
       }),
@@ -258,7 +266,7 @@ export function createScheduler(options: {
         const [state, config, agents] = await Promise.all([
           store.read(),
           settings(),
-          gateway.list(),
+          bounded(gateway.list(), 5_000),
         ]);
         return Promise.all(
           agents
@@ -284,7 +292,7 @@ export function createScheduler(options: {
       serialize(async () => {
         if (stopped) return false;
         const [state, config, agent] = await Promise.all([
-          store.read(), settings(), gateway.refresh(agentId),
+          store.read(), settings(), refresh(agentId),
         ]);
         const job = state.jobs.find(
           (job) => job.agentId === agentId && job.revision === revision
@@ -303,7 +311,7 @@ export function createScheduler(options: {
     undoSkip: (agentId: string, revision: string, skipId: string) =>
       serialize(async () => {
         const [state, config, agent] = await Promise.all([
-          store.read(), settings(), gateway.refresh(agentId),
+          store.read(), settings(), refresh(agentId),
         ]);
         const job = state.jobs.find(entry => entry.agentId === agentId);
         if (!agent || !job || job.revision !== revision ||
@@ -314,19 +322,29 @@ export function createScheduler(options: {
         await store.write(state);
         return true;
       }),
-    compactNow: async (agentId: string, revision: string) => {
+    operation: (operationId: string) => serialize(async () => {
+      const operation = (await store.read()).operations.find(entry => entry.id === operationId);
+      return operation ? publicOperation(operation) : null;
+    }),
+    compactNow: async (agentId: string, revision: string, operationId: string = randomUUID(), target?: CompactTarget) => {
       const prepared = await serialize(async () => {
-        if (active || stopped)
+        const state = await store.read();
+        const fingerprint = inputFingerprint(agentId, revision, target);
+        const prior = state.operations.find(entry => entry.id === operationId);
+        if (prior) return { result: prior.inputFingerprint === fingerprint
+          ? existingResult(prior)
+          : { status: "blocked" as const, detail: "Operation ID was already used with different input",
+              operationId: null, operation: null, code: "idempotency_conflict" as const } };
+        if (stopped || state.operations.some(operationPending))
           return {
             result: {
               status: "blocked" as const,
               detail: "Another compaction is running or plugin is stopping",
+              operationId: null, operation: null, code: "blocked" as const,
             },
           };
-        const [state, config, agent] = await Promise.all([
-          store.read(),
-          settings(),
-          gateway.refresh(agentId),
+        const [config, agent] = await Promise.all([
+          settings(), refresh(agentId),
         ]);
         // An explicit request is independent of automation switches, like the threshold.
         const refused = !config
@@ -335,23 +353,32 @@ export function createScheduler(options: {
           ? "This conversation is unavailable for compaction"
           : agent.revision !== revision
           ? "The conversation changed. Refresh and try again"
+          : target && (target.sessionId !== agent.sessionId || target.activityKey !== (agent.activityKey ?? null))
+          ? "The conversation session or activity changed. Refresh and try again"
           : !agent.idle
           ? "The conversation is busy. Wait until it finishes"
           : null;
         if (refused || !agent)
-          return { result: { status: "blocked" as const, detail: refused! } };
+          return { result: { status: "blocked" as const, detail: refused!, operationId: null,
+            operation: null, code: "blocked" as const } };
+        const attempted = state.operations.find(entry => sameActivity(entry, agent));
+        if (attempted) return { result: existingResult(attempted) };
         let job = state.jobs.find((job) => job.agentId === agentId);
         if (
           job &&
-          job.revision === revision &&
+          !state.operations.some(entry => entry.id === job?.operationId) &&
+          sameActivity({ agentId: job.agentId, revision: job.revision,
+            target: { sessionId: job.sessionId ?? null, activityKey: job.activityKey ?? null } }, agent) &&
           (job.attemptedAt !== undefined || job.status === "running")
         ) {
-          return { result: { status: job.status, detail: job.detail } };
+          return { result: { status: job.status, detail: job.detail,
+            operationId: job.operationId ?? null, operation: null, code: "existing" as const } };
         }
         job = {
           agentId,
           revision,
           endedAt: now(),
+          operationId,
           status: "scheduled",
           detail: "Explicit manual request",
           ...(agent.activityKey ? { activityKey: agent.activityKey } : {}),
@@ -361,18 +388,29 @@ export function createScheduler(options: {
           ...state.jobs.filter((entry) => entry.agentId !== agentId),
           job,
         ];
-        await reserve(job, state);
-        return { job, agent };
+        const operation = newOperation(job, agent, "manual", operationId, fingerprint);
+        await reserve(job, state, operation);
+        return { job, agent, operation };
       });
-      return "result" in prepared
-        ? prepared.result!
-        : execute(prepared.job, prepared.agent, false);
+      if ("result" in prepared) return prepared.result!;
+      // Paseo plugin RPCs have a shorter deadline than a real Claude
+      // compaction can take. Persist running before acknowledging the request,
+      // then let the existing session polling observe the final outcome.
+      void worker.reconcile().catch(onError);
+      return {
+        status: "running" as const,
+        detail: "Compaction requested; waiting for completed compaction boundary",
+        operationId: prepared.job.operationId!,
+        operation: publicOperation(prepared.operation), code: "accepted" as const,
+      };
     },
     tick: async (connected = true) => {
+      await serialize(cleanup);
+      await worker.reconcile(connected);
       const prepared = await serialize(async () => {
-        if (stopped || active) return;
+        if (stopped) return;
         const [state, config] = await Promise.all([store.read(), settings()]);
-        if (!config) return;
+        if (!config || state.operations.some(operationPending)) return;
         let changed = false;
         for (const job of [...state.jobs].sort(
           (a, b) => a.endedAt - b.endedAt
@@ -392,7 +430,7 @@ export function createScheduler(options: {
           )
             continue;
           if (!connected) continue;
-          const agent = await gateway.refresh(job.agentId);
+          const agent = await refresh(job.agentId);
           if (
             !agent ||
             agent.revision !== job.revision ||
@@ -415,7 +453,7 @@ export function createScheduler(options: {
             changed = true;
             continue;
           }
-          const blocked = await gateway.readiness?.(agent, due(job, config));
+          const blocked = gateway.readiness ? await bounded(gateway.readiness(agent, due(job, config)), 5_000) : null;
           if (blocked) {
             job.status = "blocked";
             job.detail = blocked;
@@ -444,13 +482,25 @@ export function createScheduler(options: {
             changed = true;
             continue;
           }
-          await reserve(job, state);
+          const attempted = state.operations.find(entry => sameActivity(entry, agent));
+          if (attempted) {
+            job.status = operationStatus(attempted);
+            job.detail = attempted.result?.message ?? "Compaction already requested";
+            job.operationId = attempted.id;
+            job.attemptedAt = attempted.createdAt;
+            changed = true;
+            continue;
+          }
+          const operation = newOperation(job, agent, "automatic");
+          operation.deliveryExpiresAt = due(job, latest) + DELIVERY_WINDOW_MS;
+          operation.deadlineAt = Math.min(operation.deadlineAt!, operation.deliveryExpiresAt);
+          await reserve(job, state, operation);
           // One operation per tick, host-wide serialization across all sessions.
           return { job, agent };
         }
         if (changed) await store.write(state);
       });
-      if (prepared) await execute(prepared.job, prepared.agent, true);
+      if (prepared) await worker.reconcile(connected);
     },
   };
 }

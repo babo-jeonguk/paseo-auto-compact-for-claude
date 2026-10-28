@@ -20,7 +20,7 @@ export async function waitFor(fn, label, timeout = 45_000) {
   throw new Error(`Timed out: ${label}${lastError ? ` (${lastError.message})` : ''}`);
 }
 
-export async function startFixture({ root, plugin, cliPackage, appVersion, binary, model, reportDir }) {
+export async function startFixture({ root, plugin, cliPackage, appVersion, binary, model, reportDir, webUi = false }) {
   const requireTools = createRequire(cliPackage);
   const cliRoot = dirname(cliPackage);
   const { DaemonClient } = await import(pathToFileURL(requireTools.resolve('@getpaseo/client/internal/daemon-client')));
@@ -49,7 +49,7 @@ export async function startFixture({ root, plugin, cliPackage, appVersion, binar
     DISABLE_AUTOUPDATER: '1', DISABLE_AUTO_COMPACT: '1' };
   await writeFile(join(home, 'config.json'), JSON.stringify({ version: 1, pluginsEnabled: true,
     daemon: { listen: target, relay: { enabled: false }, mcp: { enabled: false } },
-    features: { dictation: { enabled: false }, voiceMode: { enabled: false } },
+    features: { dictation: { enabled: false }, voiceMode: { enabled: false }, webUi: { enabled: webUi } },
     agents: { providers: {
       claude: { command: [binary], env: providerEnv },
       'claude-env': { extends: 'claude', label: 'Simulation explicit TTL', env: { CLAUDE_CODE_PROMPT_CACHE_TTL: '1h' } },
@@ -93,7 +93,7 @@ export async function startFixture({ root, plugin, cliPackage, appVersion, binar
     daemon = undefined;
   }
   const fixture = {
-    root, home, claude, binary, get client() { return client; },
+    root, home, claude, binary, target, get client() { return client; },
     rpc: (name, input = {}) => client.invokePluginRpc('auto-compact-for-claude', `auto-compact.${name}`, input),
     async settings(values) {
       const current = await client.invokePluginRpc('auto-compact-for-claude', 'settings.automation.read', {});
@@ -128,6 +128,11 @@ export async function startFixture({ root, plugin, cliPackage, appVersion, binar
         createHash('sha256').update(id).digest('hex'));
       const manifest = JSON.parse(await readFile(join(parent, 'current.json'), 'utf8'));
       return JSON.parse(await readFile(join(parent, manifest.launchId, 'ledger.json'), 'utf8'));
+    },
+    async receipt(id, operationId) {
+      const parent = join(home, 'plugin-data/auto-compact-for-claude/observers',
+        createHash('sha256').update(id).digest('hex'));
+      return JSON.parse(await readFile(join(parent, 'receipts', `${encodeURIComponent(operationId)}.json`), 'utf8'));
     },
     async claudeSettings(values) { await writeFile(join(claude, 'settings.json'), JSON.stringify(values)); },
     async restart() { await stop(); await start(); },

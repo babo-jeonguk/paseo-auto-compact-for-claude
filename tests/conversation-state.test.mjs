@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { canUndoSkip, sessionPresentation, pendingPresentation, sessionKey,
+import { canUndoSkip, compactCompletionNotice, sessionPresentation, pendingPresentation, sessionKey,
   STATUS_GRACE_MS, INPUT_IDLE_GRACE_MS } from "../client/session-state.ts";
 import { DEFAULT_SETTINGS } from "../shared/settings.ts";
 
@@ -98,4 +98,20 @@ test("undo requires a current explicit skip before its original deadline", () =>
   assert.equal(canUndoSkip({ ...skipped, revision: null }, now), false);
   for (const status of ["scheduled", "busy", "running", "completed", "failed", "unknown", "expired"])
     assert.equal(canUndoSkip({ ...skipped, status }, now), false, status);
+});
+
+test("only the matching Compact now operation produces a final toast notice", () => {
+  assert.equal(compactCompletionNotice(
+    { operationId: "operation-a", status: "running" }, "operation-a"), null);
+  assert.equal(compactCompletionNotice(
+    { operationId: "operation-b", status: "completed" }, "operation-a"), null);
+  assert.deepEqual(compactCompletionNotice(
+    { operationId: "operation-a", status: "completed" }, "operation-a"),
+  { variant: "success", message: "Conversation compacted" });
+  assert.deepEqual(compactCompletionNotice(
+    { operationId: "operation-a", status: "unknown" }, "operation-a"),
+  { variant: "error", message: "Check the conversation before trying again." });
+  assert.deepEqual(compactCompletionNotice(
+    { operationId: "operation-a", status: "failed" }, "operation-a"),
+  { variant: "error", message: "Couldn’t compact. Check the conversation." });
 });

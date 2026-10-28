@@ -1,7 +1,8 @@
 import type { PluginHandlerContext, PluginLifecycleEvents } from "@getpaseo/plugin/server";
 import { randomUUID } from "node:crypto";
-import type { Gateway, Observation, DispatchGuard } from "./model";
+import type { Gateway, Observation, DispatchGuard, ExecutionContext, OperationEvidence } from "./model";
 import type { createObserver } from "./observer";
+import { bounded } from "./deadline";
 import { claudeProvider } from "../shared/providers";
 export { claudeProvider } from "../shared/providers";
 
@@ -10,7 +11,7 @@ type Agent = NonNullable<Awaited<ReturnType<ReturnType<Api["agents"]["ref"]>["re
 type End = PluginLifecycleEvents["agent.turn_ended"];
 type Observer = ReturnType<typeof createObserver>;
 export function createGateway(options: {
-  observer?: Observer; now?: () => number; timeoutMs?: number; pollMs?: number;
+  observer?: Observer; now?: () => number; timeoutMs?: number; pollMs?: number; dispatchTimeoutMs?: number; cleanupTimeoutMs?: number;
 } = {}) {
   const { observer } = options;
   const now = options.now ?? Date.now;
@@ -43,8 +44,12 @@ export function createGateway(options: {
       busyReason: permission ? 'permission' : matched?.pendingInputs ? 'input' : 'reply',
       inputIdleSince,
       sessionId: agent.persistence?.sessionId ?? null,
-      activityKey: matched && matched.ordinaryRevision !== null && matched.ordinaryRevision === matched.revision
-        ? `${matched.launchId}:${matched.generation}:${matched.ordinaryRevision}` : null,
+      // Compaction consumes the ordinary scheduling window, but is still an
+      // attempt for that native activity. Keep its identity even when Paseo
+      // advances lastUserMessageAt for /compact and ordinaryRevision is cleared.
+      activityKey: matched && (matched.ordinaryRevision === matched.revision ||
+          matched.compact?.revision === matched.revision)
+        ? `${matched.launchId}:${matched.generation}:${matched.revision}` : null,
       observedEndedAt: matched?.ordinaryEndedAt ?? null,
       cache: matched?.cache ?? null,
     };
@@ -67,87 +72,143 @@ export function createGateway(options: {
       return current ? observation(current.agent) : null;
     },
     ...(observer ? {
-      automatic: (expected: Observation, guard?: DispatchGuard) => compact(expected.agentId, expected, true, guard),
+      automatic: (expected: Observation, guard?: DispatchGuard, execution?: ExecutionContext) => compact(expected.agentId, expected, true, guard, execution),
       readiness: (expected: Observation, dueAt?: number) => observer.readiness(expected, dueAt),
     } : {}),
-    compact: (id, expected) => compact(id, expected, false),
+    compact: (id, expected, execution) => compact(id, expected, false, undefined, execution),
+    async inspect(operation) {
+      const evidence = operation.evidence;
+      if (evidence?.invalidated) return { status: "unknown", detail: "Conversation changed during compaction; no automatic retry" };
+      if (!evidence?.native || !observer) return null;
+      const native = await observer.receipt(operation.agentId, evidence.native);
+      if (native && native.observedAt > (operation.deadlineAt ?? Infinity)) return null;
+      if (native?.status !== "completed") return native;
+      if (evidence.boundary && evidence.turnId)
+        return { status: "completed", detail: "Recovered matching native completion and command boundary" };
+      // History is evidence only when the caller-known message ID pins its turn.
+      // A bounded page can miss old work; absence is never proof of non-delivery.
+      const page = await requireApi().agents.ref(operation.agentId).timeline.refetch({ limit: 200 });
+      const command = page.entries.find(entry => entry.item.type === "user_message" &&
+        entry.item.clientMessageId === operation.id);
+      if (command?.turnId && page.entries.some(entry => entry.turnId === command.turnId &&
+          entry.item.type === "compaction" && entry.item.status === "completed" && entry.item.trigger === "manual"))
+        return { status: "completed", detail: "Recovered matching native completion and command boundary" };
+      return null;
+    },
   };
   async function compact(agentId: string, expected: Observation | undefined, automatic: boolean,
-    guard?: DispatchGuard): ReturnType<Gateway["compact"]> {
+    guard?: DispatchGuard, execution?: ExecutionContext): ReturnType<Gateway["compact"]> {
     if (busy.has(agentId) || stopped) return { status: "failed", detail: "Compaction already running or plugin stopped" };
     busy.add(agentId);
-    try { return await dispatch(agentId, expected, automatic, guard); }
+    try { return await dispatch(agentId, expected, automatic, guard, execution); }
     finally { busy.delete(agentId); }
   }
   async function dispatch(agentId: string, expected: Observation | undefined, automatic: boolean,
-    guard?: DispatchGuard): ReturnType<Gateway["compact"]> {
+    guard?: DispatchGuard, execution?: ExecutionContext): ReturnType<Gateway["compact"]> {
+    const deadline = Math.min(execution?.deadlineAt ?? Infinity, now() + (options.timeoutMs ?? 120_000));
+    const wait = <T>(work: Promise<T>) => bounded(work, deadline - now());
+    const currentWorker = () => !stopped && (execution?.current() ?? true) && now() < deadline;
     const ref = requireApi().agents.ref(agentId);
-    const before = await gateway.refresh(agentId);
-    if (!before?.sessionId || !before.idle || !before.eligible ||
-        (expected && (before.revision !== expected.revision || before.sessionId !== expected.sessionId ||
-          before.activityKey !== expected.activityKey)))
-      return { status: "failed", detail: "Claude session unavailable, busy or changed" };
-    const expiresAt = Math.min(guard?.expiresAt ?? Infinity, now() + (options.timeoutMs ?? 120_000));
+    const id = execution?.id ?? randomUUID();
     let operation: Awaited<ReturnType<Observer['prepare']>> | undefined;
-    if (observer) {
-      try { operation = await observer.prepare(before, automatic, expiresAt); }
-      catch (error) { return { status: "failed", detail: (error as Error).message }; }
-    } else if (automatic) return { status: "failed", detail: "Claude observer unavailable" };
-    const id = operation?.id ?? randomUUID();
-    let sent = false;
-    let armed = false, healthy = true, cancelled = false, superseded = false;
-    let boundary = false, ended: End | null = null;
+    let sent = false, armed = false, healthy = true, cancelled = false, superseded = false;
+    let boundary = false;
+    const evidence: OperationEvidence = {};
     const entry = { turnId: null as string | null, cancel() { cancelled = true; } };
-    pending.set(agentId, entry);
     let subscription: ReturnType<typeof ref.timeline.subscribe> | undefined;
-    // Lifecycle completion is secondary evidence only. Native PostCompact and a
-    // new boundary on our message's turn are required when the observer is loaded.
     const endings = new Map<string, End>();
-    const finish = (event: End) => { if (event.turnId) endings.set(event.turnId, event); };
-    completions.set(agentId, finish);
+    let saved = "", lastCheckpoint = 0;
+    async function checkpoint(force = false) {
+      if (!execution) return;
+      const value = { ...evidence, ...(entry.turnId ? { turnId: entry.turnId } : {}),
+        boundary, invalidated: !healthy || superseded,
+        turnCompleted: !!entry.turnId && endings.get(entry.turnId)?.outcome.kind === "completed" };
+      const serialized = JSON.stringify(value);
+      if (!force && serialized === saved && now() - lastCheckpoint < 5_000) return;
+      await wait(execution.checkpoint(value));
+      saved = serialized; lastCheckpoint = now();
+    }
     try {
+      const before = await wait(gateway.refresh(agentId));
+      if (!before?.sessionId || !before.idle || !before.eligible ||
+          (expected && (before.revision !== expected.revision || before.sessionId !== expected.sessionId ||
+            before.activityKey !== expected.activityKey)))
+        return { status: "failed", detail: "Claude session unavailable, busy or changed" };
+      const expiresAt = Math.min(guard?.expiresAt ?? Infinity, deadline);
+      if (observer) {
+        operation = await wait(observer.prepare(before, automatic, expiresAt, id));
+        const { launchId, generation, sessionId, revision } = operation;
+        evidence.native = { id, launchId, generation, sessionId, revision };
+        await checkpoint(true);
+      } else if (automatic) return { status: "failed", detail: "Claude observer unavailable" };
+      pending.set(agentId, entry);
+      completions.set(agentId, event => { if (armed && event.turnId) endings.set(event.turnId, event); });
       subscription = ref.timeline.subscribe(({ event }) => {
-      if (["replacement", "subscription_restored", "error"].includes(event.type)) healthy = false;
-      if (!armed || event.type !== "timeline") return;
-      if (event.item.type === "user_message") {
-        if (event.item.clientMessageId === id) entry.turnId = event.turnId ?? null;
-        else superseded = true;
-      }
-      if (event.item.type === "compaction" && event.item.status === "completed" &&
-          event.item.trigger === "manual" && entry.turnId !== null && event.turnId === entry.turnId)
-        boundary = true;
-    });
-      await subscription.ready;
-      const current = await gateway.refresh(agentId);
-      if (stopped || cancelled || !current?.idle || current.sessionId !== before.sessionId ||
+        if (!armed) return;
+        if (["replacement", "subscription_restored", "error"].includes(event.type)) healthy = false;
+        if (event.type !== "timeline") return;
+        if (event.item.type === "user_message") {
+          if (event.item.clientMessageId === id) entry.turnId = event.turnId ?? null;
+          else superseded = true;
+        }
+        if (event.item.type === "compaction" && event.item.status === "completed" &&
+            event.item.trigger === "manual" && entry.turnId !== null && event.turnId === entry.turnId)
+          boundary = true;
+      });
+      await wait(subscription.ready);
+      const current = await wait(gateway.refresh(agentId));
+      if (!currentWorker() || cancelled || !current?.idle || current.sessionId !== before.sessionId ||
           current.revision !== before.revision || current.activityKey !== before.activityKey ||
-          now() > expiresAt || (guard && !await guard.allowed()))
+          now() > expiresAt || (guard && !await wait(guard.allowed())))
         return { status: "failed", detail: "Reservation cancelled or session changed before send" };
+      // Durable marker must precede the external side effect. Recovery never
+      // resends once this marker exists, even if a crash preceded ref.send.
+      evidence.dispatchStartedAt = now();
+      await checkpoint(true);
+      if (!currentWorker() || cancelled)
+        return { status: "unknown", detail: "Worker stopped at dispatch boundary; no automatic retry" };
       armed = true;
       sent = true;
-      await ref.send("/compact", { messageId: id });
-      const finishBy = now() + (options.timeoutMs ?? 120_000);
-      while (now() <= finishBy && !stopped && !cancelled) {
+      const send = ref.send("/compact", { messageId: id });
+      // A rejection/timeout may still mean delivery. Inspect evidence until the
+      // original deadline; late send rejection is consumed by bounded().
+      await bounded(send, Math.min(options.dispatchTimeoutMs ?? 30_000, deadline - now())).catch(() => {});
+      while (currentWorker() && !cancelled) {
+        await checkpoint();
         if (!healthy || superseded) return { status: "unknown", detail: "Conversation changed during compaction; no automatic retry" };
-        const native = operation ? await observer!.result(agentId, operation) : null;
+        const native = operation ? await wait(observer!.receipt?.(agentId, evidence.native!) ?? Promise.resolve(null)) ??
+          await wait(observer!.result(agentId, operation)) : null;
         if (native && native.status !== "completed") return native;
-        ended = entry.turnId ? endings.get(entry.turnId) ?? null : null;
+        const ended = entry.turnId ? endings.get(entry.turnId) : null;
         if (ended && ended.outcome.kind !== "completed")
           return { status: "failed", detail: "Compact turn failed or was cancelled; no automatic retry" };
         if (boundary && (operation ? native?.status === "completed" : ended?.outcome.kind === "completed")) {
-          const after = await gateway.refresh(agentId);
+          const after = await wait(gateway.refresh(agentId));
           if (after?.sessionId !== before.sessionId)
             return { status: "failed", detail: "Claude session changed during compaction" };
+          await checkpoint(true);
+          if (!healthy || superseded || !currentWorker())
+            return { status: "unknown", detail: "Conversation changed during completion verification; no automatic retry" };
           return { status: "completed", detail: "Compaction completed in the same Claude session" };
         }
-        await new Promise(resolve => setTimeout(resolve, options.pollMs ?? 50));
+        await wait(new Promise(resolve => setTimeout(resolve, options.pollMs ?? 50)));
       }
       return { status: "unknown", detail: "Compaction completion unconfirmed; no automatic retry" };
+    } catch (error) {
+      return { status: sent ? "unknown" : "failed", detail: sent
+        ? "Compaction completion unconfirmed; no automatic retry"
+        : `Compaction stopped before send: ${String(error)}` };
     } finally {
-      completions.delete(agentId);
-      pending.delete(agentId);
-      if (operation) await observer!.cancel(operation, sent).catch(() => {});
-      await subscription?.release();
+      armed = false;
+      if (pending.get(agentId) === entry) {
+        completions.delete(agentId);
+        pending.delete(agentId);
+      }
+      const cleanupMs = options.cleanupTimeoutMs ?? 1_000;
+      await Promise.all([
+        operation ? bounded(observer!.cancel(operation, sent), cleanupMs).catch(() => {}) : undefined,
+        subscription ? bounded(Promise.resolve(subscription.release()), cleanupMs).catch(() => {}) : undefined,
+      ]);
     }
   }
   const completions = new Map<string, (event: End) => void>();

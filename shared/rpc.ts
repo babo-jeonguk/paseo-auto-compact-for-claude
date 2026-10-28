@@ -13,6 +13,35 @@ export const StatusSchema = z.enum([
   "failed",
   "unknown",
 ]);
+// Operation state is independent of reservation/presentation status.
+export const OperationStateSchema = z.enum(["requested", "dispatching", "observing", "succeeded", "failed", "expired", "unknown"]);
+export const CompactTargetSchema = z.object({
+  sessionId: z.string().nullable(),
+  activityKey: z.string().nullable(),
+});
+export type CompactTarget = z.infer<typeof CompactTargetSchema>;
+export const CompactOperationSchema = z.object({
+  id: z.string().min(1),
+  agentId: z.string(),
+  revision: z.string(),
+  target: CompactTargetSchema,
+  kind: z.enum(["manual", "automatic"]),
+  state: OperationStateSchema,
+  createdAt: z.number().finite(),
+  updatedAt: z.number().finite(),
+  result: z.object({ code: z.string(), message: z.string() }).nullable(),
+});
+export type CompactOperation = z.infer<typeof CompactOperationSchema>;
+export const operationPending = (operation: Pick<CompactOperation, "state">) =>
+  ["requested", "dispatching", "observing"].includes(operation.state);
+export function operationRowStatus(operation: Pick<CompactOperation, "state">) {
+  switch (operation.state) {
+    case "succeeded": return "completed" as const;
+    case "failed": case "unknown": case "expired": return operation.state;
+    default: return "running" as const;
+  }
+}
+
 export const RowSchema = z.object({
   agentId: z.string(),
   title: z.string().nullable(),
@@ -21,12 +50,18 @@ export const RowSchema = z.object({
   tokens: z.number().nullable(),
   revision: z.string().nullable(),
   enabled: z.boolean(),
+  target: CompactTargetSchema.optional(),
+  activeOperation: CompactOperationSchema.nullable().optional(),
+  latestOperation: CompactOperationSchema.nullable().optional(),
   // Only pending reservations have a due time; finished jobs keep their history privately.
   dueAt: z.number().nullable(),
   // Separate from an active reservation: only an explicit, still reversible skip.
   undoSkip: z.object({ id: z.string(), dueAt: z.number() }).nullable().default(null),
   status: StatusSchema,
   detail: z.string(),
+  // Present for an explicit Compact now attempt so the client can correlate
+  // its eventual polled outcome without keeping the initiating RPC open.
+  operationId: z.string().nullable().default(null),
   busyReason: z.enum(['reply', 'permission', 'input']).nullable().optional(),
   inputIdleSince: z.number().nullable().optional(),
   cache: z.object({ ttlMinutes: z.number(), source: z.enum(['transcript', 'settings', 'environment', 'default']),
@@ -69,6 +104,22 @@ export const undoSkipRpc = defineRpc({
 });
 export const compactRpc = defineRpc({
   name: "auto-compact.now",
-  input: z.object({ agentId: z.string(), revision: z.string() }),
-  output: z.object({ status: StatusSchema, detail: z.string() }),
+  input: z.object({
+    agentId: z.string(), revision: z.string(),
+    // Optional only for clients mounted before the upgrade. New clients supply both.
+    operationId: z.string().uuid().optional(),
+    target: CompactTargetSchema.optional(),
+  }),
+  output: z.object({
+    status: StatusSchema,
+    detail: z.string(),
+    operationId: z.string().nullable().default(null),
+    operation: CompactOperationSchema.nullable(),
+    code: z.enum(["accepted", "existing", "blocked", "idempotency_conflict"]),
+  }),
+});
+export const operationRpc = defineRpc({
+  name: "auto-compact.operation",
+  input: z.object({ operationId: z.string().min(1) }),
+  output: z.object({ operation: CompactOperationSchema.nullable() }),
 });

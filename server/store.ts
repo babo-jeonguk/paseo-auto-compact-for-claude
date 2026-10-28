@@ -1,12 +1,12 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { z } from "zod";
-import { StatusSchema } from "../shared/rpc";
+import { CompactOperationSchema, StatusSchema } from "../shared/rpc";
 import type { State, StateStore } from "./model";
 
-const StateSchema = z.object({
+const LegacyStateSchema = z.object({
   version: z.literal(1),
   disabled: z.array(z.string()),
   jobs: z.array(
@@ -17,6 +17,7 @@ const StateSchema = z.object({
       status: StatusSchema,
       detail: z.string(),
       attemptedAt: z.number().finite().optional(),
+      operationId: z.string().optional(),
       activityKey: z.string().optional(),
       sessionId: z.string().optional(),
       skip: z.object({
@@ -27,6 +28,54 @@ const StateSchema = z.object({
     })
   ),
 });
+const StateSchema = LegacyStateSchema.extend({
+  version: z.literal(2),
+  operations: z.array(CompactOperationSchema.extend({
+    inputFingerprint: z.string().nullable(),
+    deadlineAt: z.number().finite().optional(), deliveryExpiresAt: z.number().finite().optional(),
+    reservationEndedAt: z.number().finite().optional(), nextAttemptAt: z.number().finite().optional(), attempt: z.number().int().nonnegative().optional(),
+    leaseOwner: z.string().optional(), leaseUntil: z.number().finite().optional(),
+    evidence: z.object({
+      native: z.object({ id: z.string(), launchId: z.string(), generation: z.string(),
+        sessionId: z.string().nullable(), revision: z.number().int() }).optional(),
+      dispatchStartedAt: z.number().finite().optional(), turnId: z.string().optional(),
+      boundary: z.boolean().optional(), turnCompleted: z.boolean().optional(), invalidated: z.boolean().optional(),
+    }).optional(),
+  })),
+}).superRefine((state, context) => {
+  const ids = state.operations.map(operation => operation.id);
+  if (new Set(ids).size !== ids.length)
+    context.addIssue({ code: "custom", message: "Duplicate operation identities" });
+});
+
+function decode(value: unknown): State {
+  if ((value as { version?: unknown })?.version !== 1) return StateSchema.parse(value);
+  const legacy = LegacyStateSchema.parse(value);
+  const operations: State["operations"] = [];
+  for (const job of legacy.jobs) {
+    if (!["running", "completed", "failed", "unknown"].includes(job.status)) continue;
+    // Stable IDs make repeated reads/migration retries deterministic.
+    const id = job.operationId ?? "legacy-" + createHash("sha256").update(JSON.stringify([
+      job.agentId, job.revision, job.attemptedAt ?? job.endedAt,
+    ])).digest("hex");
+    const manual = !!job.operationId;
+    if (job.status === "running") {
+      job.status = "unknown";
+      job.detail = "Plugin restarted during compaction; no automatic retry";
+    }
+    operations.push({
+      id, agentId: job.agentId, revision: job.revision,
+      target: { sessionId: job.sessionId ?? null, activityKey: job.activityKey ?? null },
+      kind: manual ? "manual" : "automatic", inputFingerprint: null,
+      state: job.status === "completed" ? "succeeded" : job.status as "failed" | "unknown",
+      createdAt: job.attemptedAt ?? job.endedAt, updatedAt: job.attemptedAt ?? job.endedAt,
+      result: { code: "legacy_outcome", message: job.detail },
+    });
+    job.operationId = id;
+  }
+  return StateSchema.parse({ ...legacy, version: 2, operations });
+}
+
 export function createStore(
   path = join(
     process.env.PASEO_HOME || join(homedir(), ".paseo"),
@@ -38,7 +87,7 @@ export function createStore(
   return {
     async read() {
       try {
-        const state = StateSchema.parse(JSON.parse(await readFile(path, "utf8")));
+        const state = decode(JSON.parse(await readFile(path, "utf8")));
         for (const job of state.jobs) {
           if (!job.activityKey && ["scheduled", "blocked", "busy", "disabled"].includes(job.status)) {
             job.status = "expired";
@@ -48,7 +97,7 @@ export function createStore(
         return state;
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "ENOENT")
-          return { version: 1, disabled: [], jobs: [] };
+          return { version: 2, disabled: [], jobs: [], operations: [] };
         // Do not discard disabled policies or processed revisions on corruption.
         throw new Error(
           "Auto Compact state is unreadable; automation stopped",

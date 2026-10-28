@@ -37,17 +37,36 @@ The automatic timer test first verifies real **55- and 50-minute reservation val
 | In-turn delivery | A background command completes during the main turn; the native transcript confirms absorption and automatic scheduling remains available |
 | Automatic compact | Real timer, native completion and same session; no repeated idle compaction |
 | Manual compact | Explicit Compact now completes in the same session |
+| Operation identity | Same-ID retries during execution and after completion do not resend; conflicting input is rejected; history remains queryable after new activity |
+| Retention | Stop the plugin, age a completed native operation and seed recent/pending controls; reload deletes eligible history and orphan receipts, preserves controls, and does not resend unchanged activity |
 | Input overlap | Compaction is cancelled or remains unconfirmed; the user's own response remains on the timeline |
 | Changing TTL | New 5m/mixed responses are re-detected; later 1h data restores scheduling |
 | Missing TTL | Labeled default retains 50/55-minute scheduling |
 | Configuration | Explicit settings work; environment takes priority over merged settings |
-| Reload | Settings, conversation OFF and session identity preserved without replay |
+| Reload | Settings, conversation OFF and session identity preserved without replay; an in-flight operation recovers through its native receipt and exact command boundary without a second model request |
 | Downtime | An already-due reservation expires when the plugin returns |
 | Daemon recovery | OFF persists; reopening the same conversation supports a fresh reservation |
 
 Some rows are grouped into one scenario. The fast suite separately covers clock jumps/sleep, late delivery, permissions, model changes, corrupted state, UI status/countdown formatting and negative dispatch cases. It also distinguishes reports delivered into a main turn from queued SDK/user prompts, foreign or completed turns, explicit waiting, and aborted/error turns. A negative runner test verifies that Linux cannot be reported as a Windows execution and unrun scenarios cannot be counted as passed.
 
-This does not measure Anthropic's real cache lifetime, billing savings or summary quality. It does not open a browser or verify Electron/mobile UI rendering. Passing controlled input-overlap cases does not prove every possible race in Paseo's public send API is eliminated.
+The retention scenario deliberately edits only the isolated fixture state while the plugin is stopped; it verifies cleanup through actual startup/RPC and native receipt files, without waiting seven real days. The fast suite covers the exact seven-day boundary, pending protection, bounded batches, deletion/commit failures, restart, clock rollback, receipt directory links and unchanged-activity guards.
+
+This does not measure Anthropic's real cache lifetime, billing savings or summary quality. The default native matrix does not open a browser. The optional browser check below covers the web client; Electron/mobile rendering remains outside that check. Passing controlled input-overlap cases does not prove every possible race in Paseo's public send API is eliminated.
+
+## Optional browser validation
+
+`tests/simulation/browser.mjs` opens the packaged Paseo web client in a real Chromium browser against an isolated native daemon and the loopback model. It checks Skip, Undo, manual compact confirmation and recovery of the completed result after reloading the conversation. Browser validation is separate from the default native matrix and CI jobs.
+
+Provide an existing Playwright Core module and Chromium executable explicitly; this runner does not install browser dependencies:
+
+```sh
+node --no-maglev tests/simulation/browser.mjs --paseo 0.12.0 \
+  --playwright /absolute/path/to/playwright-core/index.mjs \
+  --browser /absolute/path/to/chromium \
+  --report-dir /absolute/path/to/results
+```
+
+Repeat with `--paseo 0.13.0`. Each run writes a browser report and completed-state screenshot under `browser-<version>/`. An unavailable Windows runtime or browser is an untested environment, not a passing result; WSL execution reports Linux.
 
 ## Reports and failure handling
 
@@ -76,3 +95,11 @@ To change a tested Claude/Paseo version, edit its exact alias in `tests/simulati
 ## CI
 
 [Check workflow](https://github.com/babo-jeonguk/paseo-auto-compact-for-claude/blob/main/.github/workflows/check.yml) has Paseo 0.12/0.13 native simulation jobs on **ubuntu-latest** and **windows-latest**, in addition to fast SDK 0.12/0.13 checks on Linux, macOS and Windows. Pull requests, pushes and manual workflow dispatch run them and upload their reports/logs even when a test fails. No API secret is needed. [View workflow runs](https://github.com/babo-jeonguk/paseo-auto-compact-for-claude/actions/workflows/check.yml). Native macOS execution is not covered by the fast macOS checks.
+
+## Validation checkpoint — 2026-10-28
+
+The seven-day retention implementation passed `npm run check` (127 tests, TypeScript and embedded-observer consistency). GPT-6.1 Terra ran the expanded native suite on Linux x64 with Node 24.21.0 and Claude Code 2.1.306: Paseo 0.12.0 and 0.13.0 each passed all 18 scenarios. Both versions also passed four web UI checks in Chromium 149: Skip, Undo, confirmed manual compact, and completed-result display after conversation reload. The reports' product and harness fingerprints match the validated checkout.
+
+The expanded retention check exposed loss of native activity identity after compaction. The gateway now preserves the matching compaction revision without recreating an ordinary scheduling window; a fresh request after history cleanup returns the existing-activity guard and sends nothing.
+
+Windows native execution was not available in this environment: WSL interop failed with `UtilBindVsockAnyPort:317: socket failed 1`. Windows CI execution, Electron/mobile rendering and live Anthropic behavior are not established by these results.

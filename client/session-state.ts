@@ -10,6 +10,27 @@ export interface Presentation {
   description: string;
 }
 
+export type CompactCompletionNotice =
+  | { variant: "success"; message: "Conversation compacted" }
+  | { variant: "error"; message: string };
+
+export function compactCompletionNotice(
+  row: Pick<Row, "operationId" | "status"> | null | undefined,
+  operationId: string | null
+): CompactCompletionNotice | null {
+  if (!row || !operationId || row.operationId !== operationId || row.status === "running")
+    return null;
+  if (row.status === "completed")
+    return { variant: "success", message: "Conversation compacted" };
+  if (row.status === "unknown")
+    return { variant: "error", message: "Check the conversation before trying again." };
+  if (row.status === "expired")
+    return { variant: "error", message: "Compaction request expired before it could start." };
+  if (row.status === "failed")
+    return { variant: "error", message: "Couldn’t compact. Check the conversation." };
+  return null;
+}
+
 export const STATUS_GRACE_MS = 10_000;
 export const INPUT_IDLE_GRACE_MS = 60_000;
 
