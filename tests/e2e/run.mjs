@@ -171,10 +171,12 @@ check(`rollback to ${FROM} keeps working on this state and sees what was compact
   const requests = model.count;
   await moveTo(FROM, 'rollback');
   await waitFor(async () => (await fixture.rpc('list').catch(() => null))?.rows, `${FROM} reads the state`);
-  assert.equal((await fixture.row(legacy.off)).enabled, false, 'conversation OFF survives rollback');
+  // The daemon restart scenario left these conversations unopened; open them like a user would.
+  const row = async id => { await fixture.client.refreshAgent(id); return waitFor(() => fixture.row(id), `${FROM} row ${id}`); };
+  assert.equal((await row(legacy.off)).enabled, false, 'conversation OFF survives rollback');
   // A finished job status is what keeps the release's timer from compacting an activity again.
   for (const id of [legacy.compacted, legacy.fresh])
-    assert.equal((await fixture.row(id)).status, 'completed', `${FROM} sees the earlier compaction of ${id}`);
+    assert.equal((await row(id)).status, 'completed', `${FROM} sees the earlier compaction of ${id}`);
   assert.equal(model.count, requests, `${FROM} sends nothing`);
 });
 check(`updating to ${TO} again restores operation without replay`, async () => {
