@@ -11,6 +11,9 @@ const here = dirname(fileURLToPath(import.meta.url)), plugin = resolve(here, '..
 const require = createRequire(join(here, 'package.json'));
 const cliPackage = require.resolve('@getpaseo/cli-0-14/package.json');
 const binary = join(dirname(require.resolve(`@anthropic-ai/claude-code-${process.platform}-${process.arch}/package.json`)), process.platform === 'win32' ? 'claude.exe' : 'claude');
+const scenario = process.argv[2];
+assert(new Set(['reload', 'automatic', 'cleanup']).has(scenario),
+  'Usage: node --no-maglev tests/simulation/lifecycle.mjs <reload|automatic|cleanup>');
 const root = await mkdtemp(join(tmpdir(), 'paseo-lifecycle-'));
 const reportDir = join(root, 'logs'); await mkdir(reportDir);
 const marker = join(root, 'cleanup');
@@ -19,9 +22,9 @@ let f;
 const scheduled = id => waitFor(async () => { const row = await f.row(id); return row.status === 'scheduled' && row.dueAt ? row : null; }, 'scheduled');
 try {
  f = await startFixture({root, plugin, cliPackage, appVersion:'0.14.0', binary, model, reportDir, readyTimeoutMs:180_000,
-   daemonEnv:process.argv[2] !== 'cleanup' ? {} : {NODE_OPTIONS:`--experimental-loader=${join(here,'lifecycle-loader.mjs')}`, LIFECYCLE_CLEANUP_MARKER:marker}});
+   daemonEnv:scenario !== 'cleanup' ? {} : {NODE_OPTIONS:`--experimental-loader=${join(here,'lifecycle-loader.mjs')}`, LIFECYCLE_CLEANUP_MARKER:marker}});
  await f.settings({idleMinutes:50});
- if (process.argv[2] === 'reload') {
+ if (scenario === 'reload') {
  const id = await f.agent(); await f.turn(id, 'RELOAD_READY: reply without tools.');
  const beforeRow = await scheduled(id), old = await f.ledger(id), session = (await f.refresh(id)).persistence.sessionId;
  const before = model.count, operationId = randomUUID();
@@ -64,7 +67,7 @@ try {
  assert.equal(repeat.operation.state,'succeeded'); assert.equal(model.count,preCompact+1);
  await f.rpc('toggle',{agentId:id,enabled:false});
  }
- if (process.argv[2] === 'automatic') {
+ else if (scenario === 'automatic') {
  await f.settings({idleMinutes:1});
  const id = await f.agent(); await f.turn(id,'AUTOMATIC_RELOAD_READY: reply without tools.');
  const reserved = await scheduled(id), old = await f.ledger(id), session = (await f.refresh(id)).persistence.sessionId;
@@ -99,7 +102,7 @@ try {
  console.log('automatic resumed',JSON.stringify({fresh,reopened,session,requestDelta:model.count-before}));
  await f.rpc('toggle',{agentId:id,enabled:false});
  }
- if (process.argv[2] === 'cleanup') {
+ else if (scenario === 'cleanup') {
  const cleanupId = await f.agent(); await f.turn(cleanupId,'CLEANUP_READY: reply without tools.');
  const reservation = await scheduled(cleanupId), oldCleanup = await f.ledger(cleanupId), cleanupSession = (await f.refresh(cleanupId)).persistence.sessionId;
  await writeFile(marker,'go');

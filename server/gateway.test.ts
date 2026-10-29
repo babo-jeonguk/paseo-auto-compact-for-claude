@@ -257,6 +257,21 @@ test('a host that reopens stale plugin sessions never sends against an observer 
   assert.equal(host.sendCount(), 0);
 });
 
+test('observer ownership is rechecked at the dispatch boundary', async () => {
+  const native = observer(null) as ReturnType<typeof observer> & {
+    ownsCurrentLaunch(agentId: string): Promise<boolean>;
+  };
+  let ownershipChecks = 0;
+  native.ownsCurrentLaunch = async () => ++ownershipChecks === 1;
+  const host = fixture([], undefined, false, [], { observer: native });
+  Object.assign(host.ref, { reload: async () => null });
+  const result = await host.gateway.compact('a', (await host.gateway.refresh('a'))!);
+  assert.equal(result.status, 'failed');
+  assert.match(result.detail, /resume.*message/i);
+  assert.equal(ownershipChecks, 2);
+  assert.equal(host.sendCount(), 0);
+});
+
 test('idle pending input is distinguished from an active reply without allowing dispatch', async () => {
   const native = observer(null)!;
   const read = native.read;
