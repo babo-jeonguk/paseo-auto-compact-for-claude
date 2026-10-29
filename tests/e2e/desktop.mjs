@@ -16,28 +16,17 @@ import { tmpdir, release } from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { startFixture, waitFor } from '../simulation/fixture.mjs';
 import { startModel } from '../simulation/model.mjs';
+import { installedPlugin, parseOptions, pluginStderr as stderrOf, remoteRevision, revisionOf, SOURCE as DEFAULT_SOURCE } from './common.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const simulation = resolve(here, '../simulation');
-const PLUGIN = 'auto-compact-for-claude';
 const isWin = process.platform === 'win32';
 const run = promisify(execFile);
-const options = new Map([['--paseo', '0.13.0'], ['--to', 'main'], ['--app', ''],
-  ['--source', 'git:babo-jeonguk/paseo-auto-compact-for-claude'], ['--expect-platform', process.platform],
-  ['--claude', ''], ['--tools', simulation], ['--report-dir', join(resolve(here, '../..'), 'test-results', 'e2e')]]);
-if (process.argv.includes('--help')) {
-  console.log(`node --no-maglev tests/e2e/desktop.mjs --app <extracted Paseo desktop app> ${[...options].filter(([k]) => k !== '--app')
-    .map(([k, v]) => `[${k} ${v || '<path>'}]`).join(' ')}`);
-  process.exit(0);
-}
-for (let i = 2; i < process.argv.length; i += 2) {
-  assert(options.has(process.argv[i]), `Unknown option: ${process.argv[i]}`);
-  assert(process.argv[i + 1] !== undefined && !process.argv[i + 1].startsWith('--'), `Missing value: ${process.argv[i]}`);
-  options.set(process.argv[i], process.argv[i + 1]);
-}
-const arg = name => options.get(name);
+const arg = parseOptions('desktop.mjs', [['--paseo', '0.13.0'], ['--to', 'main'], ['--app', ''],
+  ['--source', DEFAULT_SOURCE], ['--expect-platform', process.platform],
+  ['--claude', ''], ['--tools', simulation], ['--report-dir', join(resolve(here, '../..'), 'test-results', 'e2e')]],
+  [['--app', 'the extracted Paseo desktop app of the same version']]);
 const [TO, SOURCE, PASEO] = [arg('--to'), arg('--source'), arg('--paseo')];
-assert(arg('--app'), 'Specify --app with the extracted Paseo desktop app of the same version (see README.md)');
 const appDir = resolve(arg('--app'));
 // The Linux launcher script is what users run; it chooses sandboxing and execs Paseo.bin.
 const appExecutable = join(appDir, isWin ? 'Paseo.exe' : 'Paseo');
@@ -153,16 +142,7 @@ const shot = name => desktop.page.screenshot({ path: join(reportDir, `${name}.pn
 const openConversation = async () => {
   await desktop.page.getByText('Auto Compact simulation', { exact: true }).first().click({ timeout: 60_000 });
 };
-const pluginStderr = async () => (await readFile(join(fixture.home, 'daemon.log'), 'utf8').catch(() => ''))
-  .split(/\r?\n/).flatMap(line => { try { return [JSON.parse(line)]; } catch { return []; } })
-  .filter(entry => entry.pluginId === PLUGIN && entry.stream === 'stderr').map(entry => String(entry.message));
-const remoteRevision = async ref => {
-  if (!SOURCE.startsWith('git:')) return null;
-  const { stdout } = await run('git', ['ls-remote', `https://github.com/${SOURCE.slice(4)}.git`, ref, `${ref}^{}`],
-    { windowsHide: true, timeout: 60_000, cwd: tmpdir() });
-  const rows = stdout.trim().split('\n').filter(Boolean).map(line => line.split('\t'));
-  return (rows.find(([, name]) => name.endsWith('^{}')) ?? rows[0])?.[0] ?? null;
-};
+const pluginStderr = () => stderrOf([join(fixture.home, 'daemon.log')]);
 
 // ---- checks -------------------------------------------------------------------------------------
 const state = {};
@@ -177,11 +157,10 @@ check('the desktop app starts its own daemon on its Electron runtime in an isola
   assert.equal(report.daemonVersion, PASEO, 'the desktop app must match the requested Paseo version');
 });
 check(`the plugin installs from GitHub at ${TO} into the desktop daemon`, async () => {
-  const listed = JSON.parse(await fixture.paseo('plugin', 'ls', PLUGIN, '--json'));
-  const info = Array.isArray(listed) ? listed.find(p => p.id === PLUGIN) ?? listed[0] : listed;
+  const info = await installedPlugin(fixture);
   assert.equal(info.status, 'running', JSON.stringify(info));
-  report.revision = info?.installation?.currentRevision ?? info?.commit ?? info?.revision ?? '';
-  const expected = await remoteRevision(TO);
+  report.revision = revisionOf(info);
+  const expected = await remoteRevision(SOURCE, TO);
   if (expected) assert.equal(report.revision, expected);
 });
 check('a conversation started by the desktop daemon loads the observer and earns a 55-minute reservation', async () => {

@@ -29,6 +29,8 @@ const ReceiptSchema = z.object({
   reason: z.string().nullable(), observedAt: z.number().finite(),
 });
 const ManifestSchema = z.object({ launchId: z.string().uuid(), build: z.string() });
+// Ledgers and receipts are small; anything larger is not one of ours.
+const MAX_FILE_BYTES = 32_768;
 // The input-counting, command-guard and cancellation fixes keep the same ledger
 // and reservation contract. Keep already-open sessions observable until reopen.
 const compatibleBuilds = new Set([observerAsset.version,
@@ -46,6 +48,7 @@ export function createObserver(options: { home?: string; now?: () => number } = 
   const cacheWindow = createCacheReader();
   const agentDirectory = (id: string) => join(base, createHash('sha256').update(id).digest('hex'));
   const receiptName = (id: string) => encodeURIComponent(id) + '.json';
+  const receiptPath = (agentId: string, id: string) => join(agentDirectory(agentId), 'receipts', receiptName(id));
   async function receiptDirectory(parent: string) {
     // Never traverse a linked agent/receipt directory during cleanup.
     for (const path of [base, parent, join(parent, 'receipts')]) {
@@ -64,22 +67,33 @@ export function createObserver(options: { home?: string; now?: () => number } = 
     await writeFile(temporary, JSON.stringify(value), { mode: 0o600, flag: 'wx' });
     await rename(temporary, path);
   };
+  // null means there is no usable observer: none launched, an incompatible,
+  // closed or unsafe launch, or a heartbeat older than a minute. Failing to read
+  // one is different and is thrown, so nothing treats a busy or half-written
+  // file as proof that the observer is gone.
   async function read(agentId: string): Promise<{ ledger: Ledger; directory: string } | null> {
-    try {
-      const parent = agentDirectory(agentId);
-      const manifest = ManifestSchema.parse(JSON.parse(await readFile(join(parent, 'current.json'), 'utf8')));
-      if (!compatibleBuilds.has(manifest.build)) return null;
-      const directory = join(parent, manifest.launchId);
-      const path = join(directory, 'ledger.json');
-      const info = await lstat(path);
-      if (!info.isFile() || info.isSymbolicLink() || info.size > 32_768) return null;
-      const ledger = LedgerSchema.parse(JSON.parse(await readFile(path, 'utf8')));
-      if (ledger.launchId !== manifest.launchId || ledger.closed ||
-          now() < ledger.updatedAt || now() - ledger.updatedAt > 60_000) return null;
-      const cache = await cacheWindow(ledger.cacheRequest, ledger.transcriptPath,
-        ledger.sessionId ?? '', ledger.ordinaryEndedAt, now());
-      return { ledger: { ...ledger, cache, cacheDeadline: cache?.deadline ?? null }, directory };
-    } catch { return null; }
+    // Reading and parsing together: a missing file is absence, anything else a fault.
+    const load = async <T>(work: () => Promise<T>) => {
+      try { return await work(); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+        throw new Error('Claude observer could not be read', { cause: error });
+      }
+    };
+    const parent = agentDirectory(agentId);
+    const manifest = await load(async () =>
+      ManifestSchema.parse(JSON.parse(await readFile(join(parent, 'current.json'), 'utf8'))));
+    if (!manifest || !compatibleBuilds.has(manifest.build)) return null;
+    const directory = join(parent, manifest.launchId);
+    const path = join(directory, 'ledger.json');
+    const info = await load(() => lstat(path));
+    if (!info || !info.isFile() || info.isSymbolicLink() || info.size > MAX_FILE_BYTES) return null;
+    const ledger = await load(async () => LedgerSchema.parse(JSON.parse(await readFile(path, 'utf8'))));
+    if (!ledger || ledger.launchId !== manifest.launchId || ledger.closed ||
+        now() < ledger.updatedAt || now() - ledger.updatedAt > 60_000) return null;
+    const cache = await cacheWindow(ledger.cacheRequest, ledger.transcriptPath,
+      ledger.sessionId ?? '', ledger.ordinaryEndedAt, now());
+    return { ledger: { ...ledger, cache, cacheDeadline: cache?.deadline ?? null }, directory };
   }
   // Each open writes a new launch. A running observer refreshes its ledger every
   // few seconds, so a closed or day-old launch belongs to an ended process.
@@ -90,7 +104,7 @@ export function createObserver(options: { home?: string; now?: () => number } = 
       try {
         // A launch still being prepared may not have its ledger yet.
         const info = await lstat(path).catch(() => lstat(directory));
-        const closed = info.isFile() && info.size <= 32_768 &&
+        const closed = info.isFile() && info.size <= MAX_FILE_BYTES &&
           JSON.parse(await readFile(path, 'utf8')).closed === true;
         if (!closed && now() - info.mtimeMs < 24 * 60 * 60_000) continue;
       } catch { continue; }
@@ -117,8 +131,7 @@ export function createObserver(options: { home?: string; now?: () => number } = 
       // Retained records protect even empty/partial receipts and old pending
       // work. This also finds receipts orphaned before the native checkpoint,
       // or recreated by a late save from an already-open older observer.
-      const protectedFiles = new Set(retained.map(operation =>
-        join(agentDirectory(operation.agentId), 'receipts', receiptName(operation.id))));
+      const protectedFiles = new Set(retained.map(operation => receiptPath(operation.agentId, operation.id)));
       const parents = await readdir(base, { withFileTypes: true }).catch(error => {
         if (error.code === 'ENOENT') return [];
         throw error;
@@ -134,7 +147,7 @@ export function createObserver(options: { home?: string; now?: () => number } = 
           if (protectedFiles.has(path)) continue;
           try {
             const info = await lstat(path);
-            if (!info.isFile() || info.isSymbolicLink() || info.size > 32_768) continue;
+            if (!info.isFile() || info.isSymbolicLink() || info.size > MAX_FILE_BYTES) continue;
             let timestamp = info.mtimeMs;
             try {
               const receipt = ReceiptSchema.safeParse(JSON.parse(await readFile(path, 'utf8')));
@@ -174,7 +187,10 @@ export function createObserver(options: { home?: string; now?: () => number } = 
         CLAUDE_CODE_PLUGIN_DIRS: [...(existing ?? []), mod].join(delimiter) } };
     },
     async readiness(agent: Observation, dueAt?: number) {
-      return reason((await read(agent.agentId))?.ledger, agent, dueAt);
+      // A status display; an unreadable observer is reported, never thrown.
+      const current = await read(agent.agentId).catch(() => undefined);
+      return current === undefined ? 'Claude observer status unavailable; retrying'
+        : reason(current?.ledger, agent, dueAt);
     },
     async prepare(agent: Observation, requireCache: boolean, expiresAt: number, id: string = randomUUID()) {
       const current = await read(agent.agentId);
@@ -189,16 +205,16 @@ export function createObserver(options: { home?: string; now?: () => number } = 
       const receipts = join(agentDirectory(agent.agentId), 'receipts');
       await mkdir(receipts, { recursive: true, mode: 0o700 });
       // Pre-create the file for the Mod filesystem capability. Never erase a receipt.
-      await writeFile(join(receipts, encodeURIComponent(id) + '.json'), '{}', { mode: 0o600, flag: 'wx' })
+      await writeFile(receiptPath(agent.agentId, id), '{}', { mode: 0o600, flag: 'wx' })
         .catch(error => { if (error.code !== 'EEXIST') throw error; });
       await atomic(join(directory, 'request.json'), request);
       return { ...request, directory };
     },
     async receipt(agentId: string, operation: NativeOperation) {
       try {
-        const path = join(agentDirectory(agentId), 'receipts', encodeURIComponent(operation.id) + '.json');
+        const path = receiptPath(agentId, operation.id);
         const info = await lstat(path);
-        if (!info.isFile() || info.isSymbolicLink() || info.size > 32_768) return null;
+        if (!info.isFile() || info.isSymbolicLink() || info.size > MAX_FILE_BYTES) return null;
         const receipt = ReceiptSchema.parse(JSON.parse(await readFile(path, 'utf8')));
         if (receipt.id !== operation.id || receipt.launchId !== operation.launchId ||
             receipt.generation !== operation.generation || receipt.sessionId !== operation.sessionId ||
@@ -207,8 +223,9 @@ export function createObserver(options: { home?: string; now?: () => number } = 
           (receipt.status === 'completed' ? 'Claude observed compaction completion' : 'Compaction did not complete') };
       } catch { return null; }
     },
-    async result(agentId: string, operation: { id: string; launchId: string; generation: string; revision: number }) {
-      const current = await read(agentId);
+    async result(agentId: string, operation: Omit<NativeOperation, 'sessionId'>) {
+      // Polled after sending: a read failure means "no answer yet", never an outcome.
+      const current = await read(agentId).catch(() => null);
       const ledger = current?.ledger;
       if (!ledger) return null; // transient/partial ledger reads are not terminal evidence
       if (ledger.launchId !== operation.launchId || ledger.generation !== operation.generation)

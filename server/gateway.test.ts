@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { bounded } from "./deadline";
+import { bounded, OBSERVATION_MS } from "./deadline";
 import { Refusal, type OperationEvidence, type StoredOperation } from "./model";
 import { createGateway } from "./gateway";
 import type {
@@ -193,6 +193,30 @@ test('an observer refusal is a failed outcome; any other error before sending is
   }
 });
 
+test('a send that starts just before its deadline is still observed in full', async () => {
+  // A live budget longer than the send deadline, as in production (120 s vs. what is left).
+  const host = fixture([{ type: "compaction", status: "completed", trigger: "manual" }],
+    undefined, false, undefined, { timeoutMs: 1_000 });
+  const send = host.ref.send;
+  // The boundary arrives after the send deadline has passed.
+  host.ref.send = async (text, options) => { await new Promise(resolve => setTimeout(resolve, 80)); return send(text, options); };
+  const result = await host.gateway.compact("a", undefined, {
+    id: "late-request", deadlineAt: Date.now() + 40, checkpoint: async () => {}, current: () => true,
+  });
+  assert.equal(result.status, "completed");
+  assert.equal(host.sendCount(), 1);
+});
+
+test('an unreadable observer is reported on the observation and is a fault before sending', async () => {
+  const native = observer(null)!;
+  native.read = async () => { throw new Error('Claude observer could not be read'); };
+  const host = fixture([], undefined, false, [], { observer: native });
+  const agent = (await host.gateway.refresh('a'))!;
+  assert.equal(agent.observerUnreadable, true);
+  await assert.rejects(host.gateway.compact('a', agent), /could not be read/);
+  assert.equal(host.sendCount(), 0);
+});
+
 test('idle pending input is distinguished from an active reply without allowing dispatch', async () => {
   const native = observer(null)!;
   const read = native.read;
@@ -238,7 +262,8 @@ test("every external gateway wait is bounded, including send and release", async
     }
     // A wait that expires before sending is a fault for the worker to retry.
     if (stalled === "subscribe" || stalled === "refresh") {
-      await assert.rejects(bounded(host.gateway.compact("a"), 2_000), /deadline/i, stalled);
+      await assert.rejects(bounded(host.gateway.compact("a", undefined, { id: "stalled", deadlineAt: Date.now() + 50,
+        checkpoint: async () => {}, current: () => true }), 2_000), /deadline/i, stalled);
       assert.equal(host.sendCount(), 0, stalled);
       continue;
     }
@@ -305,9 +330,9 @@ test("recovery requires both the native receipt and the exact message's command 
   operation.evidence!.invalidated = true;
   assert.equal((await host.gateway.inspect!(operation))?.status, "unknown");
   operation.evidence!.invalidated = false;
-  operation.deadlineAt = 1000;
-  native.receipt = async () => ({ status: "completed", detail: "late receipt", observedAt: 1001 });
-  assert.equal(await host.gateway.inspect!(operation), null, "late completion cannot extend the operation deadline");
+  // Observation runs a fixed time from the marker; a receipt after that never counts.
+  native.receipt = async () => ({ status: "completed", detail: "late receipt", observedAt: 1 + OBSERVATION_MS + 1 });
+  assert.equal(await host.gateway.inspect!(operation), null, "late completion cannot extend the observation deadline");
 });
 
 test('native activity identity survives compaction without restoring its scheduling window', async () => {

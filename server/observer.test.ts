@@ -186,3 +186,23 @@ test('receipt cleanup protects retained work, collects old orphans and never fol
     assert.equal(await readFile(join(external, 'valuable.json'), 'utf8'), '{}');
   } finally { await f.close(); }
 });
+
+test('an observer that cannot be read is a fault, not an absent observer', async () => {
+  const f = await fixture();
+  try {
+    assert(await f.observer.read('a'));
+    // Half-written ledger: thrown, so dispatch retries instead of treating it as gone.
+    await writeFile(join(f.directory, 'ledger.json'), '{"version":1,');
+    await assert.rejects(f.observer.read('a'), /could not be read/);
+    await assert.rejects(f.observer.prepare(f.agent, false, Date.now() + 30_000, 'op-1'), /could not be read/);
+    assert.equal(await f.observer.readiness(f.agent), 'Claude observer status unavailable; retrying');
+    // A genuinely missing or stale observer is absence, and a refusal at dispatch.
+    await f.save();
+    f.advance(60_001);
+    assert.equal(await f.observer.read('a'), null);
+    await assert.rejects(f.observer.prepare(f.agent, false, Date.now() + 30_000, 'op-1'),
+      (error: Error) => error.constructor.name === 'Refusal');
+    await rm(join(f.parent, 'current.json'));
+    assert.equal(await f.observer.read('a'), null);
+  } finally { await f.close(); }
+});

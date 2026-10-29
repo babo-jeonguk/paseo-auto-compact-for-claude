@@ -955,3 +955,38 @@ test("every write derives the jobs' attempt fields from their operations", async
   assert.equal(g.state.jobs[0].attemptedAt, undefined);
   assert.equal(g.state.operations[0].result?.code, "failed_before_dispatch");
 });
+
+test("an unreadable observer keeps an automatic reservation instead of cancelling it", async () => {
+  const f = fixture(), s = f.make(); await s.ready;
+  f.agents[0].activityKey = "launch:generation:1";
+  await s.observedTurn(f.agents[0]);
+  f.advance(55 * 60_000);
+  const refresh = f.gateway.refresh;
+  f.gateway.refresh = async id => ({ ...(await refresh(id))!, activityKey: null, observerUnreadable: true });
+  await s.tick();
+  assert.equal(f.state.jobs[0].status, "scheduled");
+  assert.equal(f.calls, 0);
+  f.gateway.refresh = refresh;
+  await s.tick();
+  await waitForStatus(f, "completed");
+  assert.equal(f.calls, 1);
+});
+
+test("a Compact now request arriving during a worker pass starts without waiting for the next tick", async () => {
+  const f = fixture(), s = f.make(); await s.ready;
+  // A pass already in progress read the state just before the request was saved.
+  const read = f.store.read;
+  let release!: () => void, gated = false;
+  f.store.read = async () => {
+    const value = await read();
+    if (!gated) { gated = true; await new Promise<void>(resolve => { release = resolve; }); }
+    return value;
+  };
+  const pass = s.reconcile();
+  while (!release) await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal((await s.compactNow("a", f.agents[0].revision!, "request-a")).code, "accepted");
+  release();
+  await pass;
+  await waitForStatus(f, "completed");
+  assert.equal(f.calls, 1, "sent by the follow-up pass, with no tick");
+});

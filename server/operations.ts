@@ -1,8 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
-import { operationRowStatus, operationPending, type CompactOperation, type CompactTarget } from "../shared/rpc";
-import type { CompactOutcome, Gateway, State, StateStore, StoredOperation } from "./model";
+import { finishedState, operationRowStatus, operationPending, type CompactOperation, type CompactTarget } from "../shared/rpc";
+import { readable, unchanged, type CompactOutcome, type Gateway, type State, type StateStore, type StoredOperation } from "./model";
 import type { Settings } from "../shared/settings";
-import { bounded } from "./deadline";
+import { bounded, deadlineOf, inspect, INSPECT_TIMEOUT_MS, OBSERVATION_MS } from "./deadline";
 import { automaticBlock } from "./policy";
 
 export function inputFingerprint(agentId: string, revision: string, target?: CompactTarget) {
@@ -49,9 +49,8 @@ export function syncJobs(state: State) {
   return state;
 }
 
-export const OPERATION_TIMEOUT_MS = 180_000;
-const INSPECT_TIMEOUT_MS = 5_000;
 const MAX_PRE_SEND_ATTEMPTS = 3;
+const budgetSpent = (failedAttempts: number) => failedAttempts >= MAX_PRE_SEND_ATTEMPTS;
 
 type Ending = CompactOutcome | "expired" | "exhausted";
 function resultOf(ending: Ending, dispatched: boolean): NonNullable<StoredOperation["result"]> {
@@ -62,8 +61,7 @@ function resultOf(ending: Ending, dispatched: boolean): NonNullable<StoredOperat
   return { code, message: ending.detail };
 }
 const stateOf = (ending: Ending): StoredOperation["state"] =>
-  ending === "expired" ? "expired" : ending === "exhausted" ? "failed"
-    : ending.status === "completed" ? "succeeded" : ending.status;
+  finishedState(ending === "expired" ? "expired" : ending === "exhausted" ? "failed" : ending.status);
 
 export function recoverOperations(state: State, now: number) {
   for (const operation of state.operations) {
@@ -88,7 +86,7 @@ export function createOperationWorker(options: {
   const owner = randomUUID();
   // Outcomes whose terminal write failed; they are written again, never re-earned.
   const outcomes = new Map<string, Ending>();
-  let running = false, stopped = false;
+  let running = false, again = false, stopped = false, lastConnected = true;
   async function finish(id: string, ending: Ending) {
     outcomes.set(id, ending);
     await update(state => {
@@ -101,16 +99,26 @@ export function createOperationWorker(options: {
     });
     outcomes.delete(id);
   }
+  // A request that arrives during a pass runs another pass right after it, so
+  // a new operation never waits for the next tick. Callers do not wait for a
+  // pass someone else started.
   async function reconcile(connected = true) {
-    if (stopped || running) return;
+    lastConnected = connected;
+    if (stopped) return;
+    if (running) { again = true; return; }
     running = true;
+    try {
+      do { again = false; await pass(lastConnected); } while (again && !stopped);
+    } finally { running = false; }
+  }
+  async function pass(connected: boolean) {
     let claimedId: string | undefined;
     try {
       const candidate = (await store.read()).operations.find(operationPending);
       if (!candidate) return;
-      if (!outcomes.has(candidate.id) && now() < (candidate.nextAttemptAt ?? 0) && now() < (candidate.deadlineAt ?? 0)) return;
+      if (!outcomes.has(candidate.id) && now() < (candidate.nextAttemptAt ?? 0) && now() < deadlineOf(candidate)) return;
       // Expiry and retained local outcomes can progress even before host attach.
-      if (!connected && !outcomes.has(candidate.id) && !candidate.evidence?.boundary && now() < (candidate.deadlineAt ?? 0)) return;
+      if (!connected && !outcomes.has(candidate.id) && !candidate.evidence?.boundary && now() < deadlineOf(candidate)) return;
       // Startup recovery clears owners, so a claim only ever replaces an earlier
       // worker of this process; that worker's later checkpoints then fail.
       const operation = await update(state => {
@@ -128,7 +136,6 @@ export function createOperationWorker(options: {
       claimedId = operation.id;
       const remembered = outcomes.get(operation.id);
       if (remembered) return await finish(operation.id, remembered);
-      const deadlineAt = operation.deadlineAt!;
       if (operation.evidence?.dispatchStartedAt !== undefined) {
         let result: CompactOutcome | null = null;
         if (gateway.inspect && (connected || operation.evidence?.boundary)) {
@@ -136,53 +143,62 @@ export function createOperationWorker(options: {
           catch (error) { onError(error); }
         }
         if (result) return await finish(operation.id, result);
-        if (now() >= deadlineAt) return await finish(operation.id,
+        if (now() >= deadlineOf(operation)) return await finish(operation.id,
           { status: "unknown", detail: "Compaction deadline passed without matching completion evidence; no automatic retry" });
         return;
       }
-      if (now() >= deadlineAt || now() > (operation.deliveryExpiresAt ?? Infinity))
+      // Sending must start by this time; observation then has its own deadline.
+      const sendBy = operation.deadlineAt!;
+      if (now() >= sendBy || now() > (operation.deliveryExpiresAt ?? Infinity))
         return await finish(operation.id, "expired");
-      if ((operation.attempt ?? 0) > MAX_PRE_SEND_ATTEMPTS) return await finish(operation.id, "exhausted");
-      const wait = <T>(work: Promise<T>) => bounded(work, Math.min(INSPECT_TIMEOUT_MS, deadlineAt - now()));
-      const [agent, config] = await Promise.all([wait(gateway.refresh(operation.agentId)), wait(settings())]);
+      // This claim is attempt N; N - 1 earlier attempts failed.
+      if (budgetSpent((operation.attempt ?? 0) - 1)) return await finish(operation.id, "exhausted");
+      const wait = <T>(work: Promise<T>) => inspect(work, sendBy, now());
+      // Reading nothing is not evidence of change: an unreadable host, observer
+      // or setting is thrown as a fault and retried; only a reading that shows a
+      // change ends the attempt.
+      const [agent, config] = await Promise.all([wait(gateway.refresh(operation.agentId)).then(readable), wait(settings())]);
+      if (!config) throw new Error("Compact settings could not be read");
       const allowed = async () => {
-        const [latest, state] = await Promise.all([wait(settings()), store.read()]);
-        return !stopped && !!agent && !!latest && operation.reservationEndedAt !== undefined &&
+        const [latest, state] = await Promise.all([wait(settings()), wait(store.read())]);
+        if (!latest) throw new Error("Compact settings could not be read");
+        return !stopped && !!agent && operation.reservationEndedAt !== undefined &&
           now() <= (operation.deliveryExpiresAt ?? Infinity) &&
           automaticBlock({ agentId: operation.agentId, endedAt: operation.reservationEndedAt,
             settings: latest, disabled: state.disabled, now: now(), agent }) === null;
       };
       if (stopped) return;
-      if (!config || !agent?.eligible || !agent.idle || !sameActivity(operation, agent) ||
-          operation.target.sessionId !== agent.sessionId ||
-          operation.target.activityKey !== (agent.activityKey ?? null) ||
+      if (!agent?.eligible || !agent.idle || !unchanged(operation, agent) ||
           (operation.kind === "automatic" && (!gateway.automatic || !await allowed())))
         return await finish(operation.id,
           { status: "failed", detail: "Session, activity or policy changed before dispatch; nothing sent" });
+      let observeUntil: number | null = null;
       const execution = {
-        id: operation.id, deadlineAt,
-        current: () => !stopped && now() < deadlineAt,
+        id: operation.id, deadlineAt: sendBy,
+        current: () => !stopped && now() < (observeUntil ?? sendBy),
         checkpoint: async (evidence: NonNullable<StoredOperation["evidence"]>) => {
           await update(state => {
             const current = state.operations.find(entry => entry.id === operation.id);
-            if (stopped || !current || !operationPending(current) || current.owner !== owner || now() >= deadlineAt)
+            if (stopped || !current || !operationPending(current) || current.owner !== owner ||
+                now() >= deadlineOf({ ...current, evidence: { ...current.evidence, ...evidence } }))
               throw new Error("Compaction worker ownership expired");
             current.evidence = { ...current.evidence, ...evidence,
               invalidated: !!current.evidence?.invalidated || !!evidence.invalidated };
             if (current.evidence.dispatchStartedAt !== undefined) current.state = "observing";
             current.updatedAt = now();
           });
+          if (evidence.dispatchStartedAt !== undefined) observeUntil = evidence.dispatchStartedAt + OBSERVATION_MS;
         },
       };
       // A refusal comes back as a failed outcome; a fault before the dispatch
       // marker is thrown and retried below.
       const outcome = await (operation.kind === "automatic"
-        ? gateway.automatic!(agent, { expiresAt: Math.min(operation.deliveryExpiresAt ?? Infinity, deadlineAt), allowed }, execution)
+        ? gateway.automatic!(agent, { expiresAt: Math.min(operation.deliveryExpiresAt ?? Infinity, sendBy), allowed }, execution)
         : gateway.compact(agent.agentId, agent, execution));
       if (stopped) return;
       if (outcome.status === "unknown") {
         const saved = (await store.read()).operations.find(entry => entry.id === operation.id);
-        if (saved?.evidence?.dispatchStartedAt !== undefined && !saved.evidence.invalidated && now() < deadlineAt)
+        if (saved?.evidence?.dispatchStartedAt !== undefined && !saved.evidence.invalidated && now() < deadlineOf(saved))
           return; // Ambiguous delivery continues through evidence reconciliation.
       }
       await finish(operation.id, outcome);
@@ -196,7 +212,7 @@ export function createOperationWorker(options: {
             const current = state.operations.find(entry => entry.id === claimedId);
             if (!current || !operationPending(current) || current.owner !== owner ||
                 current.evidence?.dispatchStartedAt !== undefined) return;
-            if ((current.attempt ?? 0) >= MAX_PRE_SEND_ATTEMPTS) {
+            if (budgetSpent(current.attempt ?? 0)) {
               current.state = stateOf("exhausted");
               current.result = resultOf("exhausted", false);
             } else {
@@ -209,7 +225,7 @@ export function createOperationWorker(options: {
           });
         } catch (writeError) { onError(writeError); }
       }
-    } finally { running = false; }
+    }
   }
   return { reconcile, stop() { stopped = true; } };
 }

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createOperationWorker, recoverOperations } from "./operations";
-import { DEFAULT_SETTINGS } from "../shared/settings";
+import { DEFAULT_SETTINGS, type Settings } from "../shared/settings";
 import type { CompactOutcome, Gateway, Observation, State } from "./model";
 
 function fixture() {
@@ -37,9 +37,9 @@ function fixture() {
     tail = result.catch(() => {});
     return result;
   };
-  const make = () => createOperationWorker({ gateway,
+  const make = (settings = async (): Promise<Settings | null> => ({ ...DEFAULT_SETTINGS })) => createOperationWorker({ gateway,
     store: { read: async () => structuredClone(state), write: async next => { state = next; } },
-    update, settings: async () => ({ ...DEFAULT_SETTINGS }), now: () => time, onError: error => errors.push(error) });
+    update, settings, now: () => time, onError: error => errors.push(error) });
   return { make, gateway, agent, errors,
     get operation() { return state.operations[0]; },
     get sends() { return sends; },
@@ -214,4 +214,47 @@ test("checkpointed evidence can finish recovery before host attachment", async (
   await f.make().reconcile(false);
   assert.equal(f.operation.state, "succeeded");
   assert.equal(f.sends, 0);
+});
+
+test("a send late in its window is observed for the full time from the dispatch marker", async () => {
+  const f = fixture();
+  f.operation.deadlineAt = 1000 + 10_000; // e.g. the end of an automatic delivery window
+  f.gateway.compact = async (_id, _expected, execution) => {
+    f.advance(9_000);
+    await execution!.checkpoint({ dispatchStartedAt: 10_000 });
+    return { status: "unknown", detail: "send unconfirmed" };
+  };
+  const worker = f.make();
+  await worker.reconcile();
+  f.advance(60_000); await worker.reconcile();
+  assert.equal(f.operation.state, "observing", "the send deadline no longer ends observation");
+  f.evidence = { status: "completed", detail: "matching native receipt" };
+  await worker.reconcile();
+  assert.equal(f.operation.state, "succeeded");
+});
+
+test("observation ends unknown a fixed time after the dispatch marker", async () => {
+  const f = fixture();
+  f.gateway.compact = async (_id, _expected, execution) => {
+    await execution!.checkpoint({ dispatchStartedAt: 1000 });
+    return { status: "unknown", detail: "send unconfirmed" };
+  };
+  const worker = f.make();
+  await worker.reconcile();
+  f.advance(179_999); await worker.reconcile();
+  assert.equal(f.operation.state, "observing");
+  f.advance(1); await worker.reconcile();
+  assert.equal(f.operation.state, "unknown");
+});
+
+test("an unreadable observer or settings is retried, never read as a changed session", async () => {
+  for (const fault of ["observer", "settings"] as const) {
+    const f = fixture();
+    if (fault === "observer") f.gateway.refresh = async () => ({ ...f.agent, activityKey: null, observerUnreadable: true });
+    await (fault === "settings" ? f.make(async () => null) : f.make()).reconcile();
+    assert.equal(f.operation.state, "requested", fault);
+    assert.equal(f.operation.attempt, 1, fault);
+    assert.equal(f.operation.result, null, fault);
+    assert.equal(f.sends, 0, fault);
+  }
 });

@@ -14,21 +14,28 @@ export type CompactCompletionNotice =
   | { variant: "success"; message: "Conversation compacted" }
   | { variant: "error"; message: string };
 
+// One wording per outcome, whether it arrives in the request's reply or later
+// from polling the operation. Null while the outcome is still pending.
+export function compactOutcomeNotice(status: Row["status"], detail?: string): CompactCompletionNotice | null {
+  if (status === "completed")
+    return { variant: "success", message: "Conversation compacted" };
+  if (status === "unknown")
+    return { variant: "error", message: "Check the conversation before trying again." };
+  if (status === "expired")
+    return { variant: "error", message: "Compaction request expired before it could start." };
+  if (status === "failed")
+    return { variant: "error", message: "Couldn’t compact. Check the conversation." };
+  if (status === "blocked" && detail)
+    return { variant: "error", message: `${detail}.` };
+  return null;
+}
+
 export function compactCompletionNotice(
-  row: Pick<Row, "operationId" | "status"> | null | undefined,
+  tracked: Pick<Row, "operationId" | "status"> | null | undefined,
   operationId: string | null
 ): CompactCompletionNotice | null {
-  if (!row || !operationId || row.operationId !== operationId || row.status === "running")
-    return null;
-  if (row.status === "completed")
-    return { variant: "success", message: "Conversation compacted" };
-  if (row.status === "unknown")
-    return { variant: "error", message: "Check the conversation before trying again." };
-  if (row.status === "expired")
-    return { variant: "error", message: "Compaction request expired before it could start." };
-  if (row.status === "failed")
-    return { variant: "error", message: "Couldn’t compact. Check the conversation." };
-  return null;
+  if (!tracked || !operationId || tracked.operationId !== operationId) return null;
+  return compactOutcomeNotice(tracked.status);
 }
 
 export const STATUS_GRACE_MS = 10_000;

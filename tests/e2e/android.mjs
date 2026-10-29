@@ -16,31 +16,20 @@ import { homedir, tmpdir, release } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { startFixture, waitFor } from '../simulation/fixture.mjs';
 import { startModel } from '../simulation/model.mjs';
+import { installedPlugin, parseOptions, pluginStderr as stderrOf, remoteRevision, revisionOf, SOURCE as DEFAULT_SOURCE } from './common.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const simulation = resolve(here, '../simulation');
-const PLUGIN = 'auto-compact-for-claude';
 const PACKAGE = 'sh.paseo';
 const run = promisify(execFile);
-const options = new Map([['--paseo', '0.13.0'], ['--to', 'main'], ['--apk', ''],
-  ['--source', 'git:babo-jeonguk/paseo-auto-compact-for-claude'],
+const arg = parseOptions('android.mjs', [['--paseo', '0.13.0'], ['--to', 'main'], ['--apk', ''],
+  ['--source', DEFAULT_SOURCE],
   ['--sdk', process.env.ANDROID_HOME ?? join(homedir(), 'Android', 'Sdk')],
   ['--system-image', 'system-images;android-34;google_apis;x86_64'], ['--avd-home', join(tmpdir(), 'auto-compact-e2e-avd')],
   ['--port', '5584'], ['--claude', ''], ['--tools', simulation],
-  ['--report-dir', join(resolve(here, '../..'), 'test-results', 'e2e')]]);
-if (process.argv.includes('--help')) {
-  console.log(`node --no-maglev tests/e2e/android.mjs --apk <paseo-v<version>-android.apk> ${[...options].filter(([k]) => k !== '--apk')
-    .map(([k, v]) => `[${k} ${v || '<path>'}]`).join(' ')}`);
-  process.exit(0);
-}
-for (let i = 2; i < process.argv.length; i += 2) {
-  assert(options.has(process.argv[i]), `Unknown option: ${process.argv[i]}`);
-  assert(process.argv[i + 1] !== undefined && !process.argv[i + 1].startsWith('--'), `Missing value: ${process.argv[i]}`);
-  options.set(process.argv[i], process.argv[i + 1]);
-}
-const arg = name => options.get(name);
+  ['--report-dir', join(resolve(here, '../..'), 'test-results', 'e2e')]],
+  [['--apk', 'the Paseo Android APK of the same version, paseo-v<version>-android.apk']]);
 const [TO, SOURCE, PASEO] = [arg('--to'), arg('--source'), arg('--paseo')];
-assert(arg('--apk'), 'Specify --apk with the Paseo Android APK of the same version (see README.md)');
 const apk = resolve(arg('--apk')), sdk = resolve(arg('--sdk')), avdHome = resolve(arg('--avd-home'));
 const serial = `emulator-${arg('--port')}`;
 const AVD = 'auto-compact-e2e';
@@ -156,25 +145,15 @@ const openConversation = () => { let since = 0, tries = 0, selectedAt = 0; retur
   }
   return null;
 }, 'the conversation with the plugin pill', 180_000); };
-const remoteRevision = async ref => {
-  if (!SOURCE.startsWith('git:')) return null;
-  const { stdout } = await run('git', ['ls-remote', `https://github.com/${SOURCE.slice(4)}.git`, ref, `${ref}^{}`],
-    { timeout: 60_000, cwd: tmpdir() });
-  const rows = stdout.trim().split('\n').filter(Boolean).map(line => line.split('\t'));
-  return (rows.find(([, name]) => name.endsWith('^{}')) ?? rows[0])?.[0] ?? null;
-};
-const pluginStderr = async () => (await Promise.all([1, 2].map(n => readFile(join(reportDir, `daemon-${n}.log`), 'utf8').catch(() => ''))))
-  .join('\n').split(/\r?\n/).flatMap(line => { try { return [JSON.parse(line)]; } catch { return []; } })
-  .filter(entry => entry.pluginId === PLUGIN && entry.stream === 'stderr').map(entry => String(entry.message));
+const pluginStderr = () => stderrOf([1, 2].map(n => join(reportDir, `daemon-${n}.log`)));
 
 // ---- checks -------------------------------------------------------------------------------------
 const state = {};
 check(`the plugin installs from GitHub at ${TO} and a conversation earns a 55-minute reservation`, async () => {
-  const listed = JSON.parse(await fixture.paseo('plugin', 'ls', PLUGIN, '--json'));
-  const info = Array.isArray(listed) ? listed.find(p => p.id === PLUGIN) ?? listed[0] : listed;
+  const info = await installedPlugin(fixture);
   assert.equal(info.status, 'running', JSON.stringify(info));
-  report.revision = info?.installation?.currentRevision ?? info?.commit ?? info?.revision ?? '';
-  const expected = await remoteRevision(TO);
+  report.revision = revisionOf(info);
+  const expected = await remoteRevision(SOURCE, TO);
   if (expected) assert.equal(report.revision, expected);
   state.id = await fixture.agent();
   await fixture.turn(state.id, 'ANDROID_READY: reply without tools.');

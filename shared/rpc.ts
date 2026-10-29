@@ -35,6 +35,8 @@ export const CompactOperationSchema = z.object({
 export type CompactOperation = z.infer<typeof CompactOperationSchema>;
 export const operationPending = (operation: Pick<CompactOperation, "state">) =>
   ["requested", "dispatching", "observing"].includes(operation.state);
+// The two directions between an operation's state and a row/outcome status;
+// the only places these vocabularies are translated.
 export function operationRowStatus(operation: Pick<CompactOperation, "state">) {
   switch (operation.state) {
     case "succeeded": return "completed" as const;
@@ -42,6 +44,8 @@ export function operationRowStatus(operation: Pick<CompactOperation, "state">) {
     default: return "running" as const;
   }
 }
+export const finishedState = (status: "completed" | "failed" | "unknown" | "expired") =>
+  status === "completed" ? "succeeded" as const : status;
 
 export const RowSchema = z.object({
   agentId: z.string(),

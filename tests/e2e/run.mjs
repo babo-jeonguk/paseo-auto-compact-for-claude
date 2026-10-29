@@ -16,24 +16,14 @@ import { fileURLToPath } from 'node:url';
 import { startFixture, waitFor } from '../simulation/fixture.mjs';
 import { startModel } from '../simulation/model.mjs';
 import { scenarios } from '../simulation/scenarios.mjs';
+import { installedPlugin, parseOptions, pluginStderr, PLUGIN, remoteRevision, revisionOf, SOURCE as DEFAULT_SOURCE } from './common.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const simulation = resolve(here, '../simulation');
-const PLUGIN = 'auto-compact-for-claude';
-const options = new Map([['--paseo', '0.13.0'], ['--from', 'v1.0.2'], ['--to', 'main'],
-  ['--source', 'git:babo-jeonguk/paseo-auto-compact-for-claude'], ['--expect-platform', process.platform],
+const arg = parseOptions('run.mjs', [['--paseo', '0.13.0'], ['--from', 'v1.0.2'], ['--to', 'main'],
+  ['--source', DEFAULT_SOURCE], ['--expect-platform', process.platform],
   ['--claude', process.env.SIMULATION_CLAUDE_BINARY ?? ''], ['--tools', simulation],
   ['--report-dir', join(resolve(here, '../..'), 'test-results', 'e2e')], ['--min', '0']]);
-if (process.argv.includes('--help')) {
-  console.log(`node --no-maglev tests/e2e/run.mjs ${[...options].map(([k, v]) => `[${k} ${v || '<path>'}]`).join(' ')}`);
-  process.exit(0);
-}
-for (let i = 2; i < process.argv.length; i += 2) {
-  assert(options.has(process.argv[i]), `Unknown option: ${process.argv[i]}`);
-  assert(process.argv[i + 1] !== undefined && !process.argv[i + 1].startsWith('--'), `Missing value: ${process.argv[i]}`);
-  options.set(process.argv[i], process.argv[i + 1]);
-}
-const arg = name => options.get(name);
 const [FROM, TO, SOURCE, PASEO] = [arg('--from'), arg('--to'), arg('--source'), arg('--paseo')];
 // These wait for real one-minute deadlines; --min 1 leaves them to the native matrix.
 const LONG = ['real automatic timer', 'overdue reservation'];
@@ -60,18 +50,7 @@ for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, () => {
 // ---- helpers --------------------------------------------------------------------------------------
 const statePath = () => join(fixture.home, 'plugin-data', PLUGIN, 'state.json');
 const readState = async () => JSON.parse(await readFile(statePath(), 'utf8'));
-const plugin = async () => {
-  const listed = JSON.parse(await fixture.paseo('plugin', 'ls', PLUGIN, '--json'));
-  return Array.isArray(listed) ? listed.find(p => p.id === PLUGIN) ?? listed[0] : listed;
-};
-const revisionOf = info => info?.installation?.currentRevision ?? info?.commit ?? info?.revision ?? '';
-const remoteRevision = async ref => {
-  if (!SOURCE.startsWith('git:')) return null;
-  const url = `https://github.com/${SOURCE.slice(4)}.git`;
-  const { stdout } = await promisify(execFile)('git', ['ls-remote', url, ref, `${ref}^{}`], { windowsHide: true, timeout: 60_000, cwd: tmpdir() });
-  const rows = stdout.trim().split('\n').filter(Boolean).map(line => line.split('\t'));
-  return (rows.find(([, name]) => name.endsWith('^{}')) ?? rows[0])?.[0] ?? null;
-};
+const plugin = () => installedPlugin(fixture);
 async function moveTo(ref, key) {
   const before = revisionOf(await plugin());
   const output = await fixture.paseo('plugin', 'update', PLUGIN, '--ref', ref, '--yes');
@@ -80,15 +59,11 @@ async function moveTo(ref, key) {
     return current.status === 'running' && revisionOf(current) !== before ? current : null;
   }, `plugin running at ${ref}`, 120_000);
   report.revisions[key] = revisionOf(info);
-  const expected = await remoteRevision(ref);
+  const expected = await remoteRevision(SOURCE, ref);
   if (expected) assert.equal(report.revisions[key], expected, `installed revision for ${ref}`);
   return output;
 }
-// The plugin's own stderr: its console.error reports and Paseo's load/hook failures for it.
-const pluginLog = async () => (await Promise.all([1, 2, 3, 4].map(n =>
-  readFile(join(reportDir, `daemon-${n}.log`), 'utf8').catch(() => '')))).join('\n')
-  .split(/\r?\n/).flatMap(line => { try { return [JSON.parse(line)]; } catch { return []; } })
-  .filter(entry => entry.pluginId === PLUGIN && entry.stream === 'stderr').map(entry => String(entry.message));
+const pluginLog = () => pluginStderr([1, 2, 3, 4].map(n => join(reportDir, `daemon-${n}.log`)));
 // The fixture stops a daemon by signalling its whole process group, so the plugin can exit before
 // Paseo delivers agent.closed during that shutdown. That is the harness, not the plugin.
 const shutdownNoise = line => /^Lifecycle hook agent\.closed failed: Plugin process exited/.test(line);
@@ -99,7 +74,7 @@ check(`install ${FROM} from GitHub with paseo plugin install`, async () => {
   const info = await plugin();
   assert.equal(info.status, 'running', JSON.stringify(info));
   report.revisions.from = revisionOf(info);
-  const expected = await remoteRevision(FROM);
+  const expected = await remoteRevision(SOURCE, FROM);
   if (expected) assert.equal(report.revisions.from, expected, `installed revision for ${FROM}`);
   assert.deepEqual((await fixture.rpc('list')).rows, []);
   assert.equal((await fixture.settings()).enabled, true);

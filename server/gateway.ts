@@ -1,8 +1,9 @@
 import type { PluginHandlerContext, PluginLifecycleEvents } from "@getpaseo/plugin/server";
 import { randomUUID } from "node:crypto";
-import { Refusal, type Gateway, type Observation, type DispatchGuard, type ExecutionContext, type OperationEvidence } from "./model";
+import { Refusal, readable, targetOf, unchanged, type Gateway, type Observation, type DispatchGuard, type ExecutionContext,
+  type OperationEvidence } from "./model";
 import type { createObserver } from "./observer";
-import { bounded } from "./deadline";
+import { bounded, deadlineOf, inspect, SEND_DEADLINE_MS } from "./deadline";
 import { claudeProvider } from "../shared/providers";
 export { claudeProvider } from "../shared/providers";
 
@@ -10,6 +11,14 @@ type Api = PluginHandlerContext["paseo"];
 type Agent = NonNullable<Awaited<ReturnType<ReturnType<Api["agents"]["ref"]>["refresh"]>>>["agent"];
 type End = PluginLifecycleEvents["agent.turn_ended"];
 type Observer = ReturnType<typeof createObserver>;
+type TimelineItem = { type: string; status?: string; trigger?: string };
+// The completed manual compaction of the /compact command's own turn.
+const commandBoundary = (item: TimelineItem, turnId: string | null | undefined, commandTurn: string | null) =>
+  item.type === "compaction" && item.status === "completed" && item.trigger === "manual" &&
+  commandTurn !== null && turnId === commandTurn;
+const RECOVERED = "Recovered matching native completion and command boundary";
+// Unchanged evidence is still checkpointed this often, as a sign of progress.
+const CHECKPOINT_INTERVAL_MS = 5_000;
 export function createGateway(options: {
   observer?: Observer; now?: () => number; timeoutMs?: number; pollMs?: number; dispatchTimeoutMs?: number; cleanupTimeoutMs?: number;
 } = {}) {
@@ -26,7 +35,8 @@ export function createGateway(options: {
   async function observation(agent: Agent, providers?: Record<string, unknown>): Promise<Observation> {
     providers ??= (await requireApi().config.get()).config.providers;
     const tokens = agent.lastUsage?.contextWindowUsedTokens;
-    const native = (await observer?.read(agent.id))?.ledger;
+    let observerUnreadable = false;
+    const native = (await observer?.read(agent.id).catch(() => { observerUnreadable = true; return null; }))?.ledger;
     const matched = native?.sessionId === agent.persistence?.sessionId ? native : undefined;
     const permission = agent.pendingPermissions.length > 0 || agent.attentionReason === 'permission';
     const inputIdleSince = agent.status === 'idle' && !agent.activeTurn && !permission &&
@@ -52,6 +62,7 @@ export function createGateway(options: {
         ? `${matched.launchId}:${matched.generation}:${matched.revision}` : null,
       observedEndedAt: matched?.ordinaryEndedAt ?? null,
       cache: matched?.cache ?? null,
+      ...(observerUnreadable ? { observerUnreadable } : {}),
     };
   }
   const gateway: Gateway = {
@@ -81,34 +92,34 @@ export function createGateway(options: {
       if (evidence?.invalidated) return { status: "unknown", detail: "Conversation changed during compaction; no automatic retry" };
       if (!evidence?.native || !observer) return null;
       const native = await observer.receipt(operation.agentId, evidence.native);
-      if (native && native.observedAt > (operation.deadlineAt ?? Infinity)) return null;
+      if (native && native.observedAt > deadlineOf(operation)) return null;
       if (native?.status !== "completed") return native;
-      if (evidence.boundary && evidence.turnId)
-        return { status: "completed", detail: "Recovered matching native completion and command boundary" };
+      if (evidence.boundary && evidence.turnId) return { status: "completed", detail: RECOVERED };
       // History is evidence only when the caller-known message ID pins its turn.
       // A bounded page can miss old work; absence is never proof of non-delivery.
       const page = await requireApi().agents.ref(operation.agentId).timeline.refetch({ limit: 200 });
       const command = page.entries.find(entry => entry.item.type === "user_message" &&
         entry.item.clientMessageId === operation.id);
-      if (command?.turnId && page.entries.some(entry => entry.turnId === command.turnId &&
-          entry.item.type === "compaction" && entry.item.status === "completed" && entry.item.trigger === "manual"))
-        return { status: "completed", detail: "Recovered matching native completion and command boundary" };
+      if (command?.turnId && page.entries.some(entry => commandBoundary(entry.item, entry.turnId, command.turnId ?? null)))
+        return { status: "completed", detail: RECOVERED };
       return null;
     },
   };
   async function compact(agentId: string, expected: Observation | undefined, automatic: boolean,
     guard?: DispatchGuard, execution?: ExecutionContext): ReturnType<Gateway["compact"]> {
-    if (busy.has(agentId) || stopped) throw new Error("Compaction already running or plugin stopped");
-    busy.add(agentId);
-    try { return await dispatch(agentId, expected, automatic, guard, execution); }
-    finally { busy.delete(agentId); }
-  }
-  async function dispatch(agentId: string, expected: Observation | undefined, automatic: boolean,
-    guard?: DispatchGuard, execution?: ExecutionContext): ReturnType<Gateway["compact"]> {
-    const deadline = Math.min(execution?.deadlineAt ?? Infinity, now() + (options.timeoutMs ?? 120_000));
+    if (stopped) throw new Error("Plugin stopped");
+    // A concurrent dispatch of this conversation is a condition, not a fault.
+    if (busy.has(agentId)) throw new Refusal("Compaction already running for this conversation");
+    // `timeoutMs` is the live-observation budget only. Until the dispatch marker
+    // the send deadline applies; after it a fresh observation budget, so a late
+    // send is still observed in full.
+    const live = options.timeoutMs ?? 120_000;
+    let deadline = execution?.deadlineAt ?? now() + SEND_DEADLINE_MS;
     const wait = <T>(work: Promise<T>) => bounded(work, deadline - now());
+    const read = <T>(work: Promise<T>) => inspect(work, deadline, now());
     const currentWorker = () => !stopped && (execution?.current() ?? true) && now() < deadline;
     const ref = requireApi().agents.ref(agentId);
+    busy.add(agentId);
     const id = execution?.id ?? randomUUID();
     let operation: Awaited<ReturnType<Observer['prepare']>> | undefined;
     let sent = false, armed = false, healthy = true, cancelled = false, superseded = false;
@@ -123,19 +134,18 @@ export function createGateway(options: {
       const value = { ...evidence, ...(entry.turnId ? { turnId: entry.turnId } : {}),
         boundary, invalidated: !healthy || superseded };
       const serialized = JSON.stringify(value);
-      if (!force && serialized === saved && now() - lastCheckpoint < 5_000) return;
+      if (!force && serialized === saved && now() - lastCheckpoint < CHECKPOINT_INTERVAL_MS) return;
       await wait(execution.checkpoint(value));
       saved = serialized; lastCheckpoint = now();
     }
     try {
-      const before = await wait(gateway.refresh(agentId));
+      const before = readable(await read(gateway.refresh(agentId)));
       if (!before?.sessionId || !before.idle || !before.eligible ||
-          (expected && (before.revision !== expected.revision || before.sessionId !== expected.sessionId ||
-            before.activityKey !== expected.activityKey)))
+          (expected && !unchanged({ revision: expected.revision, target: targetOf(expected) }, before)))
         return { status: "failed", detail: "Claude session unavailable, busy or changed" };
       const expiresAt = Math.min(guard?.expiresAt ?? Infinity, deadline);
       if (observer) {
-        operation = await wait(observer.prepare(before, automatic, expiresAt, id));
+        operation = await read(observer.prepare(before, automatic, expiresAt, id));
         const { launchId, generation, sessionId, revision } = operation;
         evidence.native = { id, launchId, generation, sessionId, revision };
         await checkpoint(true);
@@ -150,20 +160,19 @@ export function createGateway(options: {
           if (event.item.clientMessageId === id) entry.turnId = event.turnId ?? null;
           else superseded = true;
         }
-        if (event.item.type === "compaction" && event.item.status === "completed" &&
-            event.item.trigger === "manual" && entry.turnId !== null && event.turnId === entry.turnId)
-          boundary = true;
+        if (commandBoundary(event.item, event.turnId, entry.turnId)) boundary = true;
       });
-      await wait(subscription.ready);
-      const current = await wait(gateway.refresh(agentId));
-      if (!currentWorker() || cancelled || !current?.idle || current.sessionId !== before.sessionId ||
-          current.revision !== before.revision || current.activityKey !== before.activityKey ||
-          now() > expiresAt || (guard && !await wait(guard.allowed())))
+      await read(subscription.ready);
+      const current = readable(await read(gateway.refresh(agentId)));
+      if (!currentWorker() || cancelled || !current?.idle ||
+          !unchanged({ revision: before.revision, target: targetOf(before) }, current) ||
+          now() > expiresAt || (guard && !await read(guard.allowed())))
         return { status: "failed", detail: "Reservation cancelled or session changed before send" };
       // Durable marker must precede the external side effect. Recovery never
       // resends once this marker exists, even if a crash preceded ref.send.
       evidence.dispatchStartedAt = now();
       await checkpoint(true);
+      deadline = now() + live;
       if (!currentWorker() || cancelled)
         return { status: "unknown", detail: "Worker stopped at dispatch boundary; no automatic retry" };
       armed = true;
@@ -175,8 +184,8 @@ export function createGateway(options: {
       while (currentWorker() && !cancelled) {
         await checkpoint();
         if (!healthy || superseded) return { status: "unknown", detail: "Conversation changed during compaction; no automatic retry" };
-        const native = operation ? await wait(observer!.receipt?.(agentId, evidence.native!) ?? Promise.resolve(null)) ??
-          await wait(observer!.result(agentId, operation)) : null;
+        const native = operation ? await read(observer!.receipt(agentId, evidence.native!)) ??
+          await read(observer!.result(agentId, operation)) : null;
         if (native && native.status !== "completed") return native;
         const ended = entry.turnId ? endings.get(entry.turnId) : null;
         if (ended && ended.outcome.kind !== "completed")
@@ -209,6 +218,7 @@ export function createGateway(options: {
         operation ? bounded(observer!.cancel(operation, sent), cleanupMs).catch(() => {}) : undefined,
         subscription ? bounded(Promise.resolve(subscription.release()), cleanupMs).catch(() => {}) : undefined,
       ]);
+      busy.delete(agentId);
     }
   }
   const completions = new Map<string, (event: End) => void>();

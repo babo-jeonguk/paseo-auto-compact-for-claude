@@ -16,7 +16,7 @@ import {
 import { operationRowStatus, operationPending, compactRpc, operationRpc, sessionRpc, skipRpc, toggleRpc, undoSkipRpc } from "../shared/rpc";
 import { compactSettings } from "../shared/settings";
 import { canSkip, errorLabel, tokenLabel } from "./format";
-import { canUndoSkip, compactCompletionNotice, pendingPresentation, sessionKey,
+import { canUndoSkip, compactCompletionNotice, compactOutcomeNotice, pendingPresentation, sessionKey,
   sessionPresentation, type Presentation } from "./session-state";
 import { compactSubmissions } from "./compact-submission";
 import { Toggle } from "./toggle";
@@ -168,12 +168,10 @@ export function ConversationControls({
           toast.show("Compaction requested");
         } else {
           setCompactOperationId(null);
-          if (result.status === "completed") toast.show("Conversation compacted", { variant: "success" });
-          else toast.error(result.status === "unknown"
-          ? "Check the conversation before trying again."
-          : result.status === "blocked"
-          ? `${result.detail}.`
-          : "Couldn’t compact. Check the conversation.");
+          const notice = compactOutcomeNotice(result.status, result.detail) ??
+            { variant: "error", message: "Couldn’t compact. Check the conversation." };
+          if (notice.variant === "success") toast.show(notice.message, { variant: "success" });
+          else toast.error(notice.message);
         }
       }
     },

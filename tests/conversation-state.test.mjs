@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { canUndoSkip, compactCompletionNotice, sessionPresentation, pendingPresentation, sessionKey,
+import { canUndoSkip, compactCompletionNotice, compactOutcomeNotice, sessionPresentation, pendingPresentation, sessionKey,
   STATUS_GRACE_MS, INPUT_IDLE_GRACE_MS } from "../client/session-state.ts";
 import { DEFAULT_SETTINGS } from "../shared/settings.ts";
 
@@ -114,4 +114,15 @@ test("only the matching Compact now operation produces a final toast notice", ()
   assert.deepEqual(compactCompletionNotice(
     { operationId: "operation-a", status: "failed" }, "operation-a"),
   { variant: "error", message: "Couldn’t compact. Check the conversation." });
+});
+
+test("a Compact now reply and a polled operation use the same wording", () => {
+  for (const status of ["completed", "unknown", "expired", "failed"])
+    assert.deepEqual(compactOutcomeNotice(status),
+      compactCompletionNotice({ operationId: "operation-a", status }, "operation-a"), status);
+  assert.deepEqual(compactOutcomeNotice("expired"),
+    { variant: "error", message: "Compaction request expired before it could start." });
+  assert.deepEqual(compactOutcomeNotice("blocked", "The conversation is busy. Wait until it finishes"),
+    { variant: "error", message: "The conversation is busy. Wait until it finishes." });
+  assert.equal(compactOutcomeNotice("running"), null);
 });

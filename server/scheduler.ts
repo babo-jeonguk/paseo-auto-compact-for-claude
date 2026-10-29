@@ -1,15 +1,16 @@
 import { randomUUID } from "node:crypto";
-import { bounded } from "./deadline";
+import { bounded, INSPECT_TIMEOUT_MS, SEND_DEADLINE_MS } from "./deadline";
 import type { Settings } from "../shared/settings";
-import { operationPending, type CompactTarget, type Row } from "../shared/rpc";
-import type { Gateway, Job, Observation, State, StateStore, StoredOperation } from "./model";
-import { createOperationWorker, recoverOperations, OPERATION_TIMEOUT_MS, inputFingerprint, mayHaveSent,
+import { operationPending, operationRowStatus, type CompactTarget, type Row } from "../shared/rpc";
+import { targetOf, unchanged, type Gateway, type Job, type Observation, type State, type StateStore,
+  type StoredOperation } from "./model";
+import { createOperationWorker, recoverOperations, inputFingerprint, mayHaveSent,
   publicOperation, sameActivity, syncJobs } from "./operations";
 import { automaticBlock, dueAt, DELIVERY_WINDOW_MS } from "./policy";
 import { HISTORY_RETENTION_MS, HISTORY_SWEEP_INTERVAL_MS, pruneOperationHistory, type OperationReceipts } from "./retention";
-import { operationRowStatus } from "../shared/rpc";
 
 export { DELIVERY_WINDOW_MS } from "./policy";
+const jobTarget = (job: Job): CompactTarget => ({ sessionId: job.sessionId ?? null, activityKey: job.activityKey ?? null });
 const terminal = (job: Job) =>
   ["expired", "skipped", "completed", "failed", "unknown"].includes(job.status);
 
@@ -24,8 +25,8 @@ export function createScheduler(options: {
   const { gateway } = options;
   // Every write passes through syncJobs, the only writer of jobs' attempt fields.
   const store: StateStore = { read: () => options.store.read(), write: state => options.store.write(syncJobs(state)) };
-  const settings = () => bounded(options.settings(), 5_000);
-  const refresh = (id: string) => bounded(gateway.refresh(id), 5_000);
+  const settings = () => bounded(options.settings(), INSPECT_TIMEOUT_MS);
+  const refresh = (id: string) => bounded(gateway.refresh(id), INSPECT_TIMEOUT_MS);
   const now = options.now ?? Date.now;
   const onError = options.onError ?? (() => {});
   let tail: Promise<unknown> = Promise.resolve();
@@ -136,7 +137,7 @@ export function createScheduler(options: {
         const blocked = await bounded(gateway.readiness(
           agent,
           job && config ? due(job, config) : undefined
-        ), 5_000);
+        ), INSPECT_TIMEOUT_MS);
         if (blocked) {
           status = "blocked";
           detail = blocked;
@@ -159,7 +160,7 @@ export function createScheduler(options: {
     return {
       ...agent,
       enabled,
-      target: { sessionId: agent.sessionId, activityKey: agent.activityKey ?? null },
+      target: targetOf(agent),
       activeOperation: activeOperation ? publicOperation(activeOperation) : null,
       latestOperation: latestOperation ? publicOperation(latestOperation) : null,
       undoSkip: skipped ? { id: skipped.id, dueAt: skipped.dueAt } : null,
@@ -185,9 +186,9 @@ export function createScheduler(options: {
   function newOperation(job: Job, agent: Observation, kind: StoredOperation["kind"],
     id: string = randomUUID(), fingerprint: string | null = null): StoredOperation {
     return { id, agentId: job.agentId, revision: job.revision, kind,
-      target: { sessionId: agent.sessionId, activityKey: agent.activityKey ?? null },
+      target: targetOf(agent),
       inputFingerprint: fingerprint, state: "requested", createdAt: now(), updatedAt: now(), result: null,
-      deadlineAt: now() + OPERATION_TIMEOUT_MS, reservationEndedAt: job.endedAt, attempt: 0 };
+      deadlineAt: now() + SEND_DEADLINE_MS, reservationEndedAt: job.endedAt, attempt: 0 };
   }
   const existingResult = (operation: StoredOperation) => ({
     status: operationRowStatus(operation), detail: operation.result?.message ?? "Compaction requested",
@@ -260,7 +261,7 @@ export function createScheduler(options: {
         const [state, config, agents] = await Promise.all([
           store.read(),
           settings(),
-          bounded(gateway.list(), 5_000),
+          bounded(gateway.list(), INSPECT_TIMEOUT_MS),
         ]);
         return Promise.all(
           agents
@@ -345,9 +346,11 @@ export function createScheduler(options: {
           ? "Compact settings could not be read"
           : !agent?.eligible
           ? "This conversation is unavailable for compaction"
+          : agent.observerUnreadable
+          ? "Claude observer status unavailable. Try again"
           : agent.revision !== revision
           ? "The conversation changed. Refresh and try again"
-          : target && (target.sessionId !== agent.sessionId || target.activityKey !== (agent.activityKey ?? null))
+          : target && !unchanged({ revision, target }, agent)
           ? "The conversation session or activity changed. Refresh and try again"
           : !agent.idle
           ? "The conversation is busy. Wait until it finishes"
@@ -363,8 +366,7 @@ export function createScheduler(options: {
         if (
           job?.attemptedAt !== undefined &&
           !state.operations.some(entry => entry.id === job?.operationId) &&
-          sameActivity({ agentId: job.agentId, revision: job.revision,
-            target: { sessionId: job.sessionId ?? null, activityKey: job.activityKey ?? null } }, agent)
+          sameActivity({ agentId: job.agentId, revision: job.revision, target: jobTarget(job) }, agent)
         ) {
           return { result: { status: job.status, detail: job.detail,
             operationId: job.operationId ?? null, operation: null, code: "existing" as const } };
@@ -422,11 +424,11 @@ export function createScheduler(options: {
           }
           if (timing || !connected) continue;
           const agent = await refresh(job.agentId);
+          // An unreadable observer is not a changed session: keep the reservation.
+          if (agent?.observerUnreadable) continue;
           if (
             !agent ||
-            agent.revision !== job.revision ||
-            (job.sessionId && agent.sessionId !== job.sessionId) ||
-            (job.activityKey && agent.activityKey !== job.activityKey) ||
+            !unchanged({ revision: job.revision, target: jobTarget(job) }, agent) ||
             policy(config, agent) === "ineligible"
           ) {
             job.status = "skipped";
@@ -441,7 +443,7 @@ export function createScheduler(options: {
             changed = true;
             continue;
           }
-          const blocked = gateway.readiness ? await bounded(gateway.readiness(agent, due(job, config)), 5_000) : null;
+          const blocked = gateway.readiness ? await bounded(gateway.readiness(agent, due(job, config)), INSPECT_TIMEOUT_MS) : null;
           if (blocked) {
             job.status = "blocked";
             job.detail = blocked;
@@ -472,6 +474,7 @@ export function createScheduler(options: {
             continue;
           }
           const operation = newOperation(job, agent, "automatic");
+          // The delivery window limits when sending may start, not how long it is observed.
           operation.deliveryExpiresAt = dueAt(job.endedAt, latest) + DELIVERY_WINDOW_MS;
           operation.deadlineAt = Math.min(operation.deadlineAt!, operation.deliveryExpiresAt);
           await reserve(job, state, operation);

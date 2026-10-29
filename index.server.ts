@@ -1,14 +1,14 @@
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { createGateway } from "./server/gateway";
 import { createScheduler } from "./server/scheduler";
-import { bounded } from "./server/deadline";
+import { bounded, INSPECT_TIMEOUT_MS } from "./server/deadline";
 import { createStore } from "./server/store";
 import { createObserver } from "./server/observer";
 import { claudeProvider } from "./shared/providers";
 import {
   compactRpc,
-  operationRpc,
   listRpc,
+  operationRpc,
   sessionRpc,
   skipRpc,
   undoSkipRpc,
@@ -21,7 +21,9 @@ export default function contribute(server: PluginServerContext) {
   const observer = createObserver();
   const host = createGateway({ observer });
   // Paseo closes this plugin's API just before calling the cleanup below, so work in
-  // flight then fails with a closed client. Its durable state recovers on next start.
+  // flight then fails with a closed client. Everything after cleanup starts is such
+  // cut-off work: its durable state recovers on next start, and a defect in that
+  // work would also be reported outside shutdown.
   let disposed = false;
   const report = (error: unknown) => {
     if (!disposed) console.error("[auto-compact-for-claude]", String(error));
@@ -41,7 +43,7 @@ export default function contribute(server: PluginServerContext) {
   // Paseo reports a premature turn end during overlapping compaction/input.
   const observe = async () => {
     if (!host.connected()) return;
-    for (const agent of await bounded(host.gateway.list(), 5_000)) {
+    for (const agent of await bounded(host.gateway.list(), INSPECT_TIMEOUT_MS)) {
       if (agent.activityKey && agent.observedEndedAt !== null && agent.observedEndedAt !== undefined)
         await scheduler.observedTurn(agent, agent.observedEndedAt);
     }

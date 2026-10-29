@@ -1,4 +1,5 @@
-import type { CompactOperation, Row } from "../shared/rpc";
+import { z } from "zod";
+import { CompactOperationSchema, StatusSchema, type CompactTarget, type Row } from "../shared/rpc";
 import type { CacheWindow } from './cache';
 
 export type Status = Row["status"];
@@ -17,33 +18,35 @@ export interface Observation {
   activityKey?: string | null;
   observedEndedAt?: number | null;
   cache?: CacheWindow | null;
+  // The observer exists but could not be read just now (see observer.read).
+  observerUnreadable?: boolean;
 }
-export interface Job {
-  agentId: string;
-  revision: string;
-  endedAt: number;
-  status: Status;
-  detail: string;
-  attemptedAt?: number;
-  operationId?: string;
-  skip?: { id: string; dueAt: number; sessionId: string };
-  activityKey?: string;
-  sessionId?: string;
-}
-export interface NativeOperation {
-  id: string;
-  launchId: string;
-  generation: string;
-  sessionId: string | null;
-  revision: number;
-}
-export interface OperationEvidence {
-  native?: NativeOperation;
-  dispatchStartedAt?: number;
-  turnId?: string;
-  boundary?: boolean;
-  invalidated?: boolean;
-}
+// Schemas are the one definition of stored records; the store validates with
+// them and the types below are inferred from them.
+export const JobSchema = z.object({
+  agentId: z.string(),
+  revision: z.string(),
+  endedAt: z.number().finite(),
+  status: StatusSchema,
+  detail: z.string(),
+  attemptedAt: z.number().finite().optional(),
+  operationId: z.string().optional(),
+  skip: z.object({ id: z.string().min(1), dueAt: z.number().finite(), sessionId: z.string().min(1) }).optional(),
+  activityKey: z.string().optional(),
+  sessionId: z.string().optional(),
+});
+export type Job = z.infer<typeof JobSchema>;
+export const NativeOperationSchema = z.object({ id: z.string(), launchId: z.string(), generation: z.string(),
+  sessionId: z.string().nullable(), revision: z.number().int() });
+export type NativeOperation = z.infer<typeof NativeOperationSchema>;
+export const OperationEvidenceSchema = z.object({
+  native: NativeOperationSchema.optional(),
+  dispatchStartedAt: z.number().finite().optional(),
+  turnId: z.string().optional(),
+  boundary: z.boolean().optional(),
+  invalidated: z.boolean().optional(),
+});
+export type OperationEvidence = z.infer<typeof OperationEvidenceSchema>;
 export interface ExecutionContext {
   id: string;
   deadlineAt: number;
@@ -55,18 +58,35 @@ export type CompactOutcome = { status: "completed" | "failed" | "unknown"; detai
 // A condition that makes sending wrong, not a fault: the attempt ends without
 // retry. Any other error before the dispatch marker is retried within budget.
 export class Refusal extends Error {}
-export interface StoredOperation extends CompactOperation {
-  // Canonical caller input; null identifies legacy records with no request token contract.
-  inputFingerprint: string | null;
-  deadlineAt?: number;
-  deliveryExpiresAt?: number;
-  reservationEndedAt?: number;
-  attempt?: number;
-  nextAttemptAt?: number;
-  // The worker that claimed it last; checkpoints from any earlier worker fail.
-  owner?: string;
-  evidence?: OperationEvidence;
+
+// Displays may show an unreadable observer as none; dispatch must not act on
+// that, so it throws a fault to retry instead.
+export function readable<T extends Observation | null>(agent: T): T {
+  if (agent?.observerUnreadable) throw new Error("Claude observer could not be read");
+  return agent;
 }
+
+export const targetOf = (agent: Pick<Observation, "sessionId" | "activityKey">): CompactTarget =>
+  ({ sessionId: agent.sessionId, activityKey: agent.activityKey ?? null });
+// The one test that a conversation is still exactly the one work was accepted
+// for: same host revision, Claude session and native activity.
+export const unchanged = (expected: { revision: string | null; target: CompactTarget }, agent: Observation) =>
+  expected.revision === agent.revision && expected.target.sessionId === agent.sessionId &&
+  expected.target.activityKey === (agent.activityKey ?? null);
+export const StoredOperationSchema = CompactOperationSchema.extend({
+  // Canonical caller input; null identifies legacy records with no request token contract.
+  inputFingerprint: z.string().nullable(),
+  // The dispatch marker must be written by this time (see deadline.ts).
+  deadlineAt: z.number().finite().optional(),
+  deliveryExpiresAt: z.number().finite().optional(),
+  reservationEndedAt: z.number().finite().optional(),
+  attempt: z.number().int().nonnegative().optional(),
+  nextAttemptAt: z.number().finite().optional(),
+  // The worker that claimed it last; checkpoints from any earlier worker fail.
+  owner: z.string().optional(),
+  evidence: OperationEvidenceSchema.optional(),
+});
+export type StoredOperation = z.infer<typeof StoredOperationSchema>;
 // Version 1 with additive fields: v1.0.2 drops what it does not know and keeps
 // working. Bump the version only for a change older readers would misread.
 export interface State {
