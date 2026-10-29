@@ -98,9 +98,9 @@ function createDesktop() {
   // that daemon is still starting. A slow host reaches it; retry as a user would, and record it.
   async function appReady() {
     for (let attempt = 1; attempt <= 3; attempt++) {
+      const error = page.getByText(/did not return a server id|Failed to start|failed to start/i).first();
       const ready = page.getByText('New workspace', { exact: true }).first().waitFor({ timeout: 240_000 }).then(() => 'ready');
-      const failed = page.getByText(/did not return a server id|Failed to start|failed to start/i).first()
-        .waitFor({ timeout: 240_000 }).then(() => 'failed');
+      const failed = error.waitFor({ timeout: 240_000 }).then(() => 'failed');
       const outcome = await Promise.race([ready, failed]);
       ready.catch(() => {}); failed.catch(() => {});
       if (outcome === 'ready') return;
@@ -108,6 +108,9 @@ function createDesktop() {
       report.appStartupRetries.push({ launch: launches, attempt, message, at: new Date().toISOString() });
       await page.screenshot({ path: join(reportDir, `startup-error-${launches}-${attempt}.png`) }).catch(() => {});
       await page.getByText('Retry', { exact: true }).click();
+      // The old error stays rendered for a moment; without this the next round
+      // counts it again and the three retries are spent within a second.
+      await error.waitFor({ state: 'hidden', timeout: 60_000 }).catch(() => {});
     }
     throw new Error('The desktop app did not become ready after three retries');
   }
