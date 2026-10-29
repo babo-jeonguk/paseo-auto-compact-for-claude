@@ -11,7 +11,7 @@ import type { Gateway, Observation, State, StateStore } from "./model";
 function fixture(automatic = true) {
   let time = 1_000_000;
   let config: Settings | null = { ...DEFAULT_SETTINGS };
-  let state: State = { version: 2, disabled: [], jobs: [], operations: [] };
+  let state: State = { version: 1, disabled: [], jobs: [], operations: [] };
   let calls = 0;
   const agents: Observation[] = [
     {
@@ -489,15 +489,26 @@ test("ambiguous in-flight restart and failed compact never retry automatically",
   let s = f.make();
   await s.ready;
   await s.observedTurn(f.agents[0]);
-  await f.store.write({
-    ...f.state,
-    jobs: [{ ...f.state.jobs[0], status: "running", attemptedAt: f.time }],
-  });
+  // Sent, then the plugin restarts before any evidence arrives.
+  let sends = 0;
+  f.gateway.automatic = async (_agent, _guard, execution) => {
+    sends++;
+    await execution!.checkpoint({ dispatchStartedAt: f.time });
+    return new Promise(() => {});
+  };
+  f.advance(55 * 60_000);
+  void s.tick();
+  while (f.state.operations[0]?.evidence?.dispatchStartedAt === undefined)
+    await new Promise<void>(resolve => setImmediate(resolve));
+  s.stop();
   s = f.make();
   await s.ready;
-  assert.equal(f.state.jobs[0].status, "unknown");
-  f.advance(55 * 60_000);
+  assert.equal(f.state.operations[0].state, "observing");
+  f.advance(180_001);
   await s.tick();
+  assert.equal(f.state.jobs[0].status, "unknown");
+  await s.tick();
+  assert.equal(sends, 1);
   assert.equal(f.calls, 0);
   assert.equal(
     (await s.compactNow("a", f.agents[0].revision!)).status,
@@ -883,4 +894,64 @@ test("a fresh native generation can compact despite an unchanged host revision",
   await waitForStatus(f, "completed");
   assert.equal(f.calls, 2);
   assert.equal(f.state.operations.length, 2);
+});
+
+test("Compact now can repeat an activity only when the earlier attempt provably sent nothing", async () => {
+  for (const [state, evidence, accepted] of [
+    ["expired", undefined, true],
+    ["failed", undefined, true],
+    ["failed", { dispatchStartedAt: 1 }, false],
+    ["unknown", undefined, false],
+    ["succeeded", undefined, false],
+  ] as const) {
+    const f = fixture(), s = f.make(); await s.ready;
+    f.agents[0].activityKey = "launch:generation:1";
+    const target = { sessionId: "native-a", activityKey: "launch:generation:1" };
+    f.state.operations.push({ id: "earlier", agentId: "a", revision: f.agents[0].revision!, target,
+      kind: "automatic", state, createdAt: f.time, updatedAt: f.time, inputFingerprint: null,
+      result: { code: "x", message: "earlier attempt" }, ...(evidence ? { evidence } : {}) });
+    const result = await s.compactNow("a", f.agents[0].revision!, "request-b", target);
+    assert.equal(result.code, accepted ? "accepted" : "existing", `${state} ${JSON.stringify(evidence)}`);
+    if (accepted) { await waitForStatus(f, "completed"); assert.equal(f.calls, 1); }
+    else assert.equal(f.calls, 0);
+  }
+});
+
+test("automatic dispatch never repeats an activity, even one whose attempt sent nothing", async () => {
+  const f = fixture(), s = f.make(); await s.ready;
+  f.agents[0].activityKey = "launch:generation:1";
+  await s.observedTurn(f.agents[0]);
+  f.state.operations.push({ id: "earlier", agentId: "a", revision: f.agents[0].revision!,
+    target: { sessionId: "native-a", activityKey: "launch:generation:1" }, kind: "automatic", state: "expired",
+    createdAt: f.time, updatedAt: f.time, inputFingerprint: null,
+    result: { code: "expired_before_dispatch", message: "Compaction request expired before dispatch" } });
+  f.advance(55 * 60_000);
+  await s.tick();
+  assert.equal(f.calls, 0);
+  assert.equal(f.state.jobs[0].operationId, "earlier");
+  assert.equal(f.state.jobs[0].status, "expired");
+});
+
+test("every write derives the jobs' attempt fields from their operations", async () => {
+  const f = fixture(), s = f.make(); await s.ready;
+  let release!: () => void;
+  f.gateway.compact = async (_id, _agent, execution) => {
+    await execution!.checkpoint({ dispatchStartedAt: f.time });
+    await new Promise<void>(resolve => { release = resolve; });
+    return { status: "completed", detail: "Completed" };
+  };
+  await s.compactNow("a", f.agents[0].revision!, "request-a");
+  while (!release) await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(f.state.jobs[0].status, "running");
+  assert.equal(f.state.jobs[0].attemptedAt, f.state.operations[0].createdAt);
+  release();
+  await waitForStatus(f, "completed");
+  assert.equal(f.state.jobs[0].detail, "Completed");
+  // An attempt that sent nothing leaves no attemptedAt, which is what lets v1.0.2 retry it.
+  const g = fixture(), t = g.make(); await t.ready;
+  g.gateway.compact = async () => ({ status: "failed", detail: "Claude is still working" });
+  await t.compactNow("a", g.agents[0].revision!, "request-a");
+  await waitForStatus(g, "failed");
+  assert.equal(g.state.jobs[0].attemptedAt, undefined);
+  assert.equal(g.state.operations[0].result?.code, "failed_before_dispatch");
 });

@@ -16,7 +16,7 @@ const operation = (id: string, state: StoredOperation["state"] = "succeeded", up
   kind: "manual", createdAt: 500, updatedAt, inputFingerprint: "fingerprint",
   result: { code: "completed", message: "completed boundary" },
 });
-const stateWith = (...operations: StoredOperation[]): State => ({ version: 2, disabled: ["a"], jobs: [], operations });
+const stateWith = (...operations: StoredOperation[]): State => ({ version: 1, disabled: ["a"], jobs: [], operations });
 
 test("retention uses terminal age inclusively, never pending age or last-N eviction", async () => {
   const state = stateWith(...["succeeded", "failed", "unknown", "expired"].map(s => operation(s, s as StoredOperation["state"])),

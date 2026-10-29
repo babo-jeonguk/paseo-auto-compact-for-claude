@@ -50,13 +50,13 @@ Each run writes `report.json` and the daemon logs to `<report-dir>/<platform>-pa
 |---|---|
 | 1 | `--from` installs from GitHub at the expected revision and answers its RPCs |
 | 2 | `--from` records a real reservation, a conversation OFF and a completed Compact now in state v1 |
-| 3 | Update to `--to` at the expected revision: state v2 keeps OFF and the reservation time, turns the earlier compaction into a queryable operation, and a new Compact now of the same activity sends nothing |
+| 3 | Update to `--to` at the expected revision: the state stays version 1 with operation history added, keeps OFF and the reservation time, turns the earlier compaction into a queryable `legacy` operation, and a new Compact now of the same activity sends nothing; then Compact now of a fresh activity on `--to` compacts once |
 | 4 | All native simulation scenarios (`tests/simulation/scenarios.mjs`) against the updated install |
-| 5 | Rollback to `--from` leaves `state.json` byte-identical; `--from` refuses state v2 and sends nothing |
-| 6 | Update to `--to` again restores operation, without replay |
-| 7 | No plugin errors in the daemon log, apart from the rollback refusal |
+| 5 | Rollback to `--from` reads the state, keeps OFF, shows both compacted activities as completed, so its timer will not repeat them, and sends nothing |
+| 6 | Update to `--to` again keeps OFF and turns the history `--from` dropped back into `legacy` operations that still guard their activities, without replay |
+| 7 | No plugin errors in the daemon log |
 
-Item 5 documents a one-way door: v1.0.2 reads only state version 1, so after a rollback automation stops until the newer version returns.
+Items 5 and 6 check that the update is reversible: the added fields are ones v1.0.2 ignores. Automation is off during the rollback so that a scenario reservation falling due there cannot be mistaken for a replay.
 
 ## Desktop app
 

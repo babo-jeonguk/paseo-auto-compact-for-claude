@@ -5,7 +5,7 @@ import { join, delimiter, sep } from 'node:path';
 import { homedir } from 'node:os';
 import { z } from 'zod';
 import { observerAsset } from './observer-assets.generated';
-import type { NativeOperation, Observation, StoredOperation } from './model';
+import { Refusal, type NativeOperation, type Observation, type StoredOperation } from './model';
 import { createCacheReader } from './cache';
 
 const LedgerSchema = z.object({
@@ -178,11 +178,11 @@ export function createObserver(options: { home?: string; now?: () => number } = 
     },
     async prepare(agent: Observation, requireCache: boolean, expiresAt: number, id: string = randomUUID()) {
       const current = await read(agent.agentId);
-      if (!current || current.ledger.sessionId !== agent.sessionId) throw new Error('Claude observer unavailable');
+      if (!current || current.ledger.sessionId !== agent.sessionId) throw new Refusal('Claude observer unavailable');
       const { ledger, directory } = current;
       if (ledger.activeTurns.length || ledger.pendingInputs || ledger.compact?.status === 'running')
-        throw new Error('Claude is still working');
-      if (requireCache) { const blocked = reason(ledger, agent); if (blocked) throw new Error(blocked); }
+        throw new Refusal('Claude is still working');
+      if (requireCache) { const blocked = reason(ledger, agent); if (blocked) throw new Refusal(blocked); }
       const request = { id, launchId: ledger.launchId, generation: ledger.generation,
         sessionId: ledger.sessionId, revision: ledger.revision, preparedAt: now(), expiresAt,
         requireCache, cacheDeadline: ledger.cacheDeadline, clockEpoch: ledger.clockEpoch, status: 'prepared' };

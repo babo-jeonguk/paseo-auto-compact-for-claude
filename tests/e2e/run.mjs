@@ -127,9 +127,10 @@ check(`${FROM} records a reservation, a conversation OFF and a completed Compact
 });
 
 // ---- 3. update to the version under test -----------------------------------------------------------
-check(`update to ${TO} migrates state v1 to v2 and keeps policy, reservation and history`, async () => {
+check(`update to ${TO} adds operation history to state v1 and keeps policy, reservation and history`, async () => {
   await moveTo(TO, 'to');
-  const state = await waitFor(async () => { const s = await readState(); return s.version === 2 ? s : null; }, 'state v2');
+  const state = await waitFor(async () => { const s = await readState(); return Array.isArray(s.operations) ? s : null; }, 'operation history');
+  assert.equal(state.version, 1, 'additive fields keep the version the release reads');
   assert.equal((await fixture.row(legacy.off)).enabled, false, 'conversation OFF survives');
   const reserved = await fixture.row(legacy.reserved);
   assert.equal(reserved.status, 'scheduled'); assert.equal(reserved.dueAt, legacy.row.dueAt, 'reservation time survives');
@@ -137,11 +138,23 @@ check(`update to ${TO} migrates state v1 to v2 and keeps policy, reservation and
   assert.equal(compacted.status, 'completed');
   assert.equal(compacted.latestOperation?.state, 'succeeded');
   assert.equal(compacted.latestOperation?.result?.code, 'legacy_outcome');
+  assert.equal(compacted.latestOperation?.kind, 'legacy');
   assert.equal(state.operations.length, 1);
   const again = await fixture.rpc('now', { agentId: legacy.compacted, revision: compacted.revision,
     target: compacted.target, operationId: randomUUID() });
   assert.equal(again.code, 'existing', `the migrated attempt guards the same activity: ${again.detail}`);
   assert.equal(model.count, legacy.requests, 'update and migration send nothing');
+  // An activity this release compacts, for the rollback to check.
+  legacy.fresh = await fixture.agent();
+  await fixture.turn(legacy.fresh, 'FRESH: reply without tools.');
+  const fresh = await waitFor(async () => { const row = await fixture.row(legacy.fresh);
+    return row.status === 'scheduled' ? row : null; }, `${TO} compactable row`);
+  const accepted = await fixture.rpc('now', { agentId: legacy.fresh, revision: fresh.revision,
+    target: fresh.target, operationId: randomUUID() });
+  assert.equal(accepted.code, 'accepted', accepted.detail);
+  await waitFor(async () => (await fixture.row(legacy.fresh)).latestOperation?.state === 'succeeded', `${TO} Compact now`);
+  assert.equal(model.count, legacy.requests + 1);
+  legacy.requests = model.count;
   // Leave later scenarios a quiet host: their one-minute timers would otherwise also reach these.
   for (const id of Object.values(legacy).filter(v => typeof v === 'string'))
     await fixture.rpc('toggle', { agentId: id, enabled: false });
@@ -151,13 +164,17 @@ check(`update to ${TO} migrates state v1 to v2 and keeps policy, reservation and
 for (const scenario of selected) check(scenario.name, () => scenario.run(context));
 
 // ---- 5. rollback and roll forward ----------------------------------------------------------------
-check(`rollback to ${FROM} keeps state.json byte-identical; ${FROM} refuses state v2 and sends nothing`, async () => {
-  const bytes = await readFile(statePath(), 'utf8'), requests = model.count;
-  report.logBeforeRollback = (await pluginLog()).length;
+check(`rollback to ${FROM} keeps working on this state and sees what was compacted`, async () => {
+  // Scenario reservations could legitimately fall due during the rollback; keep the host quiet.
+  await fixture.settings({ enabled: false });
+  const requests = model.count;
   await moveTo(FROM, 'rollback');
-  await assert.rejects(fixture.rpc('list'), /unreadable/i, `${FROM} must not overwrite state v2`);
-  assert.equal(await readFile(statePath(), 'utf8'), bytes, 'rollback must not rewrite state.json');
-  assert.equal(model.count, requests);
+  await waitFor(async () => (await fixture.rpc('list').catch(() => null))?.rows, `${FROM} reads the state`);
+  assert.equal((await fixture.row(legacy.off)).enabled, false, 'conversation OFF survives rollback');
+  // A finished job status is what keeps the release's timer from compacting an activity again.
+  for (const id of [legacy.compacted, legacy.fresh])
+    assert.equal((await fixture.row(id)).status, 'completed', `${FROM} sees the earlier compaction of ${id}`);
+  assert.equal(model.count, requests, `${FROM} sends nothing`);
 });
 check(`updating to ${TO} again restores operation without replay`, async () => {
   const requests = model.count;
@@ -167,14 +184,20 @@ check(`updating to ${TO} again restores operation without replay`, async () => {
   // The daemon restart scenario left this conversation unopened; open it like a user would.
   await fixture.client.refreshAgent(legacy.off);
   assert.equal((await waitFor(() => fixture.row(legacy.off), 'reopened OFF conversation')).enabled, false);
+  // The rollback dropped operation history; it comes back from the jobs as legacy history.
+  const fresh = await fixture.row(legacy.fresh);
+  assert.equal(fresh.latestOperation?.kind, 'legacy');
+  const again = await fixture.rpc('now', { agentId: legacy.fresh, revision: fresh.revision,
+    target: fresh.target, operationId: randomUUID() });
+  assert.equal(again.code, 'existing', again.detail);
   assert.equal(model.count, requests);
+  await fixture.settings({ enabled: true });
 });
 
 // ---- 6. daemon log ------------------------------------------------------------------------------
-check('daemon log has no plugin errors apart from the rollback refusal', async () => {
+check('daemon log has no plugin errors', async () => {
   const lines = await pluginLog();
-  const unexpected = lines.slice(0, report.logBeforeRollback ?? lines.length).filter(line => !shutdownNoise(line))
-    .concat(lines.slice(report.logBeforeRollback ?? lines.length).filter(line => !/unreadable/i.test(line)));
+  const unexpected = lines.filter(line => !shutdownNoise(line));
   report.pluginErrorLines = lines.slice(0, 40);
   assert.deepEqual(unexpected, []);
 });

@@ -29,14 +29,14 @@ export async function pruneOperationHistory(
   state.operations = state.operations.filter(operation => !removed.has(operation.id));
   for (const job of state.jobs) {
     if (!job.operationId || !removed.has(job.operationId)) continue;
-    // Keep the last activity's dispatch guard, not an indefinitely queryable
-    // operation ID/outcome. New native activity replaces this projection.
+    // Keep the last activity's guard, not an indefinitely queryable operation
+    // ID/outcome. syncJobs has already set attemptedAt only if it may have sent.
+    // New native activity replaces this projection.
     const operation = expired.find(operation => operation.id === job.operationId)!;
-    job.attemptedAt ??= operation.createdAt;
     job.sessionId ??= operation.target.sessionId ?? undefined;
     job.activityKey ??= operation.target.activityKey ?? undefined;
     delete job.operationId;
-    job.detail = "Compaction already attempted for this activity; operation history expired";
+    job.detail = "Compaction history for this activity expired";
   }
   return { changed: removed.size > 0, backlog: expired.length === BATCH_SIZE || removed.size < expired.length };
 }

@@ -6,7 +6,7 @@ import type { CompactOutcome, Gateway, Observation, State } from "./model";
 
 function fixture() {
   let time = 1000;
-  let state: State = { version: 2, disabled: [], jobs: [], operations: [{
+  let state: State = { version: 1, disabled: [], jobs: [], operations: [{
     id: "operation-a", agentId: "a", revision: "rev", target: { sessionId: "native", activityKey: "activity" },
     kind: "manual", state: "requested", createdAt: time, updatedAt: time, result: null,
     inputFingerprint: "fingerprint", deadlineAt: time + 180_000, attempt: 0,
@@ -135,15 +135,47 @@ test("pre-dispatch inspection failures use bounded attempts and persisted backof
   assert.equal(f.sends, 0);
 });
 
-test("a foreign unexpired lease prevents a second worker from claiming", async () => {
-  const f = fixture();
-  f.operation.leaseOwner = "other-worker";
-  f.operation.leaseUntil = 2000;
-  const worker = f.make();
+test("a gateway fault before the dispatch marker is retried; nothing is sent until it passes", async () => {
+  const f = fixture(), worker = f.make();
+  const compact = f.gateway.compact;
+  f.gateway.compact = async () => { throw new Error("observer preparation timed out"); };
   await worker.reconcile();
-  assert.equal(f.sends, 0);
-  f.advance(1001); await worker.reconcile();
+  assert.equal(f.operation.state, "requested");
+  assert.equal(f.operation.attempt, 1);
+  assert.equal(f.errors.length, 1);
+  f.gateway.compact = compact;
+  f.advance(2000); await worker.reconcile();
+  assert.equal(f.operation.state, "succeeded");
   assert.equal(f.sends, 1);
+});
+
+test("a refusal ends the attempt without retry and records that nothing was sent", async () => {
+  const f = fixture(), worker = f.make();
+  f.gateway.compact = async () => ({ status: "failed", detail: "Claude is still working" });
+  await worker.reconcile();
+  assert.equal(f.operation.state, "failed");
+  assert.equal(f.operation.result?.code, "failed_before_dispatch");
+  assert.equal(f.operation.evidence?.dispatchStartedAt, undefined);
+});
+
+test("a failure after the dispatch marker is recorded as sent", async () => {
+  const f = fixture(), worker = f.make();
+  f.gateway.compact = async (_id, _expected, execution) => {
+    await execution!.checkpoint({ dispatchStartedAt: 1000 });
+    return { status: "failed", detail: "Compact turn failed" };
+  };
+  await worker.reconcile();
+  assert.equal(f.operation.state, "failed");
+  assert.equal(f.operation.result?.code, "failed_after_dispatch");
+});
+
+test("a new worker takes over the claim and fences the earlier one", async () => {
+  const f = fixture();
+  f.operation.owner = "earlier-worker";
+  await f.make().reconcile();
+  assert.equal(f.sends, 1);
+  assert.equal(f.operation.state, "succeeded");
+  assert.equal(f.operation.owner, undefined);
 });
 
 test("stopped workers cannot publish late results over recovered operations", async () => {
@@ -162,13 +194,6 @@ test("stopped workers cannot publish late results over recovered operations", as
   release({ status: "completed", detail: "stale worker" });
   await running;
   assert.equal(f.operation.state, "failed");
-});
-
-test("legacy operations without dispatch evidence are never assumed unsent", () => {
-  const f = fixture(); delete f.operation.deadlineAt;
-  f.operation.state = "dispatching";
-  f.recover();
-  assert.equal(f.operation.state, "unknown");
 });
 
 test("crashes cannot reset the pre-dispatch attempt budget", async () => {

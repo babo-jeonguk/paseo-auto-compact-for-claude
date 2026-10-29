@@ -42,7 +42,6 @@ export interface OperationEvidence {
   dispatchStartedAt?: number;
   turnId?: string;
   boundary?: boolean;
-  turnCompleted?: boolean;
   invalidated?: boolean;
 }
 export interface ExecutionContext {
@@ -51,7 +50,11 @@ export interface ExecutionContext {
   checkpoint(evidence: OperationEvidence): Promise<void>;
   current(): boolean;
 }
+// "failed" never says whether anything was sent; the persisted dispatch marker does.
 export type CompactOutcome = { status: "completed" | "failed" | "unknown"; detail: string };
+// A condition that makes sending wrong, not a fault: the attempt ends without
+// retry. Any other error before the dispatch marker is retried within budget.
+export class Refusal extends Error {}
 export interface StoredOperation extends CompactOperation {
   // Canonical caller input; null identifies legacy records with no request token contract.
   inputFingerprint: string | null;
@@ -60,12 +63,14 @@ export interface StoredOperation extends CompactOperation {
   reservationEndedAt?: number;
   attempt?: number;
   nextAttemptAt?: number;
-  leaseOwner?: string;
-  leaseUntil?: number;
+  // The worker that claimed it last; checkpoints from any earlier worker fail.
+  owner?: string;
   evidence?: OperationEvidence;
 }
+// Version 1 with additive fields: v1.0.2 drops what it does not know and keeps
+// working. Bump the version only for a change older readers would misread.
 export interface State {
-  version: 2;
+  version: 1;
   disabled: string[];
   jobs: Job[];
   operations: StoredOperation[];

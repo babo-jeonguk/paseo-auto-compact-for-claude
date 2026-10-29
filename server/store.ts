@@ -6,6 +6,8 @@ import { z } from "zod";
 import { CompactOperationSchema, StatusSchema } from "../shared/rpc";
 import type { State, StateStore } from "./model";
 
+// Jobs as v1.0.2 wrote them, plus their operation link. Unknown keys are dropped,
+// just as v1.0.2 drops ours.
 const LegacyStateSchema = z.object({
   version: z.literal(1),
   disabled: z.array(z.string()),
@@ -28,18 +30,18 @@ const LegacyStateSchema = z.object({
     })
   ),
 });
+// Additive: a file without `operations` is v1.0.2's, or rolled back through it.
 const StateSchema = LegacyStateSchema.extend({
-  version: z.literal(2),
   operations: z.array(CompactOperationSchema.extend({
     inputFingerprint: z.string().nullable(),
     deadlineAt: z.number().finite().optional(), deliveryExpiresAt: z.number().finite().optional(),
     reservationEndedAt: z.number().finite().optional(), nextAttemptAt: z.number().finite().optional(), attempt: z.number().int().nonnegative().optional(),
-    leaseOwner: z.string().optional(), leaseUntil: z.number().finite().optional(),
+    owner: z.string().optional(),
     evidence: z.object({
       native: z.object({ id: z.string(), launchId: z.string(), generation: z.string(),
         sessionId: z.string().nullable(), revision: z.number().int() }).optional(),
       dispatchStartedAt: z.number().finite().optional(), turnId: z.string().optional(),
-      boundary: z.boolean().optional(), turnCompleted: z.boolean().optional(), invalidated: z.boolean().optional(),
+      boundary: z.boolean().optional(), invalidated: z.boolean().optional(),
     }).optional(),
   })),
 }).superRefine((state, context) => {
@@ -49,16 +51,15 @@ const StateSchema = LegacyStateSchema.extend({
 });
 
 function decode(value: unknown): State {
-  if ((value as { version?: unknown })?.version !== 1) return StateSchema.parse(value);
+  if ((value as { operations?: unknown })?.operations !== undefined) return StateSchema.parse(value);
   const legacy = LegacyStateSchema.parse(value);
   const operations: State["operations"] = [];
   for (const job of legacy.jobs) {
     if (!["running", "completed", "failed", "unknown"].includes(job.status)) continue;
     // Stable IDs make repeated reads/migration retries deterministic.
-    const id = job.operationId ?? "legacy-" + createHash("sha256").update(JSON.stringify([
+    const id = "legacy-" + createHash("sha256").update(JSON.stringify([
       job.agentId, job.revision, job.attemptedAt ?? job.endedAt,
     ])).digest("hex");
-    const manual = !!job.operationId;
     if (job.status === "running") {
       job.status = "unknown";
       job.detail = "Plugin restarted during compaction; no automatic retry";
@@ -66,14 +67,14 @@ function decode(value: unknown): State {
     operations.push({
       id, agentId: job.agentId, revision: job.revision,
       target: { sessionId: job.sessionId ?? null, activityKey: job.activityKey ?? null },
-      kind: manual ? "manual" : "automatic", inputFingerprint: null,
+      kind: "legacy", inputFingerprint: null,
       state: job.status === "completed" ? "succeeded" : job.status as "failed" | "unknown",
       createdAt: job.attemptedAt ?? job.endedAt, updatedAt: job.attemptedAt ?? job.endedAt,
       result: { code: "legacy_outcome", message: job.detail },
     });
     job.operationId = id;
   }
-  return StateSchema.parse({ ...legacy, version: 2, operations });
+  return StateSchema.parse({ ...legacy, operations });
 }
 
 export function createStore(
@@ -97,7 +98,7 @@ export function createStore(
         return state;
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "ENOENT")
-          return { version: 2, disabled: [], jobs: [], operations: [] };
+          return { version: 1, disabled: [], jobs: [], operations: [] };
         // Do not discard disabled policies or processed revisions on corruption.
         throw new Error(
           "Auto Compact state is unreadable; automation stopped",

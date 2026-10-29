@@ -3,12 +3,13 @@ import { bounded } from "./deadline";
 import type { Settings } from "../shared/settings";
 import { operationPending, type CompactTarget, type Row } from "../shared/rpc";
 import type { Gateway, Job, Observation, State, StateStore, StoredOperation } from "./model";
-
-import { createOperationWorker, recoverOperations, OPERATION_TIMEOUT_MS, inputFingerprint, operationStatus, publicOperation, sameActivity } from "./operations";
+import { createOperationWorker, recoverOperations, OPERATION_TIMEOUT_MS, inputFingerprint, mayHaveSent,
+  publicOperation, sameActivity, syncJobs } from "./operations";
+import { automaticBlock, dueAt, DELIVERY_WINDOW_MS } from "./policy";
 import { HISTORY_RETENTION_MS, HISTORY_SWEEP_INTERVAL_MS, pruneOperationHistory, type OperationReceipts } from "./retention";
+import { operationRowStatus } from "../shared/rpc";
 
-// This is a delivery grace period, never a claim about the provider cache TTL.
-export const DELIVERY_WINDOW_MS = 5 * 60_000;
+export { DELIVERY_WINDOW_MS } from "./policy";
 const terminal = (job: Job) =>
   ["expired", "skipped", "completed", "failed", "unknown"].includes(job.status);
 
@@ -20,7 +21,9 @@ export function createScheduler(options: {
   onError?: (error: unknown) => void;
   receipts?: OperationReceipts;
 }) {
-  const { store, gateway } = options;
+  const { gateway } = options;
+  // Every write passes through syncJobs, the only writer of jobs' attempt fields.
+  const store: StateStore = { read: () => options.store.read(), write: state => options.store.write(syncJobs(state)) };
   const settings = () => bounded(options.settings(), 5_000);
   const refresh = (id: string) => bounded(gateway.refresh(id), 5_000);
   const now = options.now ?? Date.now;
@@ -33,10 +36,7 @@ export function createScheduler(options: {
     tail = result.catch(() => {});
     return result;
   };
-  const due = (job: Job, config: Settings) =>
-    job.endedAt + config.idleMinutes * 60_000;
-  const allowed = (agent: Observation, config: Settings) =>
-    agent.eligible && !config.disabledProviders.includes(agent.provider);
+  const due = (job: Job, config: Settings) => dueAt(job.endedAt, config);
   function reversibleSkip(
     job: Job | undefined,
     agent: Observation,
@@ -54,10 +54,7 @@ export function createScheduler(options: {
     const config = await settings().catch(() => null);
     recoverOperations(state, now());
     for (const job of state.jobs) {
-      if (job.status === "running" && !state.operations.some(entry => entry.id === job.operationId)) {
-        job.status = "unknown";
-        job.detail = "Plugin restarted during compaction; no automatic retry";
-      } else if (config && !terminal(job) && job.status !== "running" && now() >= due(job, config)) {
+      if (config && !terminal(job) && job.status !== "running" && now() >= due(job, config)) {
         job.status = "expired";
         job.detail =
           "Reservation elapsed while plugin was stopped; waiting for new conversation activity";
@@ -181,9 +178,6 @@ export function createScheduler(options: {
   }
 
   async function reserve(job: Job, state: State, operation: StoredOperation) {
-    job.status = "running";
-    job.detail = "Waiting for completed compaction boundary";
-    job.attemptedAt = now();
     job.operationId = operation.id;
     state.operations.push(operation);
     await store.write(state);
@@ -196,7 +190,7 @@ export function createScheduler(options: {
       deadlineAt: now() + OPERATION_TIMEOUT_MS, reservationEndedAt: job.endedAt, attempt: 0 };
   }
   const existingResult = (operation: StoredOperation) => ({
-    status: operationStatus(operation), detail: operation.result?.message ?? "Compaction requested",
+    status: operationRowStatus(operation), detail: operation.result?.message ?? "Compaction requested",
     operationId: operation.id, operation: publicOperation(operation), code: "existing" as const,
   });
 
@@ -361,15 +355,16 @@ export function createScheduler(options: {
         if (refused || !agent)
           return { result: { status: "blocked" as const, detail: refused!, operationId: null,
             operation: null, code: "blocked" as const } };
-        const attempted = state.operations.find(entry => sameActivity(entry, agent));
+        // An explicit request repeats only work that sent nothing for this activity.
+        const attempted = state.operations.find(entry => sameActivity(entry, agent) && mayHaveSent(entry));
         if (attempted) return { result: existingResult(attempted) };
         let job = state.jobs.find((job) => job.agentId === agentId);
+        // After its history expires, the job's attemptedAt still guards the activity.
         if (
-          job &&
+          job?.attemptedAt !== undefined &&
           !state.operations.some(entry => entry.id === job?.operationId) &&
           sameActivity({ agentId: job.agentId, revision: job.revision,
-            target: { sessionId: job.sessionId ?? null, activityKey: job.activityKey ?? null } }, agent) &&
-          (job.attemptedAt !== undefined || job.status === "running")
+            target: { sessionId: job.sessionId ?? null, activityKey: job.activityKey ?? null } }, agent)
         ) {
           return { result: { status: job.status, detail: job.detail,
             operationId: job.operationId ?? null, operation: null, code: "existing" as const } };
@@ -416,30 +411,23 @@ export function createScheduler(options: {
           (a, b) => a.endedAt - b.endedAt
         )) {
           if (terminal(job) || job.status === "running") continue;
-          const at = now();
-          if (at > due(job, config) + DELIVERY_WINDOW_MS) {
+          const policy = (settings: Settings, agent?: Observation) => automaticBlock({ agentId: job.agentId,
+            endedAt: job.endedAt, settings, disabled: state.disabled, now: now(), agent });
+          const timing = policy(config);
+          if (timing === "late") {
             job.status = "expired";
             job.detail = "Delivery window passed; no replay after sleep";
             changed = true;
             continue;
           }
-          if (
-            at < due(job, config) ||
-            !config.enabled ||
-            state.disabled.includes(job.agentId)
-          )
-            continue;
-          if (!connected) continue;
+          if (timing || !connected) continue;
           const agent = await refresh(job.agentId);
           if (
             !agent ||
             agent.revision !== job.revision ||
             (job.sessionId && agent.sessionId !== job.sessionId) ||
             (job.activityKey && agent.activityKey !== job.activityKey) ||
-            !allowed(agent, config) ||
-            agent.tokens === null ||
-            agent.tokens < config.threshold ||
-            !agent.idle
+            policy(config, agent) === "ineligible"
           ) {
             job.status = "skipped";
             job.detail = "Session changed or no longer eligible";
@@ -462,37 +450,29 @@ export function createScheduler(options: {
           }
           // Settings can change while native observation/host refresh awaits I/O.
           const latest = await settings();
-          if (
-            stopped ||
-            !latest ||
-            !latest.enabled ||
-            !allowed(agent, latest) ||
-            agent.tokens < latest.threshold ||
-            now() < due(job, latest)
-          ) {
+          const block = latest ? policy(latest, agent) : null;
+          if (block === "late") {
+            job.status = "expired";
+            job.detail = "Delivery window passed during inspection";
+            changed = true;
+            continue;
+          }
+          if (stopped || !latest || block) {
             job.status = "blocked";
             job.detail =
               "Automation policy or idle delay changed before dispatch";
             changed = true;
             continue;
           }
-          if (now() > due(job, latest) + DELIVERY_WINDOW_MS) {
-            job.status = "expired";
-            job.detail = "Delivery window passed during inspection";
-            changed = true;
-            continue;
-          }
+          // Automatic work never repeats an activity, even one whose attempt sent nothing.
           const attempted = state.operations.find(entry => sameActivity(entry, agent));
           if (attempted) {
-            job.status = operationStatus(attempted);
-            job.detail = attempted.result?.message ?? "Compaction already requested";
             job.operationId = attempted.id;
-            job.attemptedAt = attempted.createdAt;
             changed = true;
             continue;
           }
           const operation = newOperation(job, agent, "automatic");
-          operation.deliveryExpiresAt = due(job, latest) + DELIVERY_WINDOW_MS;
+          operation.deliveryExpiresAt = dueAt(job.endedAt, latest) + DELIVERY_WINDOW_MS;
           operation.deadlineAt = Math.min(operation.deadlineAt!, operation.deliveryExpiresAt);
           await reserve(job, state, operation);
           // One operation per tick, host-wide serialization across all sessions.

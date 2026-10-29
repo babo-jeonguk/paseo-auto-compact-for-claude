@@ -25,7 +25,8 @@ export const CompactOperationSchema = z.object({
   agentId: z.string(),
   revision: z.string(),
   target: CompactTargetSchema,
-  kind: z.enum(["manual", "automatic"]),
+  // Releases before operations did not record who asked; their history is "legacy".
+  kind: z.enum(["manual", "automatic", "legacy"]),
   state: OperationStateSchema,
   createdAt: z.number().finite(),
   updatedAt: z.number().finite(),

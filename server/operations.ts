@@ -3,6 +3,7 @@ import { operationRowStatus, operationPending, type CompactOperation, type Compa
 import type { CompactOutcome, Gateway, State, StateStore, StoredOperation } from "./model";
 import type { Settings } from "../shared/settings";
 import { bounded } from "./deadline";
+import { automaticBlock } from "./policy";
 
 export function inputFingerprint(agentId: string, revision: string, target?: CompactTarget) {
   // Preserve omitted legacy target as part of caller intent. Never re-fingerprint
@@ -17,10 +18,6 @@ export function publicOperation(operation: StoredOperation): CompactOperation {
   return { id, agentId, revision, target, kind, state, createdAt, updatedAt, result };
 }
 
-export function operationStatus(operation: CompactOperation) {
-  return operationRowStatus(operation);
-}
-
 export function sameActivity(operation: Pick<CompactOperation, "agentId" | "revision" | "target">, agent: {
   agentId: string; revision: string | null; sessionId: string | null; activityKey?: string | null;
 }) {
@@ -32,35 +29,48 @@ export function sameActivity(operation: Pick<CompactOperation, "agentId" | "revi
     : operation.revision === agent.revision;
 }
 
+// Only an expired request, or a failure without the persisted dispatch marker,
+// proves that nothing was sent. Legacy history never recorded the marker.
+export const mayHaveSent = (operation: StoredOperation) => operation.kind === "legacy" ||
+  !(operation.state === "expired" || (operation.state === "failed" && operation.evidence?.dispatchStartedAt === undefined));
+
+// Jobs keep the fields v1.0.2 reads, so a rollback neither replays an attempted
+// reservation nor blocks a retry of one that sent nothing. The scheduler applies
+// this to every state it writes; nothing else writes these job fields.
+export function syncJobs(state: State) {
+  for (const job of state.jobs) {
+    const operation = job.operationId ? state.operations.find(entry => entry.id === job.operationId) : undefined;
+    if (!operation) continue;
+    job.status = operationRowStatus(operation);
+    job.detail = operation.result?.message ?? "Compaction requested; waiting for completed compaction boundary";
+    if (mayHaveSent(operation)) job.attemptedAt ??= operation.createdAt;
+    else delete job.attemptedAt;
+  }
+  return state;
+}
 
 export const OPERATION_TIMEOUT_MS = 180_000;
-const LEASE_MS = 30_000;
 const INSPECT_TIMEOUT_MS = 5_000;
 const MAX_PRE_SEND_ATTEMPTS = 3;
 
-function project(state: State, operation: StoredOperation) {
-  const job = state.jobs.find(job => job.operationId === operation.id);
-  if (job) {
-    job.status = operationStatus(operation);
-    job.detail = operation.result?.message ?? "Compaction requested; waiting for completed compaction boundary";
-  }
+type Ending = CompactOutcome | "expired" | "exhausted";
+function resultOf(ending: Ending, dispatched: boolean): NonNullable<StoredOperation["result"]> {
+  if (ending === "expired") return { code: "expired_before_dispatch", message: "Compaction request expired before dispatch" };
+  if (ending === "exhausted") return { code: "pre_dispatch_retries_exhausted", message: "Could not prepare compaction; nothing sent" };
+  const code = ending.status === "completed" ? "completed" : ending.status === "unknown" ? "unknown"
+    : dispatched ? "failed_after_dispatch" : "failed_before_dispatch";
+  return { code, message: ending.detail };
 }
+const stateOf = (ending: Ending): StoredOperation["state"] =>
+  ending === "expired" ? "expired" : ending === "exhausted" ? "failed"
+    : ending.status === "completed" ? "succeeded" : ending.status;
 
 export function recoverOperations(state: State, now: number) {
   for (const operation of state.operations) {
     if (!operationPending(operation)) continue;
-    if (operation.deadlineAt === undefined) {
-      // First-stage operations did not persist dispatch evidence. Never infer
-      // non-delivery from the absence of fields in an older state file.
-      operation.state = "unknown";
-      operation.result = { code: "interrupted", message: "Plugin restarted during compaction; no automatic retry" };
-    } else {
-      operation.state = operation.evidence?.dispatchStartedAt !== undefined ? "observing" : "requested";
-    }
-    delete operation.leaseOwner;
-    delete operation.leaseUntil;
+    operation.state = operation.evidence?.dispatchStartedAt !== undefined ? "observing" : "requested";
+    delete operation.owner;
     operation.updatedAt = now;
-    project(state, operation);
   }
 }
 
@@ -76,20 +86,18 @@ export function createOperationWorker(options: {
 }) {
   const { store, update, gateway, settings, now, onError } = options;
   const owner = randomUUID();
-  const outcomes = new Map<string, CompactOutcome>();
+  // Outcomes whose terminal write failed; they are written again, never re-earned.
+  const outcomes = new Map<string, Ending>();
   let running = false, stopped = false;
-  async function finish(id: string, outcome: CompactOutcome | "expired") {
+  async function finish(id: string, ending: Ending) {
+    outcomes.set(id, ending);
     await update(state => {
       const operation = state.operations.find(entry => entry.id === id);
-      if (stopped || !operation || !operationPending(operation) || operation.leaseOwner !== owner) return;
-      operation.state = outcome === "expired" ? "expired" : outcome.status === "completed" ? "succeeded" : outcome.status;
-      operation.result = outcome === "expired"
-        ? { code: "expired_before_dispatch", message: "Compaction request expired before dispatch" }
-        : { code: outcome.status, message: outcome.detail };
+      if (stopped || !operation || !operationPending(operation) || operation.owner !== owner) return;
+      operation.state = stateOf(ending);
+      operation.result = resultOf(ending, operation.evidence?.dispatchStartedAt !== undefined);
       operation.updatedAt = now();
-      delete operation.leaseOwner;
-      delete operation.leaseUntil;
-      project(state, operation);
+      delete operation.owner;
     });
     outcomes.delete(id);
   }
@@ -103,81 +111,71 @@ export function createOperationWorker(options: {
       if (!outcomes.has(candidate.id) && now() < (candidate.nextAttemptAt ?? 0) && now() < (candidate.deadlineAt ?? 0)) return;
       // Expiry and retained local outcomes can progress even before host attach.
       if (!connected && !outcomes.has(candidate.id) && !candidate.evidence?.boundary && now() < (candidate.deadlineAt ?? 0)) return;
+      // Startup recovery clears owners, so a claim only ever replaces an earlier
+      // worker of this process; that worker's later checkpoints then fail.
       const operation = await update(state => {
         const current = state.operations.find(entry => entry.id === candidate.id);
         if (stopped || !current || !operationPending(current)) return null;
-        if (current.leaseOwner && current.leaseOwner !== owner && (current.leaseUntil ?? 0) > now()) return null;
-        current.leaseOwner = owner;
-        current.leaseUntil = Math.min(now() + LEASE_MS, current.deadlineAt ?? now());
+        current.owner = owner;
         current.updatedAt = now();
         if (current.evidence?.dispatchStartedAt === undefined && !outcomes.has(current.id)) {
           current.state = "dispatching";
           current.attempt = (current.attempt ?? 0) + 1;
         }
-        project(state, current);
         return structuredClone(current);
       });
       if (!operation) return;
       claimedId = operation.id;
       const remembered = outcomes.get(operation.id);
-      if (remembered) { await finish(operation.id, remembered); return; }
+      if (remembered) return await finish(operation.id, remembered);
+      const deadlineAt = operation.deadlineAt!;
       if (operation.evidence?.dispatchStartedAt !== undefined) {
         let result: CompactOutcome | null = null;
         if (gateway.inspect && (connected || operation.evidence?.boundary)) {
           try { result = await bounded(gateway.inspect(operation), INSPECT_TIMEOUT_MS); }
           catch (error) { onError(error); }
         }
-        if (result && result.status !== "unknown") { outcomes.set(operation.id, result); await finish(operation.id, result); return; }
-        if (result?.status === "unknown" || now() >= (operation.deadlineAt ?? 0)) {
-          const outcome = result ?? { status: "unknown", detail: "Compaction deadline passed without matching completion evidence; no automatic retry" };
-          outcomes.set(operation.id, outcome);
-          await finish(operation.id, outcome);
-        }
+        if (result) return await finish(operation.id, result);
+        if (now() >= deadlineAt) return await finish(operation.id,
+          { status: "unknown", detail: "Compaction deadline passed without matching completion evidence; no automatic retry" });
         return;
       }
-      if (now() >= (operation.deadlineAt ?? 0) || now() > (operation.deliveryExpiresAt ?? Infinity)) {
-        await finish(operation.id, "expired"); return;
-      }
-      if ((operation.attempt ?? 0) > MAX_PRE_SEND_ATTEMPTS) {
-        const outcome: CompactOutcome = { status: "failed", detail: "Pre-dispatch attempt budget exhausted; nothing sent" };
-        outcomes.set(operation.id, outcome); await finish(operation.id, outcome); return;
-      }
-      const deadlineAt = operation.deadlineAt!;
+      if (now() >= deadlineAt || now() > (operation.deliveryExpiresAt ?? Infinity))
+        return await finish(operation.id, "expired");
+      if ((operation.attempt ?? 0) > MAX_PRE_SEND_ATTEMPTS) return await finish(operation.id, "exhausted");
       const wait = <T>(work: Promise<T>) => bounded(work, Math.min(INSPECT_TIMEOUT_MS, deadlineAt - now()));
       const [agent, config] = await Promise.all([wait(gateway.refresh(operation.agentId)), wait(settings())]);
       const allowed = async () => {
         const [latest, state] = await Promise.all([wait(settings()), store.read()]);
-        const endedAt = operation.reservationEndedAt;
-        if (stopped || !agent || !latest || !latest.enabled || latest.disabledProviders.includes(agent.provider) ||
-            state.disabled.includes(operation.agentId) || agent.tokens === null || agent.tokens < latest.threshold ||
-            endedAt === undefined) return false;
-        const due = endedAt + latest.idleMinutes * 60_000;
-        return now() >= due && now() <= due + 5 * 60_000 && now() <= (operation.deliveryExpiresAt ?? Infinity);
+        return !stopped && !!agent && !!latest && operation.reservationEndedAt !== undefined &&
+          now() <= (operation.deliveryExpiresAt ?? Infinity) &&
+          automaticBlock({ agentId: operation.agentId, endedAt: operation.reservationEndedAt,
+            settings: latest, disabled: state.disabled, now: now(), agent }) === null;
       };
       if (stopped) return;
       if (!config || !agent?.eligible || !agent.idle || !sameActivity(operation, agent) ||
           operation.target.sessionId !== agent.sessionId ||
           operation.target.activityKey !== (agent.activityKey ?? null) ||
-          (operation.kind === "automatic" && (!gateway.automatic || !await allowed()))) {
-        const outcome: CompactOutcome = { status: "failed", detail: "Session, activity or policy changed before dispatch; nothing sent" };
-        outcomes.set(operation.id, outcome); await finish(operation.id, outcome); return;
-      }
+          (operation.kind === "automatic" && (!gateway.automatic || !await allowed())))
+        return await finish(operation.id,
+          { status: "failed", detail: "Session, activity or policy changed before dispatch; nothing sent" });
       const execution = {
         id: operation.id, deadlineAt,
         current: () => !stopped && now() < deadlineAt,
         checkpoint: async (evidence: NonNullable<StoredOperation["evidence"]>) => {
           await update(state => {
             const current = state.operations.find(entry => entry.id === operation.id);
-            if (stopped || !current || !operationPending(current) || current.leaseOwner !== owner || now() >= deadlineAt)
+            if (stopped || !current || !operationPending(current) || current.owner !== owner || now() >= deadlineAt)
               throw new Error("Compaction worker ownership expired");
             current.evidence = { ...current.evidence, ...evidence,
               invalidated: !!current.evidence?.invalidated || !!evidence.invalidated };
             if (current.evidence.dispatchStartedAt !== undefined) current.state = "observing";
             current.updatedAt = now();
-            current.leaseUntil = Math.min(now() + LEASE_MS, deadlineAt);
           });
         },
       };
+      // A refusal comes back as a failed outcome; a fault before the dispatch
+      // marker is thrown and retried below.
       const outcome = await (operation.kind === "automatic"
         ? gateway.automatic!(agent, { expiresAt: Math.min(operation.deliveryExpiresAt ?? Infinity, deadlineAt), allowed }, execution)
         : gateway.compact(agent.agentId, agent, execution));
@@ -187,28 +185,27 @@ export function createOperationWorker(options: {
         if (saved?.evidence?.dispatchStartedAt !== undefined && !saved.evidence.invalidated && now() < deadlineAt)
           return; // Ambiguous delivery continues through evidence reconciliation.
       }
-      outcomes.set(operation.id, outcome);
       await finish(operation.id, outcome);
     } catch (error) {
       // Keep the durable nonterminal record. The next reconcile retries state
-      // persistence or pre-send inspection; it never retransmits marked work.
+      // persistence or pre-send preparation; it never retransmits marked work.
       onError(error);
       if (claimedId && !outcomes.has(claimedId) && !stopped) {
         try {
           await update(state => {
             const current = state.operations.find(entry => entry.id === claimedId);
-            if (!current || !operationPending(current) || current.leaseOwner !== owner ||
+            if (!current || !operationPending(current) || current.owner !== owner ||
                 current.evidence?.dispatchStartedAt !== undefined) return;
             if ((current.attempt ?? 0) >= MAX_PRE_SEND_ATTEMPTS) {
-              current.state = "failed";
-              current.result = { code: "pre_dispatch_retries_exhausted", message: "Could not prepare compaction; nothing sent" };
+              current.state = stateOf("exhausted");
+              current.result = resultOf("exhausted", false);
             } else {
               current.state = "requested";
               const delay = 1_000 * 2 ** Math.max(0, (current.attempt ?? 1) - 1);
               current.nextAttemptAt = now() + delay + Math.floor(Math.random() * 500);
             }
-            delete current.leaseOwner; delete current.leaseUntil;
-            current.updatedAt = now(); project(state, current);
+            delete current.owner;
+            current.updatedAt = now();
           });
         } catch (writeError) { onError(writeError); }
       }

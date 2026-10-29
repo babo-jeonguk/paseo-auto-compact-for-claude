@@ -20,15 +20,23 @@ function operationId() {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
+const sameInput = (a: Omit<CompactSubmission, "operationId">, b: Omit<CompactSubmission, "operationId">) =>
+  a.revision === b.revision && a.target?.sessionId === b.target?.sessionId &&
+  a.target?.activityKey === b.target?.activityKey;
+
 export function createCompactSubmissions(makeId: () => string = operationId) {
   const pending = new Map<string, CompactSubmission>();
   const key = (hostId: string, agentId: string) => JSON.stringify([hostId, agentId]);
   return {
     get: (hostId: string, agentId: string) => pending.get(key(hostId, agentId)),
+    // The same input retries an unconfirmed submission under its ID; different
+    // input is a new intent and gets a new ID. A late copy of the replaced one is
+    // refused by the server's revision check, and anything it already started
+    // blocks this one, so neither can send twice.
     prepare(hostId: string, input: Omit<CompactSubmission, "operationId">) {
       const scope = key(hostId, input.agentId);
       const existing = pending.get(scope);
-      if (existing) return existing;
+      if (existing && sameInput(existing, input)) return existing;
       const submission = { ...input, operationId: makeId() };
       pending.set(scope, submission);
       return submission;

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { bounded } from "./deadline";
-import type { OperationEvidence, StoredOperation } from "./model";
+import { Refusal, type OperationEvidence, type StoredOperation } from "./model";
 import { createGateway } from "./gateway";
 import type {
   PluginHandlerContext,
@@ -181,6 +181,18 @@ test('last-moment off policy and expired delivery prevent public send', async ()
   }
 });
 
+test('an observer refusal is a failed outcome; any other error before sending is thrown', async () => {
+  for (const [error, refused] of [[new Refusal('Claude is still working'), true], [new Error('EIO'), false]] as const) {
+    const native = observer(null)!;
+    native.prepare = async () => { throw error; };
+    const host = fixture([], undefined, false, [], { observer: native });
+    const agent = (await host.gateway.refresh('a'))!;
+    if (refused) assert.equal((await host.gateway.compact('a', agent)).status, 'failed');
+    else await assert.rejects(host.gateway.compact('a', agent), /EIO/);
+    assert.equal(host.sendCount(), 0);
+  }
+});
+
 test('idle pending input is distinguished from an active reply without allowing dispatch', async () => {
   const native = observer(null)!;
   const read = native.read;
@@ -224,8 +236,14 @@ test("every external gateway wait is bounded, including send and release", async
         return result;
       };
     }
+    // A wait that expires before sending is a fault for the worker to retry.
+    if (stalled === "subscribe" || stalled === "refresh") {
+      await assert.rejects(bounded(host.gateway.compact("a"), 2_000), /deadline/i, stalled);
+      assert.equal(host.sendCount(), 0, stalled);
+      continue;
+    }
     const result = await bounded(host.gateway.compact("a"), 2_000);
-    assert.equal(result.status, stalled === "release" ? "completed" : stalled === "send" ? "unknown" : "failed", stalled);
+    assert.equal(result.status, stalled === "release" ? "completed" : "unknown", stalled);
     assert.equal(host.ownTurn("a", "compact-1"), false);
     host.stop();
   }
@@ -251,11 +269,11 @@ test("stable identity and durable send marker precede provider dispatch", async 
 
 test("failed marker persistence never sends and late send rejection is consumed", async () => {
   const host = fixture([]);
-  const failed = await host.gateway.compact("a", undefined, {
+  // A fault before sending is the worker's to retry, so it is thrown, not an outcome.
+  await assert.rejects(host.gateway.compact("a", undefined, {
     id: "caller-request", deadlineAt: Date.now() + 1000,
     checkpoint: async () => { throw new Error("disk full"); }, current: () => true,
-  });
-  assert.equal(failed.status, "failed");
+  }), /disk full/);
   assert.equal(host.sendCount(), 0);
   let reject!: (error: Error) => void;
   host.ref.send = async () => new Promise<never>((_resolve, fail) => { reject = fail; });

@@ -1,6 +1,6 @@
 import type { PluginHandlerContext, PluginLifecycleEvents } from "@getpaseo/plugin/server";
 import { randomUUID } from "node:crypto";
-import type { Gateway, Observation, DispatchGuard, ExecutionContext, OperationEvidence } from "./model";
+import { Refusal, type Gateway, type Observation, type DispatchGuard, type ExecutionContext, type OperationEvidence } from "./model";
 import type { createObserver } from "./observer";
 import { bounded } from "./deadline";
 import { claudeProvider } from "../shared/providers";
@@ -98,7 +98,7 @@ export function createGateway(options: {
   };
   async function compact(agentId: string, expected: Observation | undefined, automatic: boolean,
     guard?: DispatchGuard, execution?: ExecutionContext): ReturnType<Gateway["compact"]> {
-    if (busy.has(agentId) || stopped) return { status: "failed", detail: "Compaction already running or plugin stopped" };
+    if (busy.has(agentId) || stopped) throw new Error("Compaction already running or plugin stopped");
     busy.add(agentId);
     try { return await dispatch(agentId, expected, automatic, guard, execution); }
     finally { busy.delete(agentId); }
@@ -121,8 +121,7 @@ export function createGateway(options: {
     async function checkpoint(force = false) {
       if (!execution) return;
       const value = { ...evidence, ...(entry.turnId ? { turnId: entry.turnId } : {}),
-        boundary, invalidated: !healthy || superseded,
-        turnCompleted: !!entry.turnId && endings.get(entry.turnId)?.outcome.kind === "completed" };
+        boundary, invalidated: !healthy || superseded };
       const serialized = JSON.stringify(value);
       if (!force && serialized === saved && now() - lastCheckpoint < 5_000) return;
       await wait(execution.checkpoint(value));
@@ -195,9 +194,10 @@ export function createGateway(options: {
       }
       return { status: "unknown", detail: "Compaction completion unconfirmed; no automatic retry" };
     } catch (error) {
-      return { status: sent ? "unknown" : "failed", detail: sent
-        ? "Compaction completion unconfirmed; no automatic retry"
-        : `Compaction stopped before send: ${String(error)}` };
+      if (sent) return { status: "unknown", detail: "Compaction completion unconfirmed; no automatic retry" };
+      // Retrying is the worker's decision; report a fault rather than an outcome.
+      if (!(error instanceof Refusal)) throw error;
+      return { status: "failed", detail: `Compaction stopped before send: ${error.message}` };
     } finally {
       armed = false;
       if (pending.get(agentId) === entry) {
