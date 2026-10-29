@@ -10,7 +10,7 @@ npm run build:observer
 npm run check
 ```
 
-`check` verifies the embedded observer source, TypeScript, scheduling, file persistence, conversation controls and execution tests. Run `build:observer` after changing `server/observer-source.mjs`. The fast CI matrix runs these checks against Paseo SDK 0.12 and 0.13 on Linux, macOS and Windows. The package keeps SDK 0.12 pinned as the minimum compile-time contract. Separate native simulation jobs exercise real Claude with both Paseo versions on Linux and Windows.
+`check` verifies the embedded observer source, TypeScript, scheduling, file persistence, conversation controls and execution tests. Run `build:observer` after changing `server/observer-source.mjs`. The fast CI matrix runs these checks against Paseo SDK 0.12, 0.13 and 0.14 on Linux, macOS and Windows. The package keeps SDK 0.12 pinned as the minimum compile-time contract. Separate native simulation jobs exercise real Claude with all three Paseo versions on Linux and Windows.
 
 ## Execution
 
@@ -41,7 +41,7 @@ Distribution uses the public GitHub repository and GitHub Releases. `private: tr
 
 Text files use LF line endings on every OS. Keep `.gitattributes` in the checkout: the embedded observer's source hash and generated-file check must remain identical on Windows.
 
-For each update, run `npm run test:update`. It combines these fast checks with the repeatable native simulation for Paseo 0.12 and 0.13. See [simulation setup, coverage and reports](testing.md).
+For each update, run `npm run test:update`. It combines these fast checks with the repeatable native simulation for Paseo 0.12, 0.13 and 0.14. See [simulation setup, coverage and reports](testing.md).
 
 ## Reference-driven validation
 

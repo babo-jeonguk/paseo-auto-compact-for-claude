@@ -240,6 +240,23 @@ test('an unreadable observer is reported on the observation and is a fault befor
   assert.equal(host.sendCount(), 0);
 });
 
+test('a host that reopens stale plugin sessions never sends against an observer from the prior plugin instance', async () => {
+  const native = observer(null) as ReturnType<typeof observer> & {
+    ownsCurrentLaunch(agentId: string): Promise<boolean>;
+  };
+  native.ownsCurrentLaunch = async () => false;
+  const host = fixture([], undefined, false, [], { observer: native });
+  Object.assign(host.ref, { reload: async () => null });
+  const result = await host.gateway.compact('a', (await host.gateway.refresh('a'))!);
+  assert.equal(result.status, 'failed');
+  assert.match(result.detail, /resume.*message/i);
+  assert.equal(host.sendCount(), 0);
+  const automatic = await host.gateway.automatic!((await host.gateway.refresh('a'))!);
+  assert.equal(automatic.status, 'failed');
+  assert.match(automatic.detail, /resume.*message/i);
+  assert.equal(host.sendCount(), 0);
+});
+
 test('idle pending input is distinguished from an active reply without allowing dispatch', async () => {
   const native = observer(null)!;
   const read = native.read;

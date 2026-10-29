@@ -4,9 +4,9 @@ import { fileURLToPath } from 'node:url';
 
 const here = dirname(fileURLToPath(import.meta.url));
 if (process.argv.includes('--paseo'))
-  throw new Error('Use test:simulation:0.12 or test:simulation:0.13 to select one Paseo version');
+  throw new Error('Use a version-specific test:simulation script to select one Paseo version');
 
-for (const paseo of ['0.12.0', '0.13.0']) {
+for (const paseo of ['0.12.0', '0.13.0', '0.14.0']) {
   await new Promise((resolve, reject) => {
     const child = spawn(process.execPath, ['--no-maglev', join(here, 'run.mjs'),
       '--paseo', paseo, ...process.argv.slice(2)], { stdio: 'inherit', windowsHide: true });

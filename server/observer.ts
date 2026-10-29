@@ -45,6 +45,7 @@ export function createObserver(options: { home?: string; now?: () => number } = 
   const base = join(options.home ?? process.env.PASEO_HOME ?? join(homedir(), '.paseo'),
     'plugin-data', 'auto-compact-for-claude', 'observers');
   const now = options.now ?? Date.now;
+  const currentLaunches = new Map<string, string>();
   const cacheWindow = createCacheReader();
   const agentDirectory = (id: string) => join(base, createHash('sha256').update(id).digest('hex'));
   const receiptName = (id: string) => encodeURIComponent(id) + '.json';
@@ -180,11 +181,16 @@ export function createObserver(options: { home?: string; now?: () => number } = 
       await writeFile(join(mod, 'hooks', 'register.mjs'), observerAsset.source + '\nexport function register(on) { registerObserver(on, ' +
         JSON.stringify(configuration) + '); }\n', { mode: 0o600 });
       await atomic(join(parent, 'current.json'), { launchId, build: observerAsset.version });
+      currentLaunches.set(request.agentId, launchId);
       await prune(parent, launchId).catch(() => {});
       const existing = request.env.CLAUDE_CODE_PLUGIN_DIRS?.split(delimiter)
         .filter(path => path && !path.startsWith(parent + sep));
       return { ...request, env: { ...request.env,
         CLAUDE_CODE_PLUGIN_DIRS: [...(existing ?? []), mod].join(delimiter) } };
+    },
+    async ownsCurrentLaunch(agentId: string) {
+      const current = await read(agentId);
+      return !!current && currentLaunches.get(agentId) === current.ledger.launchId;
     },
     async readiness(agent: Observation, dueAt?: number) {
       // A status display; an unreadable observer is reported, never thrown.

@@ -33,6 +33,8 @@ export function createGateway(options: {
     if (!api) throw new Error("Waiting for a conversation lifecycle event or plugin request");
     return api;
   };
+  const reopensStalePluginSession = (ref: object) =>
+    typeof Reflect.get(ref, "reload") === "function";
   async function observation(agent: Agent, providers?: Record<string, unknown>): Promise<Observation> {
     providers ??= (await requireApi().config.get()).config.providers;
     const tokens = agent.lastUsage?.contextWindowUsedTokens;
@@ -85,7 +87,12 @@ export function createGateway(options: {
     },
     ...(observer ? {
       automatic: (expected: Observation, guard?: DispatchGuard, execution?: ExecutionContext) => compact(expected.agentId, expected, true, guard, execution),
-      readiness: (expected: Observation, dueAt?: number) => observer.readiness(expected, dueAt),
+      readiness: async (expected: Observation, dueAt?: number) => {
+        const ref = requireApi().agents.ref(expected.agentId);
+        if (reopensStalePluginSession(ref) && !await observer.ownsCurrentLaunch(expected.agentId))
+          return "Session must resume after plugin reload; send a message before compacting";
+        return observer.readiness(expected, dueAt);
+      },
     } : {}),
     compact: (id, expected, execution) => compact(id, expected, false, undefined, execution),
     async inspect(operation) {
@@ -149,6 +156,13 @@ export function createGateway(options: {
       // for as long as it can still be observed.
       const startBy = Math.min(guard?.expiresAt ?? Infinity, sendBy);
       if (observer) {
+        // Paseo 0.14 reopens stale plugin sessions immediately before their next
+        // prompt. A /compact prepared against the previous Mod launch would run
+        // in the new launch without its request ID, splitting native completion
+        // from the durable operation. Wait for an ordinary prompt to perform the
+        // reopen; hosts without ref.reload retain the 0.12/0.13 behavior.
+        if (reopensStalePluginSession(ref) && !await read(observer.ownsCurrentLaunch(agentId)))
+          return { status: "failed", detail: "Session must resume after plugin reload; send a message before compacting" };
         operation = await read(observer.prepare(before, automatic, observationEndBy(sendBy), id));
         const { launchId, generation, sessionId, revision } = operation;
         evidence.native = { id, launchId, generation, sessionId, revision };
