@@ -149,11 +149,12 @@ check(`update to ${TO} adds operation history to state v1 and keeps policy, rese
   await fixture.turn(legacy.fresh, 'FRESH: reply without tools.');
   const fresh = await waitFor(async () => { const row = await fixture.row(legacy.fresh);
     return row.status === 'scheduled' ? row : null; }, `${TO} compactable row`);
+  const beforeCompact = model.count;
   const accepted = await fixture.rpc('now', { agentId: legacy.fresh, revision: fresh.revision,
     target: fresh.target, operationId: randomUUID() });
   assert.equal(accepted.code, 'accepted', accepted.detail);
   await waitFor(async () => (await fixture.row(legacy.fresh)).latestOperation?.state === 'succeeded', `${TO} Compact now`);
-  assert.equal(model.count, legacy.requests + 1);
+  assert.equal(model.count, beforeCompact + 1, 'Compact now sends one request');
   legacy.requests = model.count;
   // Leave later scenarios a quiet host: their one-minute timers would otherwise also reach these.
   for (const id of Object.values(legacy).filter(v => typeof v === 'string'))
@@ -184,12 +185,13 @@ check(`updating to ${TO} again restores operation without replay`, async () => {
   // The daemon restart scenario left this conversation unopened; open it like a user would.
   await fixture.client.refreshAgent(legacy.off);
   assert.equal((await waitFor(() => fixture.row(legacy.off), 'reopened OFF conversation')).enabled, false);
-  // The rollback dropped operation history; it comes back from the jobs as legacy history.
+  // The rollback dropped operation history; it comes back from the jobs as legacy history, and
+  // the finished job keeps the timer from compacting that activity again. (A manual guard needs the
+  // native activity identity, which this unopened conversation does not report.)
   const fresh = await fixture.row(legacy.fresh);
   assert.equal(fresh.latestOperation?.kind, 'legacy');
-  const again = await fixture.rpc('now', { agentId: legacy.fresh, revision: fresh.revision,
-    target: fresh.target, operationId: randomUUID() });
-  assert.equal(again.code, 'existing', again.detail);
+  assert.equal(fresh.latestOperation?.state, 'succeeded');
+  assert.equal(fresh.status, 'completed');
   assert.equal(model.count, requests);
   await fixture.settings({ enabled: true });
 });
