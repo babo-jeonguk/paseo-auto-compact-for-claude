@@ -154,14 +154,14 @@ test('automatic public dispatch requires both its own boundary and matching nati
     [{ status: 'completed', detail: 'Native PostCompact' }, 'completed'],
     [{ status: 'unknown', detail: 'Overlapping input' }, 'unknown'],
   ] as const) {
-    const host = fixture(boundary, undefined, false, boundary, { observer: observer(receipt) });
+    const host = fixture(boundary, undefined, false, boundary, { observer: observer(receipt), timeoutMs: 1_000 });
     const agent = (await host.gateway.refresh('a'))!;
     assert.equal((await host.gateway.automatic!(agent)).status, expected);
     assert.equal(host.sendCount(), 1);
   }
   const foreign = [...boundary, { type: 'user_message', clientMessageId: 'unrelated' }];
   const host = fixture(boundary, undefined, false, foreign, {
-    observer: observer({ status: 'completed', detail: 'Native PostCompact' }),
+    observer: observer({ status: 'completed', detail: 'Native PostCompact' }), timeoutMs: 1_000,
   });
   assert.equal((await host.gateway.automatic!((await host.gateway.refresh('a'))!)).status, 'unknown');
 });

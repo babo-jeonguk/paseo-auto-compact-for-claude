@@ -41,7 +41,27 @@ Distribution uses the public GitHub repository and GitHub Releases. `private: tr
 
 Text files use LF line endings on every OS. Keep `.gitattributes` in the checkout: the embedded observer's source hash and generated-file check must remain identical on Windows.
 
-For each update, run `npm run test:update`. It combines these fast checks with the repeatable native simulation for Paseo 0.12 and 0.13. See [simulation setup, coverage and reports](testing.md).
+During an edit, run the relevant test first, then `npm run test:update` (the fast observer, TypeScript and unit checks):
+
+```sh
+npm run test:focused -- server/cache.test.ts
+npm run test:update
+```
+
+After committing, use a disposable detached worktree for native validation. The runner records the exact commit and keeps results in `test-results/snapshots/<sha>-<timestamp>/`. Editing or pushing your original checkout does not change the files being tested.
+
+```sh
+npm run test:snapshot -- --suite simulation --paseo 0.13.0
+npm run test:release
+```
+
+`test:release` runs the fast checks and the complete native version matrix against one committed snapshot. It requires Git, installed root dependencies and simulation tools (`npm ci --prefix tests/simulation --ignore-scripts`). Dependency links are reused only with matching lockfiles; no global tools are installed. The source checkout must be clean at launch. Use `--ref <commit>` to test an older revision with matching lockfiles. Failed tests still write `snapshot.json`; cleanup errors fail the command too.
+
+CI runs every fast SDK/OS check and every native version/OS combination. PR updates cancel the previous run of that PR; only `main` pushes start push workflows, avoiding duplicate push/PR runs on feature branches. Native versions have separate jobs and artifact names, so a failed version can be rerun on its own. A main run is allowed to finish to preserve evidence for that commit.
+
+Local native runs share one machine slot across worktrees and fail immediately if it is occupied. This prevents this project's daemons from competing with each other. It does not control other projects or detect unrelated machine load. Normal completion releases the slot; after a crash or failed cleanup, inspect the PID in the reported lock directory, stop only your own surviving test processes, and remove the lock only once they are gone. CI runners have separate slots.
+
+Install/rollback and desktop/Android E2E currently live in PR #2; these commands do not claim to run them on main. When integrating those harnesses, pin their GitHub install target to the snapshot's full SHA, use their `--min 1` mode for routine install checks (the native matrix retains real timers), and share the native slot with desktop/emulator runs. Keep full install/rollback and app checks in the release checklist. See [simulation setup, coverage and reports](testing.md).
 
 ## Reference-driven validation
 

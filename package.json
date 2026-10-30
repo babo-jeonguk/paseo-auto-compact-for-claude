@@ -22,7 +22,10 @@
     "test:simulation": "node --no-maglev tests/simulation/matrix.mjs",
     "test:simulation:0.12": "node --no-maglev tests/simulation/run.mjs --paseo 0.12.0",
     "test:simulation:0.13": "node --no-maglev tests/simulation/run.mjs --paseo 0.13.0",
-    "test:update": "npm run check && npm run test:simulation --"
+    "test:update": "npm run check",
+    "test:focused": "node --import tsx --test --test-isolation=none",
+    "test:snapshot": "node scripts/test-snapshot.mjs",
+    "test:release": "node scripts/test-snapshot.mjs --suite release"
   },
   "devDependencies": {
     "@getpaseo/client": "0.12.0",

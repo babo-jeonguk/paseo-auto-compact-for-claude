@@ -6,7 +6,7 @@ Use **Node 24+**. From this plugin's checkout, install its development dependenc
 npm ci --ignore-scripts
 ```
 
-After each update, run:
+During development, run the fast checks after each update:
 
 ```sh
 npm run test:update
@@ -14,7 +14,7 @@ npm run test:update
 
 In Windows PowerShell, `npm.cmd run test:update` also works when execution policy blocks `npm.ps1`. Run with **Windows Node** to test Windows; WSL Node tests Linux. The runner records `process.platform`, architecture, OS release, Node/Claude/Paseo versions and product source hashes.
 
-The command runs type checks, the fast regression suite and the native simulation once with Paseo **0.12.0** and once with **0.13.0**. On first use it installs both pinned Paseo toolchains and Claude from `tests/simulation/package-lock.json`. This needs network access and can take several minutes. Later runs reuse them. Nothing is installed globally and no Claude login is required.
+The update command runs observer consistency, type checks and the fast regression suite. After committing, run `npm run test:release` for those checks and the full native matrix on an isolated snapshot with Paseo **0.12.0** and **0.13.0**. Install the pinned native tools once with `npm ci --prefix tests/simulation --ignore-scripts`. This needs network access and can take several minutes; later runs reuse them. Nothing is installed globally and no Claude login is required.
 
 ## What is real and what is simulated
 
@@ -75,4 +75,12 @@ To change a tested Claude/Paseo version, edit its exact alias in `tests/simulati
 
 ## CI
 
-[Check workflow](https://github.com/babo-jeonguk/paseo-auto-compact-for-claude/blob/main/.github/workflows/check.yml) has Paseo 0.12/0.13 native simulation jobs on **ubuntu-latest** and **windows-latest**, in addition to fast SDK 0.12/0.13 checks on Linux, macOS and Windows. Pull requests, pushes and manual workflow dispatch run them and upload their reports/logs even when a test fails. No API secret is needed. [View workflow runs](https://github.com/babo-jeonguk/paseo-auto-compact-for-claude/actions/workflows/check.yml). Native macOS execution is not covered by the fast macOS checks.
+[Check workflow](https://github.com/babo-jeonguk/paseo-auto-compact-for-claude/blob/main/.github/workflows/check.yml) has Paseo 0.12/0.13 native simulation jobs on **ubuntu-latest** and **windows-latest**, in addition to fast SDK 0.12/0.13 checks on Linux, macOS and Windows. Pull requests, main-branch pushes and manual workflow dispatch run them and upload their reports/logs even when a test fails. No API secret is needed. [View workflow runs](https://github.com/babo-jeonguk/paseo-auto-compact-for-claude/actions/workflows/check.yml). Native macOS execution is not covered by the fast macOS checks.
+
+## Fast feedback and isolated runs
+
+`npm run test:focused -- server/cache.test.ts` runs just the named test file. `npm run test:update` runs only the fast checks; it no longer starts native daemons. `npm run test:release` explicitly runs the fast checks and the full native matrix from one committed snapshot.
+
+For one native version, run `npm run test:snapshot -- --suite simulation --paseo 0.13.0`. Reports include the full commit SHA in `snapshot.json` and native `report.json`, under `test-results/snapshots/<sha>-<timestamp>/`. Source edits and later pushes do not change that run. Root and simulation dependencies must be installed for the chosen lockfiles. See [development workflow](development.md#packaging-and-releases) for prerequisites and cleanup.
+
+CI separates native versions into independent Linux/Windows jobs and artifacts. An open PR no longer also starts a feature-branch push workflow; a new PR commit cancels its superseded PR run. Manual dispatch can select a feature branch if it needs validation before a PR exists. Actual automatic-timer and downtime waits remain in each native lane. No retry turns an assertion failure into a pass.

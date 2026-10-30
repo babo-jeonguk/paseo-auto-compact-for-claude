@@ -1,10 +1,14 @@
 name: Check
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   check:
     strategy:
@@ -28,6 +32,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        paseo: [0.12.0, 0.13.0]
+        os: [ubuntu-latest, windows-latest]
         include:
           - os: ubuntu-latest
             platform: linux
@@ -46,10 +52,10 @@ jobs:
             tests/simulation/package-lock.json
       - run: npm ci --ignore-scripts
       - run: npm ci --prefix tests/simulation --ignore-scripts --no-audit --no-fund
-      - run: npm run test:simulation -- --expect-platform ${{ matrix.platform }}
+      - run: node --no-maglev tests/simulation/run.mjs --paseo ${{ matrix.paseo }} --expect-platform ${{ matrix.platform }}
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: simulation-${{ matrix.platform }}-paseo-0.12-0.13
+          name: simulation-${{ matrix.platform }}-paseo-${{ matrix.paseo }}
           path: test-results/
           if-no-files-found: error

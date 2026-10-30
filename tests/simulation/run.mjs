@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { startFixture } from './fixture.mjs';
 import { startModel } from './model.mjs';
 import { scenarios } from './scenarios.mjs';
+import { acquireNativeSlot } from './execution.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const plugin = resolve(here, '../..');
@@ -40,7 +41,7 @@ const report = { startedAt: new Date().toISOString(), result: 'running', platfor
 report.revision = process.env.GITHUB_SHA ?? null;
 const sha = value => createHash('sha256').update(value).digest('hex');
 const xml = value => String(value).replace(/[<>&"']/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&apos;' }[c]));
-let fixture, model, context;
+let fixture, model, context, releaseSlot;
 let stopped = false;
 const stop = async () => {
   if (stopped) return;
@@ -60,6 +61,7 @@ try {
   assert(Number(process.versions.node.split('.')[0]) >= 24, 'Use Node 24 or later');
   const expected = value('--expect-platform', process.platform);
   assert.equal(process.platform, expected, 'Native OS mismatch: run this using that OS\'s Node executable');
+  releaseSlot = await acquireNativeSlot();
   const requireTools = createRequire(join(tools, 'package.json'));
   const alias = paseoPackages.get(paseoRequested);
   let cliPackage;
@@ -102,7 +104,7 @@ try {
     'server/model.ts', 'server/store.ts', 'shared/rpc.ts', 'shared/providers.ts', 'paseo-plugin.json', 'package.json'])
     report.sourceFiles[path] = sha(await readFile(join(plugin, path)));
   report.simulationFiles = {};
-  for (const path of ['matrix.mjs', 'run.mjs', 'fixture.mjs', 'model.mjs', 'scenarios.mjs', 'package.json', 'package-lock.json'])
+  for (const path of ['matrix.mjs', 'run.mjs', 'execution.mjs', 'fixture.mjs', 'model.mjs', 'scenarios.mjs', 'package.json', 'package-lock.json'])
     report.simulationFiles[path] = sha(await readFile(join(here, path)));
   model = await startModel();
   fixture = await startFixture({ root, plugin, cliPackage, appVersion: report.appVersion,
@@ -133,6 +135,7 @@ try {
 } finally {
   report.requests = model?.requests ?? [];
   await stop().catch(error => { report.cleanupError = String(error); report.result = 'failed'; process.exitCode = 1; });
+  if (releaseSlot && !report.cleanupError) await releaseSlot().catch(error => { report.cleanupError = String(error); report.result = 'failed'; process.exitCode = 1; });
   if (report.result === 'passed') {
     try { await fixture.remove(); delete report.root; }
     catch (error) { report.cleanupError = String(error); report.result = 'failed'; process.exitCode = 1; }
