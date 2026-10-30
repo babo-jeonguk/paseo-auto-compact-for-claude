@@ -1,11 +1,12 @@
 import type { PluginHandlerContext, PluginLifecycleEvents } from "@getpaseo/plugin/server";
 import { randomUUID } from "node:crypto";
-import { Refusal, readable, SESSION_RESUME_REQUIRED, targetOf, unchanged, type Gateway, type Observation, type DispatchGuard, type ExecutionContext,
+import { Refusal, readable, targetOf, unchanged, type Gateway, type Observation, type DispatchGuard, type ExecutionContext,
   type OperationEvidence, type StoredOperation } from "./model";
 import type { createObserver } from "./observer";
 import { bounded, CLEANUP_TIMEOUT_MS, deadlineOf, LIVE_OBSERVATION_MS, observationEndBy, readWithin, SEND_DEADLINE_MS,
   SEND_TIMEOUT_MS } from "./deadline";
 import { claudeProvider } from "../shared/providers";
+import { SESSION_RESUME_REQUIRED } from "../shared/rpc";
 export { claudeProvider } from "../shared/providers";
 
 type Api = PluginHandlerContext["paseo"];
@@ -39,8 +40,8 @@ export function createGateway(options: {
   // the durable operation. Hosts without ref.reload keep the 0.12/0.13 behavior.
   const reopensStaleSessions = (agentId: string) =>
     typeof Reflect.get(requireApi().agents.ref(agentId), "reload") === "function";
-  const staleLaunch = (agentId: string, launchId: string) =>
-    !!observer && reopensStaleSessions(agentId) && !observer.startedHere(agentId, launchId);
+  const staleLaunch = (agentId: string, launchId: string, reopens = reopensStaleSessions(agentId)) =>
+    !!observer && reopens && !observer.startedHere(agentId, launchId);
   async function observation(agent: Agent, providers?: Record<string, unknown>): Promise<Observation> {
     providers ??= (await requireApi().config.get()).config.providers;
     const tokens = agent.lastUsage?.contextWindowUsedTokens;
@@ -137,7 +138,7 @@ export function createGateway(options: {
     busy.add(agentId);
     const id = execution?.id ?? randomUUID();
     let operation: Awaited<ReturnType<Observer['prepare']>> | undefined;
-    let sent = false, armed = false, healthy = true, cancelled = false, superseded = false, abandoned = false;
+    let sent = false, armed = false, healthy = true, cancelled = false, superseded = false, ownershipLost = false;
     let boundary = false;
     const evidence: OperationEvidence = {};
     const entry = { turnId: null as string | null, cancel() { cancelled = true; } };
@@ -147,7 +148,7 @@ export function createGateway(options: {
     async function checkpoint(force = false) {
       if (!execution) return;
       const value = { ...evidence, ...(entry.turnId ? { turnId: entry.turnId } : {}),
-        boundary, invalidated: !healthy || superseded || abandoned };
+        boundary, invalidated: !healthy || superseded || ownershipLost };
       const serialized = JSON.stringify(value);
       if (!force && serialized === saved && now() - lastCheckpoint < CHECKPOINT_INTERVAL_MS) return;
       await wait(execution.checkpoint(value));
@@ -197,13 +198,15 @@ export function createGateway(options: {
       if (!currentWorker() || cancelled)
         return { status: "unknown", detail: "Worker stopped at dispatch boundary; no automatic retry" };
       // The host may have reopened the session while the marker was written.
-      // This check is in memory and cannot fail, and nothing is awaited after
-      // it before the send. Nothing was sent, but the marker exists, so the
-      // outcome stays the conservative unknown; invalidating ends it at once.
-      if (operation && reopens && !observer!.startedHere(agentId, operation.launchId)) {
-        abandoned = true;
+      // With `reopens` read above this check is in memory and cannot fail, and
+      // nothing is awaited after it before the send. Nothing was sent, but the
+      // marker exists, and a marker means "may have sent" to everything that
+      // reads it later, so the outcome is the conservative unknown.
+      // Invalidating the evidence ends it at once instead of after observation.
+      if (operation && staleLaunch(agentId, operation.launchId, reopens)) {
+        ownershipLost = true;
         await checkpoint(true).catch(() => {});
-        return { status: "unknown", detail: "Observer changed at dispatch boundary; nothing sent, no automatic retry" };
+        return { status: "unknown", detail: "Observer changed at dispatch boundary; no automatic retry" };
       }
       armed = true;
       sent = true;

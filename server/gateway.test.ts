@@ -279,7 +279,7 @@ test('observer ownership is rechecked at the dispatch boundary, in memory, and e
     current: () => true,
   });
   assert.equal(result.status, 'unknown');
-  assert.match(result.detail, /observer changed.*nothing sent/i);
+  assert.match(result.detail, /observer changed.*no automatic retry/i);
   // Two observations before the marker, then the boundary check.
   assert.equal(ownershipChecks, 4);
   assert.equal(saved.at(-1)?.invalidated, true, 'invalidated, so the worker does not wait out the observation');

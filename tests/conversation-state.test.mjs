@@ -142,6 +142,9 @@ test("the row tells a failure that sent nothing, and a session awaiting resume, 
   const failed = (code) => ({ ...row, status: "failed", latestOperation: { result: { code, message: "reason" } } });
   assert.match(sessionPresentation(failed("failed_before_dispatch"), settings, 0).description, /nothing was sent/);
   assert.match(sessionPresentation(failed("failed_after_dispatch"), settings, 0).description, /Check the conversation/);
-  const held = { ...row, status: "blocked", detail: "Session must resume after plugin reload; send a message before compacting" };
-  assert.match(sessionPresentation(held, settings, 0).description, /Send a message to resume/);
+  assert.match(sessionPresentation(failed("failed_before_dispatch"), settings, 0).description, /nothing was sent\. reason\./);
+  // Whatever the earlier result, a session awaiting resume says to send a message.
+  for (const status of ["blocked", "completed", "failed", "expired"])
+    assert.match(sessionPresentation({ ...row, status, resumeRequired: true }, settings, 0).description,
+      /Send a message to resume/, status);
 });

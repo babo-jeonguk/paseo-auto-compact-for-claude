@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { bounded, INSPECT_TIMEOUT_MS, SEND_DEADLINE_MS } from "./deadline";
 import type { Settings } from "../shared/settings";
-import { operationPending, operationRowStatus, type CompactTarget, type Row } from "../shared/rpc";
-import { SESSION_RESUME_REQUIRED, targetOf, unchanged, type Gateway, type Job, type Observation, type State, type StateStore,
+import { operationPending, operationRowStatus, SESSION_RESUME_REQUIRED, type CompactTarget, type Row } from "../shared/rpc";
+import { targetOf, unchanged, type Gateway, type Job, type Observation, type State, type StateStore,
   type StoredOperation } from "./model";
 import { createOperationWorker, recoverOperations, inputFingerprint, mayHaveSent,
   publicOperation, sameActivity, syncJobs } from "./operations";
@@ -10,6 +10,7 @@ import { automaticBlock, dueAt, DELIVERY_WINDOW_MS } from "./policy";
 import { HISTORY_RETENTION_MS, HISTORY_SWEEP_INTERVAL_MS, pruneOperationHistory, type OperationReceipts } from "./retention";
 
 const jobTarget = (job: Job): CompactTarget => ({ sessionId: job.sessionId ?? null, activityKey: job.activityKey ?? null });
+const UNAVAILABLE = "This conversation is unavailable for compaction";
 const terminal = (job: Job) =>
   ["expired", "skipped", "completed", "failed", "unknown"].includes(job.status);
 
@@ -351,7 +352,7 @@ export function createScheduler(options: {
         ]);
         // First, which activity the request is about: without it nothing can be answered.
         const unidentified = !agent
-          ? "This conversation is unavailable for compaction"
+          ? UNAVAILABLE
           : agent.observerUnreadable
           ? "Claude observer status unavailable. Try again"
           : agent.revision !== revision
@@ -382,7 +383,7 @@ export function createScheduler(options: {
         const refused = !config
           ? "Compact settings could not be read"
           : !agent.eligible
-          ? "This conversation is unavailable for compaction"
+          ? UNAVAILABLE
           : agent.resumeRequired
           ? SESSION_RESUME_REQUIRED
           : !agent.idle
@@ -456,9 +457,15 @@ export function createScheduler(options: {
             changed = true;
             continue;
           }
-          if (!gateway.automatic || agent.resumeRequired) {
+          if (!gateway.automatic) {
             job.status = "blocked";
-            job.detail = agent.resumeRequired ? SESSION_RESUME_REQUIRED : "Claude observer unavailable; nothing sent";
+            job.detail = "Claude observer unavailable; nothing sent";
+            changed = true;
+            continue;
+          }
+          if (agent.resumeRequired) {
+            job.status = "blocked";
+            job.detail = SESSION_RESUME_REQUIRED;
             changed = true;
             continue;
           }

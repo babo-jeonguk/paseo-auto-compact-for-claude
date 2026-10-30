@@ -71,8 +71,13 @@ export function sessionPresentation(row: Row, settings: Settings, now: number): 
   };
   if (row.status === "unknown")
     return check("Compaction could not be confirmed. Check the conversation before trying again.");
-  if (row.status === "failed" && sentNothing(row.latestOperation?.result?.code))
-    return check("Compaction didn’t start; nothing was sent. You can try again.");
+  // Ahead of any earlier result: until the session resumes nothing is compacted there.
+  if (row.resumeRequired)
+    return check("Paseo restarted this plugin. Send a message to resume the conversation; automatic compaction is scheduled again after the reply.");
+  if (row.status === "failed" && sentNothing(row.latestOperation?.result?.code)) {
+    const reason = row.latestOperation?.result?.message;
+    return check(`Compaction didn’t start; nothing was sent. ${reason ? `${reason}.` : "You can try again."}`);
+  }
   if (row.status === "failed")
     return check("Compaction failed. Check the conversation before trying again.");
   if (row.status === "busy") {
@@ -85,8 +90,6 @@ export function sessionPresentation(row: Row, settings: Settings, now: number): 
     return on("A new schedule will be checked after the current reply finishes.");
   }
   if (row.status === "blocked") {
-    if (/resume/i.test(row.detail))
-      return check("Paseo restarted this plugin. Send a message to resume the conversation; automatic compaction is scheduled again after the reply.");
     if (/settings/i.test(row.detail))
       return check("Compact settings could not be read. Open Settings to check them.");
     if (/observer/i.test(row.detail))

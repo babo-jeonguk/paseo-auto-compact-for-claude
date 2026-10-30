@@ -220,16 +220,17 @@ export function createOperationWorker(options: {
       // The one place an error before the dispatch marker is classified. A
       // refusal ends the attempt with nothing sent. A fault keeps the durable
       // record and is retried until the send deadline, then expires unsent;
-      // only the fault that ends it is reported. Marked work is never resent.
+      // only the fault that ends it is reported. The decision is made on the
+      // stored record, never on the copy taken at claim: work whose marker was
+      // written in this pass is not ours to expire, and is never resent.
       if (!claimed || outcomes.has(claimed.id) || stopped) return onError(error);
+      const id = claimed.id;
       try {
-        if (error instanceof Refusal) return await finish(claimed.id, { status: "failed", detail: error.message });
-        faults.set(claimed.id, error);
-        if (expiredUnsent(claimed)) return await finish(claimed.id, "expired");
-        const id = claimed.id;
-        const delay = await update(state => {
+        const next = await update(state => {
           const current = state.operations.find(entry => entry.id === id);
-          if (!held(current) || current.evidence?.dispatchStartedAt !== undefined) return null;
+          if (!held(current) || current.evidence?.dispatchStartedAt !== undefined) return "not-classified" as const;
+          if (error instanceof Refusal) return "refused" as const;
+          if (expiredUnsent(current)) return "expired" as const;
           // Never wait past the send deadline: the expiry is reported on time.
           const wait = Math.min(1_000 * 2 ** Math.max(0, (current.attempt ?? 1) - 1) + Math.floor(Math.random() * 500),
             MAX_RETRY_DELAY_MS, current.sendBy! - now());
@@ -239,12 +240,14 @@ export function createOperationWorker(options: {
           current.updatedAt = now();
           return wait;
         });
+        if (next === "not-classified") return onError(error);
+        if (next === "refused") return await finish(id, { status: "failed", detail: (error as Refusal).message });
+        faults.set(id, error);
+        if (next === "expired") return await finish(id, "expired");
         // The worker wakes itself for the retry rather than waiting for a tick.
-        if (delay !== null) {
-          clearTimeout(retry);
-          retry = setTimeout(() => { void reconcile(lastConnected).catch(onError); }, delay);
-          retry.unref?.();
-        }
+        clearTimeout(retry);
+        retry = setTimeout(() => { void reconcile(lastConnected).catch(onError); }, next);
+        retry.unref?.();
       } catch (writeError) { onError(writeError); }
     }
   }

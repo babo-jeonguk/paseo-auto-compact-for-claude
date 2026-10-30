@@ -25,7 +25,6 @@ export interface Observation {
   // ordinary message has done that, nothing is compacted there.
   resumeRequired?: boolean;
 }
-export const SESSION_RESUME_REQUIRED = "Session must resume after plugin reload; send a message before compacting";
 // Schemas are the one definition of stored records; the store validates with
 // them and the types below are inferred from them.
 export const JobSchema = z.object({

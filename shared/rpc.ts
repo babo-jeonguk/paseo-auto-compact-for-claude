@@ -57,6 +57,9 @@ export function operationRowStatus(operation: Pick<CompactOperation, "state">) {
 export const finishedState = (status: "completed" | "failed" | "unknown" | "expired") =>
   status === "completed" ? "succeeded" as const : status;
 
+// Why nothing is compacted in a session the host must reopen first (Paseo 0.14).
+export const SESSION_RESUME_REQUIRED = "Session must resume after plugin reload; send a message before compacting";
+
 export const RowSchema = z.object({
   agentId: z.string(),
   title: z.string().nullable(),
@@ -78,6 +81,8 @@ export const RowSchema = z.object({
   // its eventual polled outcome without keeping the initiating RPC open.
   operationId: z.string().nullable().default(null),
   busyReason: z.enum(['reply', 'permission', 'input']).nullable().optional(),
+  // Nothing is compacted until an ordinary message resumes the session (see Observation).
+  resumeRequired: z.boolean().optional(),
   inputIdleSince: z.number().nullable().optional(),
   cache: z.object({ ttlMinutes: z.number(), source: z.enum(['transcript', 'settings', 'environment', 'default']),
     deadline: z.number(), observedAt: z.number().optional(), mixed: z.boolean().optional() }).nullable().optional(),

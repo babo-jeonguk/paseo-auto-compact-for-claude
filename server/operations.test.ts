@@ -11,7 +11,7 @@ function fixture() {
     kind: "manual", state: "requested", createdAt: time, updatedAt: time, result: null,
     inputFingerprint: "fingerprint", sendBy: time + 180_000, attempt: 0,
   }] };
-  let sends = 0, writesFail = false;
+  let sends = 0, writesFail = false, readsFail = 0;
   const errors: unknown[] = [];
   const agent: Observation = { agentId: "a", revision: "rev", sessionId: "native", activityKey: "activity",
     title: null, workspace: "/work", provider: "claude", tokens: 100, eligible: true, idle: true };
@@ -38,13 +38,15 @@ function fixture() {
     return result;
   };
   const make = (settings = async (): Promise<Settings | null> => ({ ...DEFAULT_SETTINGS })) => createOperationWorker({ gateway,
-    store: { read: async () => structuredClone(state), write: async next => { state = next; } },
+    store: { read: async () => { if (readsFail > 0) { readsFail--; throw new Error("EBUSY"); } return structuredClone(state); },
+      write: async next => { state = next; } },
     update, settings, now: () => time, onError: error => errors.push(error) });
   return { make, gateway, agent, errors,
     get operation() { return state.operations[0]; },
     get sends() { return sends; },
     set evidence(value: CompactOutcome | null) { evidence = value; },
     set failTerminal(value: boolean) { writesFail = value; },
+    set failReads(count: number) { readsFail = count; },
     advance(ms: number) { time += ms; },
     recover() { recoverOperations(state, time); },
   };
@@ -301,4 +303,19 @@ test("a finished operation retires its native request, so it cannot claim a late
   await f.make().reconcile();
   assert.equal(f.operation.state, "unknown");
   assert.deepEqual(released, ["operation-a:unknown"]);
+});
+
+test("a fault after the dispatch marker never expires the work as unsent, even past the send deadline", async () => {
+  const f = fixture();
+  f.gateway.compact = async (_id, _expected, execution) => {
+    f.advance(100_000);
+    await execution!.checkpoint({ dispatchStartedAt: 101_000 });
+    f.advance(90_000); // past the send deadline (181 s), inside the observation (281 s)
+    f.failReads = 1; // the worker's own read after the outcome fails
+    return { status: "unknown", detail: "send unconfirmed" };
+  };
+  await f.make().reconcile();
+  assert.equal(f.operation.state, "observing", "marked work is observed, not expired");
+  assert.equal(f.operation.result, null);
+  assert.deepEqual(f.errors.map(String), ["Error: EBUSY"]);
 });
