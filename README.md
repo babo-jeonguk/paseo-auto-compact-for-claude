@@ -16,7 +16,7 @@ Codex subscription sessions do not need this plugin: [caches are retained indefi
 
 - **Paseo 0.12 or later**.
 - A Claude provider using a native Claude Code CLI that supports Mods. Claude profiles are supported too.
-- Paseo web app. Native mobile apps are unverified.
+- The Paseo web, desktop or Android app. The iOS app is unverified.
 
 Supported Claude versions and setup help: [troubleshooting](docs/runtime.md).
 
@@ -51,7 +51,7 @@ Open the pill for the current reason and any action needed. Brief refreshes and 
 - **Automation switch:** enable or disable automatic compaction for this conversation.
 - **Skip this time:** cancel the current reservation without changing automation settings. The button stays visible and is disabled when there is no eligible schedule.
 - **Undo skip:** restore the original scheduled time while the reservation is still valid. New activity or an expired deadline prevents undo.
-- **Compact now:** compact after confirmation, regardless of automation switches, the automatic token threshold or whether context usage is available. The control acknowledges the persisted operation immediately, shows **Compacting…**, and reports the matching final result as it arrives. Keep the conversation idle and stop background work first.
+- **Compact now:** compact after confirmation, regardless of automation switches, the automatic token threshold or whether context usage is available. The control acknowledges the persisted operation immediately, shows **Compacting…**, and reports the matching final result as it arrives, even after the controls are closed or the plugin restarts. A request is never sent twice. If nothing could be sent, the result says why, and you can try again once that is resolved. Keep the conversation idle and stop background work first.
 
 Near a scheduled time, skip or turn automation off and wait for confirmation before sending new work. During **Compacting…**, wait for completion.
 
@@ -68,6 +68,8 @@ paseo plugin update auto-compact-for-claude
 ```
 
 Review the proposed commit before confirming. Direct GitHub updates follow the repository's default branch. Reopen Claude sessions after an update so they use the new version.
+
+On Paseo 0.14, Paseo reopens a session itself before its next message. Until then, the plugin does not compact that conversation: send a message and wait for the reply first. A countdown from before the update does not run; that reply schedules a new one.
 
 ## Remove
 
