@@ -90,6 +90,8 @@ node --no-maglev tests/simulation/lifecycle.mjs cleanup
 
 `reload` verifies that Compact now sends nothing after a plugin reload until an ordinary message reopens the observer, and then succeeds once. `automatic` applies the same assertion to a real one-minute reservation and normal scheduler tick. `cleanup` runs Paseo 0.14's installed idle collector with only its clock and sweep interval accelerated, then verifies closure, reservation invalidation and ordinary-message resume. It does not establish the real one-hour wait, successful compaction before cleanup, input/background-work vetoes, or a cleanup/dispatch race. These diagnostics use native Claude and the loopback model, need localhost binding, and are not part of the cross-platform CI matrix.
 
+See the pinned [upstream change review](research/paseo-0.14.0-upstream-changes-2026-10-29.md), [project impact and patch rationale](research/paseo-0.14.0-project-impact-2026-10-29.md), and [lifecycle reproduction evidence](research/paseo-0.14.0-lifecycle-reproduction-2026-10-29.md).
+
 ## Reports and failure handling
 
 Results are written under `test-results/<platform>-<arch>/paseo-<version>/`:
@@ -162,4 +164,4 @@ Sonnet 5.5 subagents ran every suite.
 
 ## Paseo 0.14 validation checkpoint — 2026-10-29
 
-The SDK 0.12.0, 0.13.0 and 0.14.0 lanes each passed `npm run check` with 136 tests. The Linux native matrix passed 18/18 scenarios on each of the three versions with Claude Code 2.1.306. GPT-6.1 Terra (High) reproduced the 0.14 reload evidence split before the fix, then passed the focused manual reload, automatic due-dispatch and accelerated idle-cleanup scenarios after the fix. The reload guards sent no `/compact` until an ordinary message installed the new observer; cleanup invalidated the old reservation and resumed with a fresh one. Windows and macOS native 0.14 execution remain delegated to CI and were not established by this local checkpoint.
+The initial SDK 0.12.0, 0.13.0 and 0.14.0 lanes each passed `npm run check` with 136 tests. After rebasing onto the latest stacked base and addressing fresh-context review, the current PR head passed 146 tests on all three SDKs across Linux, macOS and Windows CI. The Linux native matrix passed 18/18 scenarios on each version locally, and current-head CI passed the same matrix on Linux and Windows with Claude Code 2.1.306. GPT-6.1 Terra (High) reproduced the 0.14 reload evidence split before the fix, then passed the focused manual reload, automatic due-dispatch and accelerated idle-cleanup scenarios after the fix. The reload guards sent no `/compact` until an ordinary message installed the new observer; cleanup invalidated the old reservation and resumed with a fresh one. macOS native execution remains unverified.

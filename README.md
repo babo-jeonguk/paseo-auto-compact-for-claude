@@ -79,4 +79,4 @@ paseo plugin remove auto-compact-for-claude
 
 Reopen remaining sessions when convenient to finish removing the plugin.
 
-[Setup and troubleshooting](docs/runtime.md) · [Third-party notices](THIRD_PARTY_NOTICES.md)
+[Setup and troubleshooting](docs/runtime.md) · [Paseo 0.14 compatibility research](docs/research/paseo-0.14.0-project-impact-2026-10-29.md) · [Third-party notices](THIRD_PARTY_NOTICES.md)
