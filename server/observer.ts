@@ -190,7 +190,7 @@ export function createObserver(options: { home?: string; now?: () => number } = 
     },
     async ownsCurrentLaunch(agentId: string) {
       const current = await read(agentId);
-      return !!current && currentLaunches.get(agentId) === current.ledger.launchId;
+      return current ? currentLaunches.get(agentId) === current.ledger.launchId : null;
     },
     async readiness(agent: Observation, dueAt?: number) {
       // A status display; an unreadable observer is reported, never thrown.

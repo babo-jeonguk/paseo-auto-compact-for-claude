@@ -8,7 +8,7 @@
 
 ## 대응 결과
 
-- 0.12/0.13/0.14 SDK 및 native matrix를 추가했다. 최초 대응 checkout에서 세 SDK lane은 각각 136개 검사를 통과했다. 최신 stacked base로 rebase한 PR head는 세 버전·Linux/macOS/Windows SDK lane에서 각각 146개 검사를 통과했고, Linux·Windows native는 버전별 18/18 시나리오를 통과했다.
+- 0.12/0.13/0.14 SDK 및 native matrix를 추가했다. 최초 대응 checkout에서 세 SDK lane은 각각 136개 검사를 통과했다. 호환성 checkpoint `abdbb2f`는 세 버전·Linux/macOS/Windows SDK lane에서 각각 146개 검사를 통과했고, workflow runs `40934131828`·`40934141757`의 Linux·Windows native는 버전별 18/18 시나리오를 통과했다. 후속 커밋은 각자의 PR check를 근거로 삼는다.
 - reload 직후 Compact now에서 실제 결함을 재현했다. `/compact`는 새 observer launch에서 성공했지만 요청 ID는 이전 launch에 준비되어 operation이 `observing`에 남았다.
 - Paseo 0.14처럼 stale plugin session을 reopen하는 host에서는 현재 plugin instance가 observer launch를 소유하는지 확인한다. 소유하지 않으면 manual은 전송 전 실패하고 automatic은 blocked가 되며, 일반 메시지로 reopen한 뒤 정상 실행한다. 0.12/0.13 동작은 유지한다.
 - 실제 0.14 idle collector를 clock만 가속해 검사했다. 기존 close/invalidate 경로가 예약을 skip하고, 다음 일반 메시지가 같은 native session을 새 launch로 resume해 새 예약을 만든다. 이 경로에는 제품 수정이 필요하지 않았다.
@@ -61,4 +61,4 @@
 
 ## 검증 경계
 
-공식 릴리스 커밋 소스와 로컬 제품 소스를 대조하고, 격리된 home·daemon·합성 loopback model로 native Claude를 실행했다. lifecycle 재현과 패치 후 확인은 사용자가 지정한 GPT-6.1 Terra (High)가 수행했다. manual reload, 실제 1분 automatic due-dispatch, collector clock을 가속한 cleanup이 통과했다. PR CI에서도 세 Paseo 버전의 Linux·Windows native matrix가 통과했다. cleanup의 실제 1시간 대기, 렌더링된 UI pill, macOS native 0.14, 실제 Anthropic 응답·비용·요약 품질은 확정하지 않는다. 운영 Paseo와 사용자 설정은 변경하지 않았다.
+공식 릴리스 커밋 소스와 로컬 제품 소스를 대조하고, 격리된 home·daemon·합성 loopback model로 native Claude를 실행했다. lifecycle 재현과 패치 후 확인은 사용자가 지정한 GPT-6.1 Terra (High)가 수행했다. manual reload, 실제 1분 automatic due-dispatch, collector clock을 가속한 cleanup이 통과했다. checkpoint `abdbb2f`의 CI에서도 세 Paseo 버전의 Linux·Windows native matrix가 통과했다. cleanup의 실제 1시간 대기, 렌더링된 UI pill, macOS native 0.14, 실제 Anthropic 응답·비용·요약 품질은 확정하지 않는다. 운영 Paseo와 사용자 설정은 변경하지 않았다.

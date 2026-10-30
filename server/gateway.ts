@@ -36,8 +36,10 @@ export function createGateway(options: {
   };
   const reopensStalePluginSession = (ref: object) =>
     typeof Reflect.get(ref, "reload") === "function";
-  const requiresSessionResume = async (agentId: string, ref: object) =>
-    !!observer && reopensStalePluginSession(ref) && !await observer.ownsCurrentLaunch(agentId);
+  const requiresSessionResume = async (agentId: string, ref: object) => {
+    if (!observer || !reopensStalePluginSession(ref)) return false;
+    return await observer.ownsCurrentLaunch(agentId) === false;
+  };
   async function observation(agent: Agent, providers?: Record<string, unknown>): Promise<Observation> {
     providers ??= (await requireApi().config.get()).config.providers;
     const tokens = agent.lastUsage?.contextWindowUsedTokens;
@@ -201,6 +203,11 @@ export function createGateway(options: {
       deadline = now() + live;
       if (!currentWorker() || cancelled)
         return { status: "unknown", detail: "Worker stopped at dispatch boundary; no automatic retry" };
+      // No awaited work remains after this ownership read and before send. The
+      // durable marker makes a failure here conservative: nothing was sent, but
+      // recovery must not assume it is safe to retry after a possible crash.
+      if (await read(requiresSessionResume(agentId, ref)))
+        return { status: "unknown", detail: "Observer changed at dispatch boundary; no automatic retry" };
       armed = true;
       sent = true;
       const send = ref.send("/compact", { messageId: id });

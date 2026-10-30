@@ -262,13 +262,33 @@ test('observer ownership is rechecked at the dispatch boundary', async () => {
     ownsCurrentLaunch(agentId: string): Promise<boolean>;
   };
   let ownershipChecks = 0;
-  native.ownsCurrentLaunch = async () => ++ownershipChecks === 1;
+  let markerPersisted = false;
+  native.ownsCurrentLaunch = async () => { ownershipChecks++; return !markerPersisted; };
+  const host = fixture([], undefined, false, [], { observer: native });
+  Object.assign(host.ref, { reload: async () => null });
+  const result = await host.gateway.compact('a', (await host.gateway.refresh('a'))!, {
+    id: 'ownership-race', deadlineAt: Date.now() + 30_000,
+    checkpoint: async evidence => { markerPersisted ||= evidence.dispatchStartedAt !== undefined; },
+    current: () => true,
+  });
+  assert.equal(result.status, 'unknown');
+  assert.match(result.detail, /observer changed.*no automatic retry/i);
+  assert.equal(ownershipChecks, 3);
+  assert.equal(host.sendCount(), 0);
+});
+
+test('an absent observer is not misreported as a session awaiting reload', async () => {
+  const native = observer(null) as ReturnType<typeof observer> & {
+    ownsCurrentLaunch(agentId: string): Promise<boolean | null>;
+  };
+  native.ownsCurrentLaunch = async () => null;
+  native.prepare = async () => { throw new Refusal('Claude observer unavailable'); };
   const host = fixture([], undefined, false, [], { observer: native });
   Object.assign(host.ref, { reload: async () => null });
   const result = await host.gateway.compact('a', (await host.gateway.refresh('a'))!);
   assert.equal(result.status, 'failed');
-  assert.match(result.detail, /resume.*message/i);
-  assert.equal(ownershipChecks, 2);
+  assert.match(result.detail, /observer unavailable/i);
+  assert.doesNotMatch(result.detail, /resume.*message/i);
   assert.equal(host.sendCount(), 0);
 });
 
