@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { bounded, OBSERVATION_MS } from "./deadline";
+import { Refusal, type OperationEvidence, type StoredOperation } from "./model";
 import { createGateway } from "./gateway";
 import type {
   PluginHandlerContext,
@@ -39,6 +41,7 @@ function fixture(
   let liveListener: ((message: unknown) => void) | undefined;
   const ref = {
     timeline: {
+      refetch: async () => ({ entries: [] as Array<{ turnId: string | null; item: unknown }> }),
       subscribe: (listener: (message: unknown) => void) => {
         liveListener = listener;
         return Object.assign(() => {}, {
@@ -80,7 +83,7 @@ function fixture(
     config: { get: async () => ({ config: { providers: {} } }) },
     agents: { ref: () => ref },
   } as unknown as PluginHandlerContext["paseo"]);
-  return Object.assign(host, { sendCount: () => sends });
+  return Object.assign(host, { ref, sendCount: () => sends });
 }
 
 test("gateway requires completed manual boundary from command turn and same persistence session", async () => {
@@ -140,9 +143,11 @@ function observer(result: { status: 'completed' | 'unknown'; detail: string } | 
       ordinaryRevision: 1, cacheDeadline: Date.now() + 300000, compact: null, closed: false,
     } }),
     prepareSession: async (request: never) => request,
-    prepare: async () => operation,
+    prepare: async (_agent: unknown, _cache: boolean, _expires: number, id: string) => ({ ...operation, id }),
     readiness: async () => null,
+    startedHere: (_agentId: string, _launchId: string) => true,
     result: async () => result,
+    receipt: async () => result,
     cancel: async () => {},
   } as unknown as NonNullable<Parameters<typeof createGateway>[0]>['observer'];
 }
@@ -172,7 +177,127 @@ test('last-moment off policy and expired delivery prevent public send', async ()
     { expiresAt: 0, allowed: async () => true },
   ]) {
     const host = fixture([], undefined, false, [], { observer: observer(null) });
-    assert.equal((await host.gateway.automatic!((await host.gateway.refresh('a'))!, guard)).status, 'failed');
+    // Policy off is a reading; running out of time is not.
+    await assert.rejects(host.gateway.automatic!((await host.gateway.refresh('a'))!, guard),
+      guard.expiresAt ? Refusal : /Send deadline passed/);
+    assert.equal(host.sendCount(), 0);
+  }
+});
+
+test('before sending, a refusal and any other error are both thrown for the worker to classify', async () => {
+  for (const error of [new Refusal('Claude is still working'), new Error('EIO')]) {
+    const native = observer(null)!;
+    native.prepare = async () => { throw error; };
+    const host = fixture([], undefined, false, [], { observer: native });
+    const agent = (await host.gateway.refresh('a'))!;
+    await assert.rejects(host.gateway.compact('a', agent), error);
+    assert.equal(host.sendCount(), 0);
+  }
+});
+
+test('a second call for a conversation already compacting is a refusal', async () => {
+  const host = fixture([{ type: "compaction", status: "completed", trigger: "manual" }]);
+  const first = host.gateway.compact('a');
+  await assert.rejects(host.gateway.compact('a'), (error: unknown) =>
+    error instanceof Refusal && /already running/.test(error.message));
+  assert.equal((await first).status, 'completed');
+  assert.equal(host.sendCount(), 1);
+});
+
+test('Claude admits the compaction for as long as it can be observed, not only until sending must start', async () => {
+  const native = observer(null)!;
+  const prepare = native.prepare;
+  let admitted = 0;
+  native.prepare = async (agent, cache, expiresAt, id) => { admitted = expiresAt; return prepare(agent, cache, expiresAt, id); };
+  const host = fixture([], undefined, false, [], { observer: native });
+  const sendBy = Date.now() + 1_000;
+  await host.gateway.automatic!((await host.gateway.refresh('a'))!, { expiresAt: Date.now() + 500, allowed: async () => true },
+    { id: 'late-admission', sendBy, checkpoint: async () => {}, current: () => true });
+  assert.equal(admitted, sendBy + OBSERVATION_MS);
+  assert.equal(host.sendCount(), 1);
+});
+
+test('a send that starts just before its deadline is still observed in full', async () => {
+  // A live budget longer than the send deadline, as in production (120 s vs. what is left).
+  const host = fixture([{ type: "compaction", status: "completed", trigger: "manual" }],
+    undefined, false, undefined, { timeoutMs: 1_000 });
+  const send = host.ref.send;
+  // The boundary arrives after the send deadline has passed.
+  host.ref.send = async (text, options) => { await new Promise(resolve => setTimeout(resolve, 80)); return send(text, options); };
+  const result = await host.gateway.compact("a", undefined, {
+    id: "late-request", sendBy: Date.now() + 40, checkpoint: async () => {}, current: () => true,
+  });
+  assert.equal(result.status, "completed");
+  assert.equal(host.sendCount(), 1);
+});
+
+test('an unreadable observer is reported on the observation and is a fault before sending', async () => {
+  const native = observer(null)!;
+  native.read = async () => { throw new Error('Claude observer could not be read'); };
+  const host = fixture([], undefined, false, [], { observer: native });
+  const agent = (await host.gateway.refresh('a'))!;
+  assert.equal(agent.observerUnreadable, true);
+  await assert.rejects(host.gateway.compact('a', agent), /could not be read/);
+  assert.equal(host.sendCount(), 0);
+});
+
+test('a host that reopens stale plugin sessions never sends against an observer from the prior plugin instance', async () => {
+  const native = observer(null)!;
+  native.startedHere = () => false;
+  const host = fixture([], undefined, false, [], { observer: native });
+  Object.assign(host.ref, { reload: async () => null });
+  assert.equal((await host.gateway.refresh('a'))!.resumeRequired, true);
+  await assert.rejects(host.gateway.compact('a', (await host.gateway.refresh('a'))!),
+    (error: unknown) => error instanceof Refusal && /resume.*message/i.test(error.message));
+  assert.equal(host.sendCount(), 0);
+  await assert.rejects(host.gateway.automatic!((await host.gateway.refresh('a'))!),
+    (error: unknown) => error instanceof Refusal && /resume.*message/i.test(error.message));
+  assert.equal(host.sendCount(), 0);
+});
+
+test('a host without session reopening never requires a resume', async () => {
+  const native = observer({ status: 'completed', detail: 'Native PostCompact' })!;
+  native.startedHere = () => false;
+  const host = fixture([{ type: "compaction", status: "completed", trigger: "manual" }], undefined, false, undefined,
+    { observer: native });
+  const agent = (await host.gateway.refresh('a'))!;
+  assert.equal(agent.resumeRequired, undefined);
+  assert.equal((await host.gateway.automatic!(agent)).status, 'completed');
+});
+
+test('observer ownership is rechecked at the dispatch boundary, in memory, and ends the attempt at once', async () => {
+  const native = observer(null)!;
+  let ownershipChecks = 0;
+  let markerPersisted = false;
+  native.startedHere = () => { ownershipChecks++; return !markerPersisted; };
+  const host = fixture([], undefined, false, [], { observer: native });
+  Object.assign(host.ref, { reload: async () => null });
+  const saved: OperationEvidence[] = [];
+  const result = await host.gateway.compact('a', (await host.gateway.refresh('a'))!, {
+    id: 'ownership-race', sendBy: Date.now() + 30_000,
+    checkpoint: async evidence => { saved.push(evidence); markerPersisted ||= evidence.dispatchStartedAt !== undefined; },
+    current: () => true,
+  });
+  assert.equal(result.status, 'unknown');
+  assert.match(result.detail, /observer changed.*no automatic retry/i);
+  // Two observations before the marker, then the boundary check.
+  assert.equal(ownershipChecks, 4);
+  assert.equal(saved.at(-1)?.invalidated, true, 'invalidated, so the worker does not wait out the observation');
+  assert.equal(host.sendCount(), 0);
+});
+
+test('an absent or unreadable observer is not misreported as a session awaiting reload, and reading it never throws', async () => {
+  for (const read of [async () => null, async () => { throw new Error('Claude observer could not be read'); }]) {
+    const native = observer(null)!;
+    native.read = read;
+    native.startedHere = () => false;
+    native.prepare = async () => { throw new Refusal('Claude observer unavailable'); };
+    const host = fixture([], undefined, false, [], { observer: native });
+    Object.assign(host.ref, { reload: async () => null });
+    const agent = (await host.gateway.refresh('a'))!;
+    assert.equal(agent.resumeRequired, undefined);
+    await assert.rejects(host.gateway.compact('a', agent),
+      (error: unknown) => !/resume.*message/i.test(String(error)));
     assert.equal(host.sendCount(), 0);
   }
 });
@@ -192,7 +317,7 @@ test('idle pending input is distinguished from an active reply without allowing 
   assert.equal(stuck.idle, false);
   assert.equal(stuck.busyReason, 'input');
   assert.equal(stuck.inputIdleSince, 1000);
-  assert.equal((await host.gateway.automatic!(stuck)).status, 'failed');
+  await assert.rejects(host.gateway.automatic!(stuck), Refusal);
   assert.equal(host.sendCount(), 0);
   activeTurns = ['ordinary-reply'];
   assert.equal((await host.gateway.refresh('a'))!.inputIdleSince, null);
@@ -200,5 +325,121 @@ test('idle pending input is distinguished from an active reply without allowing 
   pendingInputs = 0;
   assert.equal((await host.gateway.refresh('a'))!.idle, true);
   assert.equal((await host.gateway.refresh('a'))!.inputIdleSince, null);
+  host.stop();
+});
+
+
+test("every external gateway wait is bounded, including send and release", async () => {
+  for (const stalled of ["send", "subscribe", "refresh", "release"] as const) {
+    const host = fixture([{ type: "compaction", status: "completed", trigger: "manual" }],
+      undefined, false, undefined, { timeoutMs: 50, dispatchTimeoutMs: 5, cleanupTimeoutMs: 5 });
+    const never = () => new Promise<never>(() => {});
+    if (stalled === "send") host.ref.send = never;
+    if (stalled === "refresh") host.ref.refresh = never;
+    if (stalled === "subscribe" || stalled === "release") {
+      const subscribe = host.ref.timeline.subscribe;
+      host.ref.timeline.subscribe = listener => {
+        const result = subscribe(listener);
+        if (stalled === "subscribe") result.ready = never();
+        else result.release = never;
+        return result;
+      };
+    }
+    // A wait that expires before sending is a fault for the worker to retry.
+    if (stalled === "subscribe" || stalled === "refresh") {
+      await assert.rejects(bounded(host.gateway.compact("a", undefined, { id: "stalled", sendBy: Date.now() + 50,
+        checkpoint: async () => {}, current: () => true }), 2_000), /deadline/i, stalled);
+      assert.equal(host.sendCount(), 0, stalled);
+      continue;
+    }
+    const result = await bounded(host.gateway.compact("a"), 2_000);
+    assert.equal(result.status, stalled === "release" ? "completed" : "unknown", stalled);
+    assert.equal(host.ownTurn("a", "compact-1"), false);
+    host.stop();
+  }
+});
+
+test("stable identity and durable send marker precede provider dispatch", async () => {
+  const host = fixture([{ type: "compaction", status: "completed", trigger: "manual" }]);
+  const checkpoints: OperationEvidence[] = [];
+  const send = host.ref.send;
+  host.ref.send = async (text, options) => {
+    assert.equal(options.messageId, "caller-request");
+    assert(checkpoints.at(-1)?.dispatchStartedAt);
+    return send(text, options);
+  };
+  const result = await host.gateway.compact("a", undefined, {
+    id: "caller-request", sendBy: Date.now() + 1000,
+    checkpoint: async evidence => { checkpoints.push(evidence); }, current: () => true,
+  });
+  assert.equal(result.status, "completed");
+  assert.equal(checkpoints.at(-1)?.boundary, true);
+  assert.equal(checkpoints.at(-1)?.turnId, "compact-1");
+});
+
+test("failed marker persistence never sends and late send rejection is consumed", async () => {
+  const host = fixture([]);
+  // A fault before sending is the worker's to retry, so it is thrown, not an outcome.
+  await assert.rejects(host.gateway.compact("a", undefined, {
+    id: "caller-request", sendBy: Date.now() + 1000,
+    checkpoint: async () => { throw new Error("disk full"); }, current: () => true,
+  }), /disk full/);
+  assert.equal(host.sendCount(), 0);
+  let reject!: (error: Error) => void;
+  host.ref.send = async () => new Promise<never>((_resolve, fail) => { reject = fail; });
+  assert.equal((await host.gateway.compact("a")).status, "unknown");
+  reject(new Error("late rejection"));
+  await new Promise<void>(resolve => setImmediate(resolve));
+});
+
+test("recovery requires both the native receipt and the exact message's command boundary", async () => {
+  const native = observer({ status: "completed", detail: "receipt" })!;
+  const host = fixture([], undefined, false, [], { observer: native });
+  const operation: StoredOperation = {
+    id: "caller-request", agentId: "a", revision: "rev", target: { sessionId: "native-a", activityKey: null },
+    kind: "manual", state: "observing", createdAt: 1, updatedAt: 1, result: null, inputFingerprint: null,
+    evidence: { dispatchStartedAt: 1, native: { id: "caller-request", launchId: "launch", generation: "gen",
+      sessionId: "native-a", revision: 1 } },
+  };
+  assert.equal(await host.gateway.inspect!(operation), null, "native completion alone is insufficient");
+  host.ref.timeline.refetch = async () => ({ entries: [
+    { turnId: "our-turn", item: { type: "user_message", clientMessageId: operation.id } },
+    { turnId: "foreign-turn", item: { type: "compaction", status: "completed", trigger: "manual" } },
+  ] });
+  assert.equal(await host.gateway.inspect!(operation), null);
+  host.ref.timeline.refetch = async () => ({ entries: [
+    { turnId: "our-turn", item: { type: "user_message", clientMessageId: operation.id } },
+    { turnId: "our-turn", item: { type: "compaction", status: "completed", trigger: "manual" } },
+  ] });
+  assert.equal((await host.gateway.inspect!(operation))?.status, "completed");
+  operation.evidence!.invalidated = true;
+  assert.equal((await host.gateway.inspect!(operation))?.status, "unknown");
+  operation.evidence!.invalidated = false;
+  // Observation runs a fixed time from the marker; a receipt after that never counts.
+  native.receipt = async () => ({ status: "completed", detail: "late receipt", observedAt: 1 + OBSERVATION_MS + 1 });
+  assert.equal(await host.gateway.inspect!(operation), null, "late completion cannot extend the observation deadline");
+});
+
+test('native activity identity survives compaction without restoring its scheduling window', async () => {
+  const native = observer(null)!;
+  const initial = (await native.read('a'))!;
+  let ledger = initial.ledger;
+  native.read = async () => ({ ...initial, ledger });
+  const host = fixture([], undefined, false, [], { observer: native });
+  const before = await host.gateway.refresh('a');
+  assert(before?.activityKey);
+  for (const status of ['running', 'completed', 'failed', 'unknown'] as const) {
+    ledger = { ...ledger, ordinaryRevision: null, ordinaryEndedAt: null, cacheDeadline: null,
+      compact: { id: 'operation', revision: 1, status } };
+    const after = await host.gateway.refresh('a');
+    assert.equal(after?.activityKey, before.activityKey);
+    assert.equal(after?.observedEndedAt, null, 'compaction cannot create an ordinary reservation');
+  }
+  ledger = { ...ledger, revision: 2 };
+  assert.equal((await host.gateway.refresh('a'))?.activityKey, null, 'old compact evidence cannot name new input');
+  ledger = { ...ledger, ordinaryRevision: 2, ordinaryEndedAt: 2000 };
+  assert.notEqual((await host.gateway.refresh('a'))?.activityKey, before.activityKey);
+  ledger = { ...ledger, sessionId: 'another-session' };
+  assert.equal((await host.gateway.refresh('a'))?.activityKey, null);
   host.stop();
 });

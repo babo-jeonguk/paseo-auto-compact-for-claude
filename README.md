@@ -51,7 +51,7 @@ Open the pill for the current reason and any action needed. Brief refreshes and 
 - **Automation switch:** enable or disable automatic compaction for this conversation.
 - **Skip this time:** cancel the current reservation without changing automation settings. The button stays visible and is disabled when there is no eligible schedule.
 - **Undo skip:** restore the original scheduled time while the reservation is still valid. New activity or an expired deadline prevents undo.
-- **Compact now:** compact after confirmation, regardless of automation switches, the automatic token threshold or whether context usage is available. Keep the conversation idle and stop background work first.
+- **Compact now:** compact after confirmation, regardless of automation switches, the automatic token threshold or whether context usage is available. The control acknowledges the persisted operation immediately, shows **Compacting…**, and reports the matching final result as it arrives. Keep the conversation idle and stop background work first.
 
 Near a scheduled time, skip or turn automation off and wait for confirmation before sending new work. During **Compacting…**, wait for completion.
 
@@ -79,4 +79,4 @@ paseo plugin remove auto-compact-for-claude
 
 Reopen remaining sessions when convenient to finish removing the plugin.
 
-[Setup and troubleshooting](docs/runtime.md) · [Third-party notices](THIRD_PARTY_NOTICES.md)
+[Setup and troubleshooting](docs/runtime.md) · [Paseo 0.14 compatibility research](docs/research/paseo-0.14.0-project-impact-2026-10-29.md) · [Third-party notices](THIRD_PARTY_NOTICES.md)

@@ -5,6 +5,8 @@
   "dependencies": {
     "@anthropic-ai/claude-code": "2.1.306",
     "@getpaseo/cli-0-12": "npm:@getpaseo/cli@0.12.0",
-    "@getpaseo/cli-0-13": "npm:@getpaseo/cli@0.13.0"
+    "@getpaseo/cli-0-13": "npm:@getpaseo/cli@0.13.0",
+    "@getpaseo/cli-0-14": "npm:@getpaseo/cli@0.14.0",
+    "playwright-core": "1.58.2"
   }
 }

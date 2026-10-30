@@ -3,6 +3,7 @@
 let state;
 let configuration;
 let writes = Promise.resolve();
+let lastReceiptValue = null;
 // A cancelled request blocks one late plugin /compact. Claude cannot tell that
 // command from the user's own, so later ones run as unrequested compaction.
 let consumedCancelId = null;
@@ -15,7 +16,24 @@ async function save($) {
   }
   state.updatedAt = now;
   const snapshot = JSON.stringify(state);
-  writes = writes.catch(() => {}).then(() => $.fs.write(configuration.ledger, snapshot));
+  const compact = state.compact;
+  if (compact?.id && compact.status !== 'running') compact.observedAt ??= now;
+  const receipt = configuration.receipts && compact?.id && compact.status !== 'running'
+    ? { path: configuration.receipts + '/' + encodeURIComponent(compact.id) + '.json',
+        value: JSON.stringify({ id: compact.id, launchId: state.launchId, generation: state.generation,
+          sessionId: state.sessionId, revision: compact.revision, status: compact.status,
+          reason: compact.reason ?? null, observedAt: compact.observedAt }) } : null;
+  writes = writes.catch(() => {}).then(async () => {
+    // A receipt survives later activity and launch pruning. Partial reads are
+    // treated as unavailable and retried by the server, never as completion.
+    if (receipt && receipt.value !== lastReceiptValue) {
+      await $.fs.write(receipt.path, receipt.value);
+      // Heartbeats must not recreate a receipt after retention removes it.
+      // Remember only a successful write so transient failures remain retryable.
+      lastReceiptValue = receipt.value;
+    }
+    await $.fs.write(configuration.ledger, snapshot);
+  });
   await writes;
 }
 
@@ -84,6 +102,7 @@ async function confirm($, operation) {
 export function registerObserver(on, config) {
   configuration = config;
   writes = Promise.resolve();
+  lastReceiptValue = null;
   consumedCancelId = null;
   state = {
     version: 1, launchId: configuration.launchId, generation: crypto.randomUUID(),

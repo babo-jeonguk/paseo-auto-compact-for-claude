@@ -10,7 +10,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const git = async (...args) => (await promisify(execFile)('git', ['-C', root, ...args], { windowsHide: true })).stdout.trim();
 const options = new Map([['--suite', 'check'], ['--ref', 'HEAD'], ['--paseo', 'all']]);
 if (process.argv.includes('--help')) {
-  console.log('npm run test:snapshot -- [--suite check|simulation|release] [--ref HEAD|<commit>] [--paseo all|0.12.0|0.13.0]');
+  console.log('npm run test:snapshot -- [--suite check|simulation|release] [--ref HEAD|<commit>] [--paseo all|0.12.0|0.13.0|0.14.0]');
   process.exit(0);
 }
 for (let i = 2; i < process.argv.length; i += 2) {

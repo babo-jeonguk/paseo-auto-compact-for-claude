@@ -5,13 +5,14 @@ import {
   SettingsSchema,
   type Settings,
 } from "../shared/settings";
-import { createScheduler, DELIVERY_WINDOW_MS } from "./scheduler";
+import { createScheduler } from "./scheduler";
+import { DELIVERY_WINDOW_MS } from "./policy";
 import type { Gateway, Observation, State, StateStore } from "./model";
 
 function fixture(automatic = true) {
   let time = 1_000_000;
   let config: Settings | null = { ...DEFAULT_SETTINGS };
-  let state: State = { version: 1, disabled: [], jobs: [] };
+  let state: State = { version: 1, disabled: [], jobs: [], operations: [] };
   let calls = 0;
   const agents: Observation[] = [
     {
@@ -76,6 +77,14 @@ function fixture(automatic = true) {
   };
 }
 
+async function waitForStatus(f: ReturnType<typeof fixture>, status: State["jobs"][number]["status"]) {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    if (f.state.jobs[0]?.status === status) return;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  assert.fail(`Timed out waiting for ${status}; current status is ${f.state.jobs[0]?.status}`);
+}
+
 test("defaults remain 200,000 tokens and 55 minutes; invalid settings rejected", () => {
   assert.equal(DEFAULT_SETTINGS.threshold, 200_000);
   assert.equal(DEFAULT_SETTINGS.idleMinutes, 55);
@@ -111,8 +120,9 @@ test("stock host blocks automatic dispatch while preserving manual access", asyn
   assert.equal((await s.list())[0].status, "blocked");
   assert.equal(
     (await s.compactNow("a", f.agents[0].revision!)).status,
-    "completed"
+    "running"
   );
+  await waitForStatus(f, "completed");
 });
 
 test("threshold filtering and unknown context are distinct", async () => {
@@ -127,8 +137,9 @@ test("threshold filtering and unknown context are distinct", async () => {
   assert.equal(row.status, "blocked");
   assert.equal(
     (await s.compactNow("a", f.agents[0].revision!)).status,
-    "completed"
+    "running"
   );
+  await waitForStatus(f, "completed");
   assert.equal(f.calls, 1);
 });
 
@@ -143,7 +154,8 @@ test("manual compact ignores automatic context thresholds while automatic dispat
     f.advance(55 * 60_000);
     await s.tick();
     assert.equal(f.calls, 0, `automatic dispatch must not run with ${tokens} tokens`);
-    assert.equal((await s.compactNow("a", f.agents[0].revision!)).status, "completed");
+    assert.equal((await s.compactNow("a", f.agents[0].revision!)).status, "running");
+    await waitForStatus(f, "completed");
     assert.equal(f.calls, 1);
   }
 });
@@ -478,15 +490,26 @@ test("ambiguous in-flight restart and failed compact never retry automatically",
   let s = f.make();
   await s.ready;
   await s.observedTurn(f.agents[0]);
-  await f.store.write({
-    ...f.state,
-    jobs: [{ ...f.state.jobs[0], status: "running", attemptedAt: f.time }],
-  });
+  // Sent, then the plugin restarts before any evidence arrives.
+  let sends = 0;
+  f.gateway.automatic = async (_agent, _guard, execution) => {
+    sends++;
+    await execution!.checkpoint({ dispatchStartedAt: f.time });
+    return new Promise(() => {});
+  };
+  f.advance(55 * 60_000);
+  void s.tick();
+  while (f.state.operations[0]?.evidence?.dispatchStartedAt === undefined)
+    await new Promise<void>(resolve => setImmediate(resolve));
+  s.stop();
   s = f.make();
   await s.ready;
-  assert.equal(f.state.jobs[0].status, "unknown");
-  f.advance(55 * 60_000);
+  assert.equal(f.state.operations[0].state, "observing");
+  f.advance(180_001);
   await s.tick();
+  assert.equal(f.state.jobs[0].status, "unknown");
+  await s.tick();
+  assert.equal(sends, 1);
   assert.equal(f.calls, 0);
   assert.equal(
     (await s.compactNow("a", f.agents[0].revision!)).status,
@@ -539,7 +562,35 @@ test("list and policy edits remain responsive during a compaction; only one send
   );
   release();
   await run;
+  await waitForStatus(f, "completed");
   assert.deepEqual(f.state.disabled, ["b"]);
+});
+
+test("Compact now acknowledges a slow backend before the plugin RPC deadline", async () => {
+  const f = fixture();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  f.gateway.compact = async () => {
+    await gate;
+    return { status: "completed", detail: "Completed boundary" };
+  };
+  const scheduler = f.make();
+  await scheduler.ready;
+
+  const request = scheduler.compactNow("a", f.agents[0].revision!);
+  const first = await Promise.race([
+    request,
+    new Promise<"rpc-timeout">((resolve) => setTimeout(() => resolve("rpc-timeout"), 10)),
+  ]);
+  release();
+  await waitForStatus(f, "completed");
+
+  if (first === "rpc-timeout")
+    assert.fail("the RPC waited for compaction instead of acknowledging the persisted running job");
+  assert.equal(first.status, "running");
+  assert(first.operationId);
+  assert.match(first.operationId, /^[0-9a-f-]{36}$/);
+  assert.equal(f.state.jobs[0].operationId, first.operationId);
 });
 
 test("unreadable settings and stopped plugin never send", async () => {
@@ -622,7 +673,8 @@ test('a manual compact retains native activity identity and cannot reschedule it
   f.agents[0].activityKey = 'launch:generation:1';
   const scheduler = f.make(); await scheduler.ready;
   await scheduler.observedTurn(f.agents[0]);
-  assert.equal((await scheduler.compactNow('a', f.agents[0].revision!)).status, 'completed');
+  assert.equal((await scheduler.compactNow('a', f.agents[0].revision!)).status, 'running');
+  await waitForStatus(f, 'completed');
   f.agents[0].revision = new Date(f.time + 1).toISOString();
   await scheduler.observedTurn(f.agents[0], f.time + 2);
   assert.equal(f.state.jobs[0].status, 'completed');
@@ -660,7 +712,8 @@ test("Compact now works whether automation is off globally, for the provider or 
     await s.ready;
     if ("conversationOff" in change) await s.toggle("a", false);
     else f.config = { ...DEFAULT_SETTINGS, ...change };
-    assert.equal((await s.compactNow("a", f.agents[0].revision!)).status, "completed");
+    assert.equal((await s.compactNow("a", f.agents[0].revision!)).status, "running");
+    await waitForStatus(f, "completed");
     assert.equal(f.calls, 1);
   }
 });
@@ -699,5 +752,329 @@ test("a later native turn without a new host message earns a reservation; the sa
   assert.equal(f.state.jobs[0].endedAt, f.time);
   f.advance(55 * 60_000);
   await s.tick();
+  assert.equal(f.calls, 1);
+});
+
+test("lost acknowledgement retries return the same operation before live eligibility checks", async () => {
+  const f = fixture(), s = f.make();
+  await s.ready;
+  let release!: () => void;
+  let sends = 0;
+  f.gateway.compact = async () => {
+    sends++;
+    await new Promise<void>(resolve => { release = resolve; });
+    return { status: "completed", detail: "Completed" };
+  };
+  const revision = f.agents[0].revision!;
+  const target = { sessionId: "native-a", activityKey: null };
+  const accepted = await s.compactNow("a", revision, "request-a", target);
+  while (!release) await new Promise<void>(resolve => setImmediate(resolve));
+  f.agents[0].idle = false;
+  f.config = null;
+  f.gateway.refresh = async () => { throw new Error("duplicate must not refresh"); };
+  const duplicate = await s.compactNow("a", revision, "request-a", target);
+  assert.equal(duplicate.code, "existing");
+  assert.equal(duplicate.operationId, accepted.operationId);
+  assert.equal(duplicate.operation?.state, "dispatching");
+  assert.equal(f.state.operations.length, 1);
+  assert.equal(sends, 1);
+  release();
+  await waitForStatus(f, "completed");
+  assert.equal((await s.compactNow("a", revision, "request-a", target)).operation?.state, "succeeded");
+  assert.equal((await s.operation("request-a"))?.state, "succeeded");
+});
+
+test("operation IDs reject different caller input, including target identity", async () => {
+  const f = fixture(), s = f.make(); await s.ready;
+  const revision = f.agents[0].revision!;
+  const target = { sessionId: "native-a", activityKey: null };
+  await s.compactNow("a", revision, "request-a", target);
+  await waitForStatus(f, "completed");
+  for (const [agent, rev, scope] of [
+    ["b", revision, target], ["a", "changed", target],
+    ["a", revision, { ...target, activityKey: "changed" }],
+    ["a", revision, { ...target, sessionId: "other" }],
+    ["a", revision, undefined],
+  ] as const) {
+    const result = await s.compactNow(agent, rev, "request-a", scope);
+    assert.equal(result.code, "idempotency_conflict");
+    assert.equal(result.operationId, null);
+  }
+  assert.equal(f.calls, 1);
+});
+
+test("new requests reject stale native identity even when host revision is unchanged", async () => {
+  const f = fixture(), s = f.make(); await s.ready;
+  f.agents[0].activityKey = "launch:generation:3";
+  const result = await s.compactNow("a", f.agents[0].revision!, "request-a",
+    { sessionId: "native-a", activityKey: "launch:generation:1" });
+  assert.equal(result.code, "blocked");
+  assert.equal(f.calls, 0);
+  assert.equal(f.state.operations.length, 0);
+});
+
+test("operation completion survives reservation replacement and remains queryable without the agent", async () => {
+  const f = fixture(), s = f.make(); await s.ready;
+  let release!: () => void;
+  f.gateway.compact = async () => {
+    await new Promise<void>(resolve => { release = resolve; });
+    return { status: "completed", detail: "Completed" };
+  };
+  await s.compactNow("a", f.agents[0].revision!, "request-a");
+  while (!release) await new Promise<void>(resolve => setImmediate(resolve));
+  f.advance(1000);
+  f.agents[0].revision = new Date(f.time).toISOString();
+  await s.observedTurn(f.agents[0]);
+  assert.equal(f.state.jobs[0].status, "scheduled");
+  assert.equal((await s.session("a"))?.activeOperation?.id, "request-a");
+  assert.equal((await s.session("a"))?.status, "running");
+  release();
+  for (let i = 0; i < 100 && (await s.operation("request-a"))?.state === "dispatching"; i++)
+    await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal((await s.operation("request-a"))?.state, "succeeded");
+  assert.equal(f.state.jobs[0].status, "scheduled");
+  assert.equal((await s.session("a"))?.latestOperation?.id, "request-a");
+  f.agents.splice(0);
+  assert.equal((await s.operation("request-a"))?.state, "succeeded");
+  assert.equal(await s.operation("missing"), null);
+});
+
+test("failed acceptance persistence never sends and the same submission can be retried", async () => {
+  const f = fixture(), s = f.make(); await s.ready;
+  const write = f.store.write;
+  f.store.write = async () => { throw new Error("disk full"); };
+  await assert.rejects(s.compactNow("a", f.agents[0].revision!, "request-a"), /disk full/);
+  assert.equal(f.calls, 0);
+  assert.equal(f.state.operations.length, 0);
+  f.store.write = write;
+  assert.equal((await s.compactNow("a", f.agents[0].revision!, "request-a")).code, "accepted");
+  await waitForStatus(f, "completed");
+  assert.equal(f.calls, 1);
+});
+
+test("restart observes a dispatched operation and an old worker cannot overwrite recovery", async () => {
+  const f = fixture(), first = f.make(); await first.ready;
+  let release!: () => void;
+  f.gateway.compact = async (_id, _agent, execution) => {
+    await execution!.checkpoint({ dispatchStartedAt: f.time });
+    await new Promise<void>(resolve => { release = resolve; });
+    return { status: "completed", detail: "Late completion" };
+  };
+  const revision = f.agents[0].revision!;
+  await first.compactNow("a", revision, "request-a");
+  while (!release) await new Promise<void>(resolve => setImmediate(resolve));
+  first.stop();
+  const second = f.make(); await second.ready;
+  assert.equal((await second.compactNow("a", revision, "request-a")).operation?.state, "observing");
+  f.advance(180_001);
+  await second.reconcile();
+  release();
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal((await second.operation("request-a"))?.state, "unknown");
+});
+
+test("a different ID cannot repeat compaction of the same activity", async () => {
+  const f = fixture(), s = f.make(); await s.ready;
+  f.agents[0].activityKey = "launch:generation:1";
+  await s.compactNow("a", f.agents[0].revision!, "request-a");
+  await waitForStatus(f, "completed");
+  assert.equal((await s.compactNow("a", f.agents[0].revision!, "request-b")).operationId, "request-a");
+  assert.equal(f.calls, 1);
+  assert.equal(f.state.operations.length, 1);
+});
+
+test("a fresh native generation can compact despite an unchanged host revision", async () => {
+  const f = fixture(), s = f.make(); await s.ready;
+  f.agents[0].activityKey = "launch:generation:1";
+  await s.compactNow("a", f.agents[0].revision!, "request-a");
+  await waitForStatus(f, "completed");
+  f.agents[0].activityKey = "launch:generation:2";
+  const result = await s.compactNow("a", f.agents[0].revision!, "request-b",
+    { sessionId: "native-a", activityKey: "launch:generation:2" });
+  assert.equal(result.code, "accepted");
+  await waitForStatus(f, "completed");
+  assert.equal(f.calls, 2);
+  assert.equal(f.state.operations.length, 2);
+});
+
+test("Compact now can repeat an activity only when the earlier attempt provably sent nothing", async () => {
+  for (const [state, evidence, accepted] of [
+    ["expired", undefined, true],
+    ["failed", undefined, true],
+    ["failed", { dispatchStartedAt: 1 }, false],
+    ["unknown", undefined, false],
+    ["succeeded", undefined, false],
+  ] as const) {
+    const f = fixture(), s = f.make(); await s.ready;
+    f.agents[0].activityKey = "launch:generation:1";
+    const target = { sessionId: "native-a", activityKey: "launch:generation:1" };
+    f.state.operations.push({ id: "earlier", agentId: "a", revision: f.agents[0].revision!, target,
+      kind: "automatic", state, createdAt: f.time, updatedAt: f.time, inputFingerprint: null,
+      result: { code: "x", message: "earlier attempt" }, ...(evidence ? { evidence } : {}) });
+    const result = await s.compactNow("a", f.agents[0].revision!, "request-b", target);
+    assert.equal(result.code, accepted ? "accepted" : "existing", `${state} ${JSON.stringify(evidence)}`);
+    if (accepted) { await waitForStatus(f, "completed"); assert.equal(f.calls, 1); }
+    else assert.equal(f.calls, 0);
+  }
+});
+
+test("automatic dispatch never repeats an activity, even one whose attempt sent nothing", async () => {
+  const f = fixture(), s = f.make(); await s.ready;
+  f.agents[0].activityKey = "launch:generation:1";
+  await s.observedTurn(f.agents[0]);
+  f.state.operations.push({ id: "earlier", agentId: "a", revision: f.agents[0].revision!,
+    target: { sessionId: "native-a", activityKey: "launch:generation:1" }, kind: "automatic", state: "expired",
+    createdAt: f.time, updatedAt: f.time, inputFingerprint: null,
+    result: { code: "expired_before_dispatch", message: "Compaction request expired before dispatch" } });
+  f.advance(55 * 60_000);
+  await s.tick();
+  assert.equal(f.calls, 0);
+  assert.equal(f.state.jobs[0].operationId, "earlier");
+  assert.equal(f.state.jobs[0].status, "expired");
+});
+
+test("every write derives the jobs' attempt fields from their operations", async () => {
+  const f = fixture(), s = f.make(); await s.ready;
+  let release!: () => void;
+  f.gateway.compact = async (_id, _agent, execution) => {
+    await execution!.checkpoint({ dispatchStartedAt: f.time });
+    await new Promise<void>(resolve => { release = resolve; });
+    return { status: "completed", detail: "Completed" };
+  };
+  await s.compactNow("a", f.agents[0].revision!, "request-a");
+  while (!release) await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(f.state.jobs[0].status, "running");
+  assert.equal(f.state.jobs[0].attemptedAt, f.state.operations[0].createdAt);
+  release();
+  await waitForStatus(f, "completed");
+  assert.equal(f.state.jobs[0].detail, "Completed");
+  // An attempt that sent nothing leaves no attemptedAt, which is what lets v1.0.2 retry it.
+  const g = fixture(), t = g.make(); await t.ready;
+  g.gateway.compact = async () => ({ status: "failed", detail: "Claude is still working" });
+  await t.compactNow("a", g.agents[0].revision!, "request-a");
+  await waitForStatus(g, "failed");
+  assert.equal(g.state.jobs[0].attemptedAt, undefined);
+  assert.equal(g.state.operations[0].result?.code, "failed_before_dispatch");
+});
+
+test("an unreadable observer keeps an automatic reservation instead of cancelling it", async () => {
+  const f = fixture(), s = f.make(); await s.ready;
+  f.agents[0].activityKey = "launch:generation:1";
+  await s.observedTurn(f.agents[0]);
+  f.advance(55 * 60_000);
+  const refresh = f.gateway.refresh;
+  f.gateway.refresh = async id => ({ ...(await refresh(id))!, activityKey: null, observerUnreadable: true });
+  await s.tick();
+  assert.equal(f.state.jobs[0].status, "scheduled");
+  assert.equal(f.calls, 0);
+  f.gateway.refresh = refresh;
+  await s.tick();
+  await waitForStatus(f, "completed");
+  assert.equal(f.calls, 1);
+});
+
+test("a Compact now request arriving during a worker pass starts without waiting for the next tick", async () => {
+  const f = fixture(), s = f.make(); await s.ready;
+  // A pass already in progress read the state just before the request was saved.
+  const read = f.store.read;
+  let release!: () => void, gated = false;
+  f.store.read = async () => {
+    const value = await read();
+    if (!gated) { gated = true; await new Promise<void>(resolve => { release = resolve; }); }
+    return value;
+  };
+  const pass = s.reconcile();
+  while (!release) await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal((await s.compactNow("a", f.agents[0].revision!, "request-a")).code, "accepted");
+  release();
+  await pass;
+  await waitForStatus(f, "completed");
+  assert.equal(f.calls, 1, "sent by the follow-up pass, with no tick");
+});
+
+test("unreadable settings during inspection keep an automatic reservation instead of reporting a change", async () => {
+  const f = fixture(), s = f.make(); await s.ready;
+  await s.observedTurn(f.agents[0]);
+  f.advance(55 * 60_000);
+  f.gateway.readiness = async () => { f.config = null; return null; };
+  await s.tick();
+  assert.equal(f.state.jobs[0].status, "scheduled");
+  assert.equal(f.calls, 0);
+  f.gateway.readiness = async () => null;
+  f.config = { ...DEFAULT_SETTINGS };
+  await s.tick();
+  await waitForStatus(f, "completed");
+  assert.equal(f.calls, 1);
+});
+
+test("a scheduler stopped mid-request cannot put back state a newer instance replaced", async () => {
+  const f = fixture(), first = f.make(); await first.ready;
+  const refresh = f.gateway.refresh;
+  let release!: () => void;
+  f.gateway.refresh = async id => { await new Promise<void>(resolve => { release = resolve; }); return refresh(id); };
+  const stale = first.compactNow("a", f.agents[0].revision!, "request-old");
+  while (!release) await new Promise<void>(resolve => setImmediate(resolve));
+  first.stop();
+  f.gateway.refresh = refresh;
+  const second = f.make(); await second.ready;
+  await second.compactNow("a", f.agents[0].revision!, "request-new");
+  release();
+  await assert.rejects(stale, /Plugin stopped/);
+  assert.deepEqual(f.state.operations.map(operation => operation.id), ["request-new"]);
+});
+
+test("a Compact now that cannot be prepared ends within seconds, unsent and retryable", async () => {
+  const f = fixture(), s = f.make(); await s.ready;
+  const compact = f.gateway.compact;
+  let attempts = 0;
+  f.gateway.compact = async () => { attempts++; throw new Error("observer preparation timed out"); };
+  const revision = f.agents[0].revision!;
+  assert.equal((await s.compactNow("a", revision, "request-a")).code, "accepted");
+  for (let i = 0; i < 100 && attempts === 0; i++) await new Promise<void>(resolve => setImmediate(resolve));
+  f.advance(10_000);
+  for (let i = 0; i < 100 && (await s.operation("request-a"))?.state !== "expired"; i++) {
+    await s.reconcile();
+    await new Promise<void>(resolve => setImmediate(resolve));
+  }
+  const operation = await s.operation("request-a");
+  assert.equal(operation?.state, "expired");
+  assert.equal(operation?.result?.code, "expired_before_dispatch");
+  f.gateway.compact = compact;
+  assert.equal((await s.compactNow("a", revision, "request-b")).code, "accepted", "nothing was sent, so it can be tried again");
+  s.stop();
+});
+
+test("a session awaiting resume is refused at once and holds its reservation, without a request that would fail later", async () => {
+  const f = fixture(), s = f.make(); await s.ready;
+  await s.observedTurn(f.agents[0]);
+  f.agents[0].resumeRequired = true;
+  const refused = await s.compactNow("a", f.agents[0].revision!, "request-a");
+  assert.equal(refused.status, "blocked");
+  assert.match(refused.detail, /resume/i);
+  assert.equal(refused.operation, null);
+  assert.equal((await s.session("a"))?.status, "blocked");
+  f.advance(55 * 60_000);
+  await s.tick();
+  assert.equal(f.state.jobs[0].status, "blocked");
+  assert.match(f.state.jobs[0].detail, /resume/i);
+  assert.equal(f.state.operations.length, 0);
+  assert.equal(f.calls, 0);
+});
+
+test("what already happened to an activity is answered before whether sending may start", async () => {
+  const f = fixture(), s = f.make(); await s.ready;
+  f.agents[0].activityKey = "launch:generation:1";
+  await s.observedTurn(f.agents[0]);
+  const revision = f.agents[0].revision!;
+  assert.equal((await s.compactNow("a", revision, "request-a")).code, "accepted");
+  await waitForStatus(f, "completed");
+  // After a plugin reload on Paseo 0.14 the same, already compacted activity awaits a resume.
+  f.agents[0].resumeRequired = true;
+  for (const live of [{ resumeRequired: true }, { idle: false }]) {
+    Object.assign(f.agents[0], live);
+    const again = await s.compactNow("a", revision, `request-${JSON.stringify(live)}`);
+    assert.equal(again.code, "existing", JSON.stringify(live));
+    assert.equal(again.operationId, "request-a");
+  }
   assert.equal(f.calls, 1);
 });

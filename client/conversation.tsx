@@ -13,10 +13,12 @@ import {
   useQuery,
   useQueryClient,
 } from "@tanstack/react-query";
-import { compactRpc, sessionRpc, skipRpc, toggleRpc, undoSkipRpc } from "../shared/rpc";
+import { operationRowStatus, operationPending, compactRpc, operationRpc, sessionRpc, skipRpc, toggleRpc, undoSkipRpc } from "../shared/rpc";
 import { compactSettings } from "../shared/settings";
 import { canSkip, errorLabel, tokenLabel } from "./format";
-import { canUndoSkip, pendingPresentation, sessionKey, sessionPresentation, type Presentation } from "./session-state";
+import { canUndoSkip, compactCompletionNotice, compactOutcomeNotice, pendingPresentation, sessionKey,
+  sessionPresentation, type Presentation } from "./session-state";
+import { compactSubmissions } from "./compact-submission";
 import { Toggle } from "./toggle";
 
 export function useConversation(hostId: string, agentId: string) {
@@ -85,8 +87,24 @@ export function ConversationControls({
   const toast = useToast();
   const toggle = useRpc(toggleRpc), skip = useRpc(skipRpc), compact = useRpc(compactRpc);
   const undoSkip = useRpc(undoSkipRpc);
+  const readOperation = useRpc(operationRpc);
   const key = sessionKey(host.id, agentId);
   const [confirmRevision, setConfirmRevision] = useState<string | null>(null);
+  const [compactOperationId, setCompactOperationId] = useState<string | null>(
+    () => compactSubmissions.get(host.id, agentId)?.operationId ?? null);
+  const trackedId = compactOperationId ?? row?.activeOperation?.id ?? null;
+  const operationQuery = useQuery({
+    queryKey: ["auto-compact", host.id, "operation", trackedId],
+    queryFn: () => readOperation({ operationId: trackedId! }),
+    enabled: !!trackedId,
+    refetchInterval: query => query.state.data?.operation &&
+      !operationPending(query.state.data.operation) ? false : 2_000,
+    retry: false,
+  });
+  const operation = operationQuery.data?.operation ?? row?.activeOperation ?? row?.latestOperation;
+  useEffect(() => {
+    setCompactOperationId(compactSubmissions.get(host.id, agentId)?.operationId ?? null);
+  }, [host.id, agentId]);
   useEffect(() => setConfirmRevision(null), [row?.revision]);
 
   const action = useMutation({
@@ -114,7 +132,13 @@ export function ConversationControls({
         if (!result.changed) throw new Error("This skipped schedule changed or expired. Refresh and try again.");
         return { kind: input.kind } as const;
       }
-      return { kind: input.kind, ...await compact({ agentId, revision: input.revision }) } as const;
+      const submission = compactSubmissions.prepare(host.id, {
+        agentId, revision: input.revision, target: row?.target,
+      });
+      setCompactOperationId(submission.operationId);
+      const result = await compact(submission);
+      compactSubmissions.acknowledge(host.id, agentId, submission.operationId);
+      return { kind: input.kind, ...result } as const;
     },
     onSuccess: (result) => {
       // These updates happen only after the server acknowledges the action.
@@ -129,25 +153,53 @@ export function ConversationControls({
             : result.kind === "undo-skip"
             ? { ...current.row, status: "blocked", dueAt: null, undoSkip: null,
                 detail: "Waiting for refreshed schedule" }
-            : { ...current.row, status: result.status, detail: result.detail, dueAt: null, undoSkip: null },
+            : { ...current.row, status: result.status, detail: result.detail,
+                operationId: result.operationId, dueAt: null, undoSkip: null,
+                activeOperation: result.operation && operationPending(result.operation) ? result.operation : null,
+                latestOperation: result.operation ?? current.row.latestOperation },
         };
       });
       if (result.kind === "skip") toast.show("Skipped this schedule");
       if (result.kind === "undo-skip") toast.show("Skip undone");
       if (result.kind === "compact") {
         setConfirmRevision(null);
-        if (result.status === "completed") toast.show("Conversation compacted", { variant: "success" });
-        else toast.error(result.status === "unknown"
-          ? "Check the conversation before trying again."
-          : result.status === "blocked"
-          ? `${result.detail}.`
-          : "Couldn’t compact. Check the conversation.");
+        if (result.status === "running") {
+          setCompactOperationId(result.operationId);
+          toast.show("Compaction requested");
+        } else {
+          setCompactOperationId(null);
+          const notice = compactOutcomeNotice({ status: result.status, detail: result.detail,
+            code: result.operation?.result?.code }) ??
+            { variant: "error", message: "Couldn’t compact. Check the conversation." };
+          if (notice.variant === "success") toast.show(notice.message, { variant: "success" });
+          else toast.error(notice.message);
+        }
       }
     },
-    onError: (error) => toast.error(errorLabel(error)),
+    onError: (error, input) => {
+      if (input.kind === "compact") toast.show("Request status unconfirmed. Checking compaction status.");
+      else toast.error(errorLabel(error));
+    },
     onSettled: () => queryClient.invalidateQueries({ queryKey: key }),
   });
-  const busy = state.mutations > 0 || row?.status === "running";
+  useEffect(() => {
+    if (operation && operation.id === compactOperationId) {
+      compactSubmissions.acknowledge(host.id, agentId, operation.id);
+      if (action.isError && action.variables?.kind === "compact") action.reset();
+    }
+    if (action.isPending) return;
+    const notice = compactCompletionNotice(operation ? {
+      operationId: operation.id,
+      status: operationRowStatus(operation),
+      detail: operation.result?.message,
+      code: operation.result?.code,
+    } : null, compactOperationId);
+    if (!notice) return;
+    setCompactOperationId(null);
+    if (notice.variant === "success") toast.show(notice.message, { variant: "success" });
+    else toast.error(notice.message);
+  }, [compactOperationId, operation?.id, operation?.state, toast, host.id, agentId, action.isPending, action.isError]);
+  const busy = state.mutations > 0 || row?.status === "running" || !!operation && operationPending(operation);
   const disabled = !ready || busy;
   const { colors } = theme;
   const textStyle = { color: colors.foreground, fontSize: 14 };
@@ -201,7 +253,13 @@ export function ConversationControls({
       {action.isError ? <Text accessibilityRole="alert" style={{ ...mutedStyle, color: colors.statusDanger }}>
         {action.variables?.kind === "toggle"
           ? "Couldn’t update this conversation. Try again."
+          : action.variables?.kind === "compact"
+          ? "Request status unconfirmed. Refresh status or retry the same request."
           : "This action failed. Refresh the status and try again."}
+      </Text> : null}
+      {operation ? <Text style={mutedStyle}>
+        {operationPending(operation) ? "Compaction requested"
+          : `Last compaction: ${operation.result?.message ?? operation.state}`}
       </Text> : null}
       {button("Skip this time", () => action.mutate({ kind: "skip", revision: row!.revision! }),
         disabled || !row || !canSkip(row) || !status?.startsWith("Compact in "), "SkipForward")}

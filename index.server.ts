@@ -1,12 +1,15 @@
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { createGateway } from "./server/gateway";
 import { createScheduler } from "./server/scheduler";
+import { bounded, INSPECT_TIMEOUT_MS } from "./server/deadline";
 import { createStore } from "./server/store";
 import { createObserver } from "./server/observer";
+import { createReporter } from "./server/report";
 import { claudeProvider } from "./shared/providers";
 import {
   compactRpc,
   listRpc,
+  operationRpc,
   sessionRpc,
   skipRpc,
   undoSkipRpc,
@@ -18,22 +21,26 @@ export default function contribute(server: PluginServerContext) {
   const settings = server.registerSettings(compactSettings);
   const observer = createObserver();
   const host = createGateway({ observer });
+  // Work cut off by shutdown recovers from durable state on next start; see
+  // server/report.ts for how its errors are told apart from real ones.
+  const reporter = createReporter(message => console.error("[auto-compact-for-claude]", message));
+  const report = reporter.report;
   const scheduler = createScheduler({
     store: createStore(),
     gateway: host.gateway,
+    receipts: { remove: observer.removeReceipt, sweep: observer.sweepReceipts },
     settings: async () => {
       const state = await settings.read();
       return state.status === "ready" ? state.values : null;
     },
+    onError: report,
   });
-  const report = (error: unknown) =>
-    console.error("[auto-compact-for-claude]", String(error));
-  void scheduler.ready.catch(report);
+  void scheduler.ready.then(() => scheduler.reconcile(host.connected())).catch(report);
   // Reservations are created from native ordinary completion, including when
   // Paseo reports a premature turn end during overlapping compaction/input.
   const observe = async () => {
     if (!host.connected()) return;
-    for (const agent of await host.gateway.list()) {
+    for (const agent of await bounded(host.gateway.list(), INSPECT_TIMEOUT_MS)) {
       if (agent.activityKey && agent.observedEndedAt !== null && agent.observedEndedAt !== undefined)
         await scheduler.observedTurn(agent, agent.observedEndedAt);
     }
@@ -114,17 +121,24 @@ export default function contribute(server: PluginServerContext) {
     host.attach(paseo);
     return { changed: await scheduler.undoSkip(agentId, revision, skipId) };
   });
-  server.handle(compactRpc, async ({ agentId, revision }, { paseo }) => {
+  server.handle(compactRpc, async ({ agentId, revision, operationId, target }, { paseo }) => {
     host.attach(paseo);
-    return scheduler.compactNow(agentId, revision);
+    return scheduler.compactNow(agentId, revision, operationId, target);
+  });
+  server.handle(operationRpc, async ({ operationId }, { paseo }) => {
+    host.attach(paseo);
+    return { operation: await scheduler.operation(operationId) };
   });
   let ticking = false;
   const timer = setInterval(() => {
     if (ticking) return;
     ticking = true;
-    void observe().then(() => scheduler.tick(host.connected())).catch(report).finally(() => { ticking = false; });
+    // Operation recovery must progress even when native discovery fails/hangs.
+    void scheduler.tick(host.connected()).catch(report).finally(() => { ticking = false; });
+    void observe().catch(report);
   }, 10_000);
   return () => {
+    reporter.dispose();
     clearInterval(timer);
     scheduler.stop();
     host.stop();

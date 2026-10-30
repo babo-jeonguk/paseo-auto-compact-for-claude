@@ -6,7 +6,7 @@ function fixture(env = {}, settings = {}) {
   let time = 1_000_000, contextTokens = 100_000;
   const hooks = new Map(), files = new Map();
   const timers = new Set();
-  const configuration = { launchId: 'launch-1', ledger: '/ledger', request: '/request' };
+  const configuration = { launchId: 'launch-1', ledger: '/ledger', request: '/request', receipts: '/receipts' };
   const $ = { clock: { now: async () => time, every: (_ms, fn) => {
       const timer = { fn, cancel() { timers.delete(timer); } };
       timers.add(timer); return timer;
@@ -367,4 +367,34 @@ test('a cancelled reservation blocks one late /compact, then the user can compac
 test('a repeated session start keeps a single heartbeat', async () => {
   const f = fixture(); await f.start(); await f.start();
   assert.equal(f.timers(), 1);
+});
+
+
+test('operation receipts survive later ordinary activity and session closure', async () => {
+  const f = fixture(); await f.start(); await f.ordinary(); f.request();
+  await f.compact(async () => {
+    await f.event('classic.PreCompact', { trigger: 'manual' });
+    await f.event('classic.PostCompact');
+  });
+  const completed = JSON.parse(f.files.get('/receipts/operation-1.json'));
+  assert.equal(completed.status, 'completed');
+  assert.equal(completed.sessionId, 'native-1');
+  await f.ordinary(); await f.event('session.end');
+  const retained = JSON.parse(f.files.get('/receipts/operation-1.json'));
+  assert.equal(retained.status, 'completed');
+  assert.equal(retained.revision, completed.revision);
+  assert.equal(retained.generation, completed.generation);
+});
+
+test('heartbeat and session closure do not recreate a successfully written expired receipt', async () => {
+  const f = fixture(); await f.start(); await f.ordinary(); f.request();
+  await f.compact(async () => {
+    await f.event('classic.PreCompact', { trigger: 'manual' });
+    await f.event('classic.PostCompact');
+  });
+  assert(f.files.has('/receipts/operation-1.json'));
+  f.files.delete('/receipts/operation-1.json');
+  await f.tick(7 * 24 * 60 * 60_000); await f.ordinary(); await f.event('session.end');
+  assert.equal(f.files.has('/receipts/operation-1.json'), false);
+  assert.equal(f.ledger().closed, true);
 });

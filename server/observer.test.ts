@@ -1,18 +1,24 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, utimes, writeFile } from 'node:fs/promises';
 import { join, delimiter } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createObserver } from './observer';
 import type { PluginSessionOpenRequest } from '@getpaseo/plugin/server';
-import type { Observation } from './model';
+import type { Observation, StoredOperation } from './model';
 
 async function fixture() {
   const home = await mkdtemp(join(tmpdir(), 'compact-observer-'));
   let time = 1_000_000;
   const observer = createObserver({ home, now: () => time });
-  const request: PluginSessionOpenRequest = { agentId: 'a', workspaceId: 'w', provider: 'claude',
-    purpose: 'interactive', reason: 'create', cwd: home, env: { CLAUDE_CODE_PLUGIN_DIRS: '/existing', OTHER: 'preserved' } };
+  // The additive 0.14 fields are harmless to 0.12/0.13 and verify that the
+  // observer preserves the complete session-open request across SDK versions.
+  const request = { agentId: 'a', workspaceId: 'w', provider: 'claude',
+    purpose: 'interactive', reason: 'create', cwd: home, title: 'Conversation',
+    labels: { retained: 'yes' }, tools: [], mcpServers: {},
+    env: { CLAUDE_CODE_PLUGIN_DIRS: '/existing', OTHER: 'preserved' } } as PluginSessionOpenRequest & {
+      readonly title: string; readonly labels: Readonly<Record<string, string>>;
+    };
   const prepared = await observer.prepareSession(request, true);
   const parent = join(home, 'plugin-data/auto-compact-for-claude/observers',
     (await readdir(join(home, 'plugin-data/auto-compact-for-claude/observers')))[0]);
@@ -38,6 +44,13 @@ test('observer session preparation preserves provider environment and ignores hi
   const f = await fixture();
   try {
     assert.equal(f.prepared.env.OTHER, 'preserved');
+    assert.equal((f.prepared as typeof f.request).title, 'Conversation');
+    assert.deepEqual((f.prepared as typeof f.request).labels, { retained: 'yes' });
+    const launch = (await f.observer.read('a'))!.ledger.launchId;
+    assert.equal(f.observer.startedHere('a', launch), true);
+    assert.equal(createObserver({ home: f.home, now: () => 1_000_000 }).startedHere('a', launch), false,
+      'a later plugin instance did not start this launch');
+    assert.equal(f.observer.startedHere('missing', launch), false);
     assert(f.prepared.env.CLAUDE_CODE_PLUGIN_DIRS.startsWith('/existing' + delimiter));
     assert.equal(await f.observer.prepareSession(f.request, false), f.request);
     const history = { ...f.request, purpose: 'history' as const };
@@ -125,8 +138,84 @@ test('opening a session removes closed or long-idle launches of that conversatio
     await f.observer.prepareSession(f.request, true);
     const current = JSON.parse(await readFile(join(f.parent, 'current.json'), 'utf8')).launchId;
     const remaining = (await readdir(f.parent)).filter(name => name !== 'current.json').sort();
-    assert.deepEqual(remaining, [current, f.manifest.launchId, 'preparing', 'recent'].sort());
+    assert.deepEqual(remaining, [current, f.manifest.launchId, 'preparing', 'receipts', 'recent'].sort());
     assert(other.env.CLAUDE_CODE_PLUGIN_DIRS.includes('observers'));
     assert.equal((await readdir(join(f.home, 'plugin-data/auto-compact-for-claude/observers'))).length, 2);
+  } finally { await f.close(); }
+});
+
+test('durable receipts survive closed-launch pruning and require every native identity field', async () => {
+  const f = await fixture();
+  try {
+    const operation = await f.observer.prepare(f.agent, false, 1_030_000, 'caller-request');
+    assert.equal(operation.id, 'caller-request');
+    const path = join(f.parent, 'receipts', 'caller-request.json');
+    const receipt = { id: operation.id, launchId: operation.launchId, generation: operation.generation,
+      sessionId: operation.sessionId, revision: operation.revision, status: 'completed', reason: null, observedAt: 1_000_001 };
+    await writeFile(path, JSON.stringify(receipt));
+    f.ledger.closed = true; await f.save();
+    await f.observer.prepareSession(f.request, true);
+    assert.equal((await f.observer.receipt('a', operation))?.status, 'completed');
+    for (const patch of [{ id: 'foreign' }, { launchId: 'foreign' }, { generation: 'foreign' },
+      { revision: operation.revision + 1 }, { sessionId: 'foreign' }]) {
+      await writeFile(path, JSON.stringify({ ...receipt, ...patch }));
+      assert.equal(await f.observer.receipt('a', operation), null);
+    }
+    await writeFile(path, '{partial');
+    assert.equal(await f.observer.receipt('a', operation), null);
+    await writeFile(path, JSON.stringify(receipt));
+    assert.equal((await f.observer.receipt('a', operation))?.status, 'completed');
+  } finally { await f.close(); }
+});
+
+test('receipt cleanup protects retained work, collects old orphans and never follows directory links', async () => {
+  const f = await fixture();
+  try {
+    const receipts = join(f.parent, 'receipts');
+    const old = { id: 'orphan', launchId: f.manifest.launchId, generation: 'generation-1', sessionId: 'native-a',
+      revision: 1, status: 'completed', reason: null, observedAt: 100 };
+    await writeFile(join(receipts, 'orphan.json'), JSON.stringify(old));
+    await writeFile(join(receipts, 'pending.json'), '{}');
+    await writeFile(join(receipts, 'partial.json'), '{');
+    await writeFile(join(receipts, 'recent.json'), JSON.stringify({ ...old, id: 'recent', observedAt: 1001 }));
+    for (const file of ['pending.json', 'partial.json']) await utimes(join(receipts, file), 0, 0);
+    const retained = [{ id: 'pending', agentId: 'a' }] as StoredOperation[];
+    await f.observer.sweepReceipts(retained, 1000);
+    assert.deepEqual((await readdir(receipts)).sort(), ['pending.json', 'recent.json']);
+    // A late save from an older observer is collected using observedAt, not its fresh mtime.
+    await writeFile(join(receipts, 'orphan.json'), JSON.stringify(old));
+    await f.observer.sweepReceipts(retained, 1000);
+    assert.deepEqual((await readdir(receipts)).sort(), ['pending.json', 'recent.json']);
+    await f.observer.removeReceipt('a', 'pending');
+    await f.observer.removeReceipt('a', 'pending');
+    await f.observer.removeReceipt('missing-agent', 'missing');
+    // Windows junctions work without the optional file-symlink privilege.
+    const external = join(f.home, 'external'); await mkdir(external);
+    await writeFile(join(external, 'valuable.json'), '{}');
+    await rm(receipts, { recursive: true });
+    await symlink(external, receipts, process.platform === 'win32' ? 'junction' : 'dir');
+    await assert.rejects(f.observer.removeReceipt('a', 'valuable'), /Unsafe/);
+    await assert.rejects(f.observer.sweepReceipts([], Infinity), /Unsafe/);
+    assert.equal(await readFile(join(external, 'valuable.json'), 'utf8'), '{}');
+  } finally { await f.close(); }
+});
+
+test('an observer that cannot be read is a fault, not an absent observer', async () => {
+  const f = await fixture();
+  try {
+    assert(await f.observer.read('a'));
+    // Half-written ledger: thrown, so dispatch retries instead of treating it as gone.
+    await writeFile(join(f.directory, 'ledger.json'), '{"version":1,');
+    await assert.rejects(f.observer.read('a'), /could not be read/);
+    await assert.rejects(f.observer.prepare(f.agent, false, Date.now() + 30_000, 'op-1'), /could not be read/);
+    assert.equal(await f.observer.readiness(f.agent), 'Claude observer status unavailable; retrying');
+    // A genuinely missing or stale observer is absence, and a refusal at dispatch.
+    await f.save();
+    f.advance(60_001);
+    assert.equal(await f.observer.read('a'), null);
+    await assert.rejects(f.observer.prepare(f.agent, false, Date.now() + 30_000, 'op-1'),
+      (error: Error) => error.constructor.name === 'Refusal');
+    await rm(join(f.parent, 'current.json'));
+    assert.equal(await f.observer.read('a'), null);
   } finally { await f.close(); }
 });

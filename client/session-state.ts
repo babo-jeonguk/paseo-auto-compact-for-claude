@@ -1,4 +1,4 @@
-import type { Row } from "../shared/rpc";
+import { sentNothing, type Row } from "../shared/rpc";
 import type { Settings } from "../shared/settings";
 import { formatTokenThreshold } from "./format";
 
@@ -8,6 +8,41 @@ export const sessionKey = (hostId: string, agentId: string) =>
 export interface Presentation {
   label: "Compact off" | "Compact on" | "Compacting…" | "Check compact" | `Compact in ${number}${"m" | "s"}`;
   description: string;
+}
+
+export type CompactCompletionNotice =
+  | { variant: "success"; message: "Conversation compacted" }
+  | { variant: "error"; message: string };
+
+// An outcome as the server reports it: a row status, the server's reason, and
+// the result code that says whether anything was sent.
+export interface CompactOutcomeReport { status: Row["status"]; detail?: string; code?: string }
+
+// One wording per outcome, whether it arrives in the request's reply or later
+// from polling the operation. Null while the outcome is still pending. When
+// nothing was sent the server's reason says what to do before trying again.
+export function compactOutcomeNotice({ status, detail, code }: CompactOutcomeReport): CompactCompletionNotice | null {
+  if (status === "completed")
+    return { variant: "success", message: "Conversation compacted" };
+  if (status === "unknown")
+    return { variant: "error", message: "Check the conversation before trying again." };
+  if (status === "expired")
+    return { variant: "error", message: "Compaction request expired before it could start; nothing was sent. Try again." };
+  if (status === "failed" && sentNothing(code))
+    return { variant: "error", message: `Compaction didn’t start; nothing was sent. ${detail ? `${detail}.` : "Try again."}` };
+  if (status === "failed")
+    return { variant: "error", message: "Couldn’t compact. Check the conversation." };
+  if (status === "blocked" && detail)
+    return { variant: "error", message: `${detail}.` };
+  return null;
+}
+
+export function compactCompletionNotice(
+  tracked: CompactOutcomeReport & { operationId: string | null } | null | undefined,
+  operationId: string | null
+): CompactCompletionNotice | null {
+  if (!tracked || !operationId || tracked.operationId !== operationId) return null;
+  return compactOutcomeNotice(tracked);
 }
 
 export const STATUS_GRACE_MS = 10_000;
@@ -36,6 +71,13 @@ export function sessionPresentation(row: Row, settings: Settings, now: number): 
   };
   if (row.status === "unknown")
     return check("Compaction could not be confirmed. Check the conversation before trying again.");
+  // Ahead of any earlier result: until the session resumes nothing is compacted there.
+  if (row.resumeRequired)
+    return check("Paseo restarted this plugin. Send a message to resume the conversation; automatic compaction is scheduled again after the reply.");
+  if (row.status === "failed" && sentNothing(row.latestOperation?.result?.code)) {
+    const reason = row.latestOperation?.result?.message;
+    return check(`Compaction didn’t start; nothing was sent. ${reason ? `${reason}.` : "You can try again."}`);
+  }
   if (row.status === "failed")
     return check("Compaction failed. Check the conversation before trying again.");
   if (row.status === "busy") {

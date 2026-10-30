@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
+import { access, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { waitFor } from './fixture.mjs';
 
 const scheduled = (f, id, source) => waitFor(async () => {
@@ -87,7 +89,12 @@ export const scenarios = [
       const tooSmall = await scheduled(f, manualId);
       assert(tooSmall.tokens < 600_000);
       const sessionId = (await f.refresh(manualId)).persistence.sessionId;
-      assert.equal((await f.rpc('now', { agentId: manualId, revision: tooSmall.revision })).status, 'completed');
+      const accepted = await f.rpc('now', { agentId: manualId, revision: tooSmall.revision });
+      assert.equal(accepted.status, 'running'); assert(accepted.operationId);
+      await waitFor(async () => {
+        const current = await f.row(manualId);
+        return current.status === 'completed' && current.operationId === accepted.operationId;
+      }, 'manual compaction below threshold');
       assert.equal((await f.refresh(manualId)).persistence.sessionId, sessionId);
       assert.equal(boundaries(await f.timeline(manualId)).length, 1);
       await f.settings({ threshold: 400_000 });
@@ -149,8 +156,147 @@ export const scenarios = [
       await f.settings({ idleMinutes: 50 });
       await f.turn(id, 'MANUAL_READY: reply without tools.');
       const row = await scheduled(f, id);
-      assert.equal((await f.rpc('now', { agentId: id, revision: row.revision })).status, 'completed');
+      const accepted = await f.rpc('now', { agentId: id, revision: row.revision });
+      assert.equal(accepted.status, 'running'); assert(accepted.operationId);
+      await waitFor(async () => {
+        const current = await f.row(id);
+        return current.status === 'completed' && current.operationId === accepted.operationId;
+      }, 'explicit manual compaction');
       assert.equal((await f.refresh(id)).persistence.sessionId, sessionId);
+    },
+  },
+  {
+    name: 'manual operation is idempotent and remains queryable after new activity',
+    async run({ fixture: f, model }) {
+      const id = await f.agent();
+      await f.turn(id, 'IDEMPOTENCY_READY: reply without tools.');
+      const row = await scheduled(f, id);
+      const input = { agentId: id, revision: row.revision, target: row.target, operationId: randomUUID() };
+      const gate = model.holdNext();
+      const accepted = await f.rpc('now', input);
+      assert.equal(accepted.status, 'running');
+      assert.equal(accepted.operationId, input.operationId);
+      assert.equal(accepted.operation.id, input.operationId);
+      await waitFor(() => gate.requestId, 'in-flight idempotent compaction');
+      const duplicate = await f.rpc('now', input);
+      assert.equal(duplicate.operation.id, input.operationId);
+      assert(['dispatching', 'observing'].includes(duplicate.operation.state));
+      const conflict = await f.rpc('now', { ...input, revision: `${input.revision}-different` });
+      assert.equal(conflict.status, 'blocked');
+      assert.equal(conflict.code, 'idempotency_conflict');
+      assert.equal(conflict.operationId, null);
+      assert.equal(conflict.operation, null);
+      gate.release();
+      const finished = await waitFor(async () => {
+        const operation = (await f.rpc('operation', { operationId: input.operationId })).operation;
+        return operation?.state === 'succeeded' ? operation : null;
+      }, 'idempotent operation completion');
+      const completedDuplicate = await f.rpc('now', input);
+      assert.equal(completedDuplicate.operation.id, input.operationId);
+      assert.equal(completedDuplicate.operation.state, 'succeeded');
+      assert.equal(boundaries(await f.timeline(id)).length, 1);
+      await f.turn(id, 'IDEMPOTENCY_LATER_ACTIVITY: reply without tools.');
+      assert.deepEqual((await f.rpc('operation', { operationId: input.operationId })).operation, finished);
+      assert.equal(boundaries(await f.timeline(id)).length, 1);
+      await f.rpc('toggle', { agentId: id, enabled: false });
+    },
+  },
+  {
+    name: 'an in-flight operation recovers after plugin reload without resending',
+    async run({ fixture: f, model }) {
+      const id = await f.agent();
+      await f.turn(id, 'RECOVERY_READY: reply without tools.');
+      const row = await scheduled(f, id);
+      const operationId = randomUUID();
+      const gate = model.holdNext();
+      const before = model.count;
+      const accepted = await f.rpc('now', { agentId: id, revision: row.revision, target: row.target, operationId });
+      assert.equal(accepted.status, 'running');
+      assert.equal(accepted.operation.id, operationId);
+      await waitFor(() => gate.requestId, 'in-flight recovery compaction');
+      assert.equal(model.count, before + 1);
+      assert.equal((await f.client.reloadPlugin('auto-compact-for-claude')).status, 'running');
+      gate.release();
+      const recovered = await waitFor(async () => {
+        const operation = (await f.rpc('operation', { operationId })).operation;
+        return operation?.state === 'succeeded' ? operation : null;
+      }, 'operation reconciled after plugin reload', 60_000);
+      assert.equal(recovered.id, operationId);
+      assert.equal(model.count, before + 1, 'recovery must not send another model request');
+      const receipt = await f.receipt(id, operationId);
+      assert.equal(receipt.id, operationId);
+      assert.equal(receipt.status, 'completed');
+      const timeline = await f.timeline(id);
+      const command = timeline.find(entry => entry.item.type === 'user_message' && entry.item.clientMessageId === operationId);
+      assert(command?.turnId, 'operation ID must identify the compaction command turn');
+      const completed = boundaries(timeline);
+      assert.equal(completed.length, 1);
+      assert.equal(completed[0].turnId, command.turnId);
+      await f.rpc('toggle', { agentId: id, enabled: false });
+    },
+  },
+  {
+    name: 'aged terminal records and receipts are pruned without replay; recent and pending records survive',
+    async run({ fixture: f, model }) {
+      const id = await f.agent();
+      await f.turn(id, 'RETENTION_READY: reply without tools.');
+      const row = await scheduled(f, id);
+      const operationId = randomUUID();
+      await f.rpc('now', { agentId: id, revision: row.revision, target: row.target, operationId });
+      await waitFor(async () => (await f.rpc('operation', { operationId })).operation?.state === 'succeeded', 'retention compaction');
+      const receipt = await f.receipt(id, operationId);
+      const statePath = join(f.home, 'plugin-data/auto-compact-for-claude/state.json');
+      const receiptPath = (agentId, receiptId) => join(f.home, 'plugin-data/auto-compact-for-claude/observers',
+        createHash('sha256').update(agentId).digest('hex'), 'receipts', `${encodeURIComponent(receiptId)}.json`);
+      const recentId = randomUUID(), orphanId = randomUUID(), recentOrphanId = randomUUID();
+      // Age and clone records only while the plugin is stopped. These are
+      // retention fixtures, not simulated passage of real reservation time.
+      await f.client.disablePlugin('auto-compact-for-claude');
+      const state = JSON.parse(await readFile(statePath, 'utf8'));
+      const old = state.operations.find(entry => entry.id === operationId);
+      assert(old);
+      old.createdAt = old.updatedAt = Date.now() - 8 * 24 * 60 * 60_000;
+      state.operations.push({ ...structuredClone(old), id: recentId, agentId: 'retention-recent-fixture',
+        createdAt: Date.now(), updatedAt: Date.now() });
+      await mkdir(join(receiptPath('retention-recent-fixture', recentId), '..'), { recursive: true });
+      await writeFile(receiptPath('retention-recent-fixture', recentId), JSON.stringify({ ...receipt, id: recentId }));
+      await writeFile(receiptPath(id, orphanId), JSON.stringify({ ...receipt, id: orphanId, observedAt: Date.now() - 8 * 24 * 60 * 60_000 }));
+      await writeFile(receiptPath(id, recentOrphanId), JSON.stringify({ ...receipt, id: recentOrphanId, observedAt: Date.now() }));
+      await writeFile(statePath, JSON.stringify(state));
+      const requests = model.count;
+      assert.equal((await f.client.enablePlugin('auto-compact-for-claude')).status, 'running');
+      await waitFor(async () => !(await f.rpc('operation', { operationId })).operation, 'old operation cleanup');
+      await assert.rejects(access(receiptPath(id, operationId)), { code: 'ENOENT' });
+      await assert.rejects(access(receiptPath(id, orphanId)), { code: 'ENOENT' });
+      await access(receiptPath(id, recentOrphanId));
+      assert((await f.rpc('operation', { operationId: recentId })).operation);
+      await access(receiptPath('retention-recent-fixture', recentId));
+      const latest = await f.row(id);
+      const guarded = await f.rpc('now', { agentId: id, revision: latest.revision, target: latest.target, operationId: randomUUID() });
+      assert.equal(guarded.code, 'existing', `pruning must preserve the same-activity guard: ${guarded.detail}`);
+      assert.equal(model.count, requests, 'cleanup and the guard must not resend compaction');
+
+      await f.client.disablePlugin('auto-compact-for-claude');
+      const pendingState = JSON.parse(await readFile(statePath, 'utf8'));
+      const pendingId = randomUUID(), future = Date.now() + 60 * 60_000;
+      pendingState.operations.push({ ...structuredClone(old), id: pendingId, agentId: 'retention-pending-fixture',
+        state: 'requested', result: null, sendBy: future, nextAttemptAt: future });
+      await mkdir(join(receiptPath('retention-pending-fixture', pendingId), '..'), { recursive: true });
+      await writeFile(receiptPath('retention-pending-fixture', pendingId), JSON.stringify({ ...receipt, id: pendingId }));
+      await writeFile(statePath, JSON.stringify(pendingState));
+      assert.equal((await f.client.enablePlugin('auto-compact-for-claude')).status, 'running');
+      assert((await f.rpc('operation', { operationId: pendingId })).operation, 'pending record must survive');
+      await access(receiptPath('retention-pending-fixture', pendingId));
+      assert.equal(model.count, requests, 'pending recovery must not resend');
+      // Remove only the synthetic pending record while stopped so it cannot
+      // block unrelated later scenarios.
+      await f.client.disablePlugin('auto-compact-for-claude');
+      const finalState = JSON.parse(await readFile(statePath, 'utf8'));
+      finalState.operations = finalState.operations.filter(entry => entry.id !== pendingId);
+      await writeFile(statePath, JSON.stringify(finalState));
+      await rm(receiptPath('retention-pending-fixture', pendingId));
+      assert.equal((await f.client.enablePlugin('auto-compact-for-claude')).status, 'running');
+      await f.rpc('toggle', { agentId: id, enabled: false });
     },
   },
   {
@@ -159,18 +305,22 @@ export const scenarios = [
       await f.turn(id, 'RACE_READY: reply without tools.');
       const row = await scheduled(f, id);
       const compact = model.holdNext();
-      const operation = f.rpc('now', { agentId: id, revision: row.revision });
+      const operation = await f.rpc('now', { agentId: id, revision: row.revision });
+      assert.equal(operation.status, 'running'); assert(operation.operationId);
       await waitFor(() => compact.requestId, 'in-flight compaction');
       const user = model.holdNext();
       await f.send(id, 'INPUT_DURING_COMPACT: reply without tools.');
       compact.release();
       await waitFor(() => user.requestId, 'overlapping user request');
-      const result = await operation;
+      const result = await waitFor(async () => {
+        const receipt = (await f.ledger(id)).compact;
+        return receipt && receipt.status !== 'running' ? receipt : null;
+      }, 'native overlapping compact outcome');
       // Claude can acknowledge cancellation before the overlapping input is
       // observed. A confirmed cancellation is failed; an uncertain outcome is
       // unknown. Neither may be promoted to successful compaction.
       assert(result.status === 'unknown' || (result.status === 'failed' &&
-        /cancel|without completing|did not complete/i.test(result.detail)), JSON.stringify(result));
+        /cancel|without completing|did not complete/i.test(result.reason)), JSON.stringify(result));
       assert.equal((await f.row(id)).status, 'busy');
       user.release();
       await waitFor(async () => (await f.timeline(id)).some(row => row.item.type === 'assistant_message' &&
