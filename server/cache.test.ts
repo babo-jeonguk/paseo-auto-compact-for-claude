@@ -42,7 +42,7 @@ test('missing TTL uses a disclosed one-hour default; settings and actual transcr
     const observed = await read(request, path, 'session', now, now);
     assert.equal(observed?.source, 'transcript'); assert.equal(observed?.ttlMinutes, 60);
     // Re-read changed metadata even after a previous one-hour observation.
-    // Same-size rewrites can share an mtime tick on Windows; a later write has a later mtime.
+    // Same-size rewrites can share an mtime tick on Windows.
     await writeFile(path, row(12, 0));
     await utimes(path, new Date(now + 1_000), new Date(now + 1_000));
     assert.equal((await read(request, path, 'session', now, now))?.ttlMinutes, 5);
