@@ -197,3 +197,15 @@ At `e7b8d70` the 0.12.0 desktop E2E no longer logged an error on app quit, which
 Reruns, none of them plugin assertions: one Android 0.12.0 run, after host load from other projects reached 89 while it ran.
 
 Sonnet 5.5 subagents ran every suite.
+
+A fifth review found that an error after the dispatch marker, written in the same pass, was classified from the copy taken at claim. Past the send deadline, that could settle possibly sent work as `expired_before_dispatch`. `bd30a13` classifies it on the stored record. The same commit lets the session row carry `resumeRequired`, so the controls no longer match a server string. At `bd30a13`:
+- `npm run check`: 162 tests passed.
+- Linux:
+  - native suite 18/18 on 0.14.0, 0.13.0 and 0.12.0;
+  - the 0.14 lifecycle `reload`, `automatic` and `cleanup` scenarios passed;
+  - 0.14.0 web UI 4/4, install/upgrade/rollback E2E 24/24 and desktop E2E 9/9.
+- Windows 11: 0.14.0 install/upgrade/rollback E2E 24/24.
+- Android 14: 0.14.0 APK 8/8.
+
+Every first failure before a rerun was a readiness or reply timeout, not a plugin assertion. Load from other projects and a concurrent emulator reached 25–50 during three install E2E attempts, which timed out waiting for native replies in different scenarios. The run passed once load fell. Two Android attempts ran next to the desktop suite and lost the emulator to its watchdog or a boot timeout. One more attempt timed out behind a System UI ANR dialog. Run alone, the Android test passed.
+
