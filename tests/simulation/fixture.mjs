@@ -23,7 +23,8 @@ export async function waitFor(fn, label, timeout = 45_000) {
 // `install` replaces the default checkout install, e.g. with a GitHub install through the CLI.
 // `launcher` replaces `paseo daemon run`, e.g. with the desktop app that starts its own daemon.
 export async function startFixture({ root, plugin, cliPackage, appVersion, binary, model, reportDir, webUi = false,
-  install, launcher, providerEnv: extraProviderEnv = {}, readyTimeoutMs = 90_000 }) {
+  install, launcher, providerEnv: extraProviderEnv = {}, readyTimeoutMs = 90_000,
+  daemonEnv = {} }) {
   const requireTools = createRequire(cliPackage);
   const cliRoot = dirname(cliPackage);
   const { DaemonClient } = await import(pathToFileURL(requireTools.resolve('@getpaseo/client/internal/daemon-client')));
@@ -67,7 +68,7 @@ export async function startFixture({ root, plugin, cliPackage, appVersion, binar
     const log = openSync(logPath, 'w');
     try {
       daemon = spawn(process.execPath, ['--no-maglev', join(cliRoot, 'bin/paseo'),
-        'daemon', 'run', '--home', home], { env: environment, stdio: ['ignore', log, log],
+        'daemon', 'run', '--home', home], { env: { ...environment, ...daemonEnv }, stdio: ['ignore', log, log],
         detached: process.platform !== 'win32', windowsHide: true });
       daemon.on('error', error => { launchError = error; });
     } finally { closeSync(log); }

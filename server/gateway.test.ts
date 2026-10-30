@@ -158,14 +158,14 @@ test('automatic public dispatch requires both its own boundary and matching nati
     [{ status: 'completed', detail: 'Native PostCompact' }, 'completed'],
     [{ status: 'unknown', detail: 'Overlapping input' }, 'unknown'],
   ] as const) {
-    const host = fixture(boundary, undefined, false, boundary, { observer: observer(receipt) });
+    const host = fixture(boundary, undefined, false, boundary, { observer: observer(receipt), timeoutMs: 1_000 });
     const agent = (await host.gateway.refresh('a'))!;
     assert.equal((await host.gateway.automatic!(agent)).status, expected);
     assert.equal(host.sendCount(), 1);
   }
   const foreign = [...boundary, { type: 'user_message', clientMessageId: 'unrelated' }];
   const host = fixture(boundary, undefined, false, foreign, {
-    observer: observer({ status: 'completed', detail: 'Native PostCompact' }),
+    observer: observer({ status: 'completed', detail: 'Native PostCompact' }), timeoutMs: 1_000,
   });
   assert.equal((await host.gateway.automatic!((await host.gateway.refresh('a'))!)).status, 'unknown');
 });
@@ -237,6 +237,55 @@ test('an unreadable observer is reported on the observation and is a fault befor
   const agent = (await host.gateway.refresh('a'))!;
   assert.equal(agent.observerUnreadable, true);
   await assert.rejects(host.gateway.compact('a', agent), /could not be read/);
+  assert.equal(host.sendCount(), 0);
+});
+
+test('a host that reopens stale plugin sessions never sends against an observer from the prior plugin instance', async () => {
+  const native = observer(null) as ReturnType<typeof observer> & {
+    ownsCurrentLaunch(agentId: string): Promise<boolean>;
+  };
+  native.ownsCurrentLaunch = async () => false;
+  const host = fixture([], undefined, false, [], { observer: native });
+  Object.assign(host.ref, { reload: async () => null });
+  await assert.rejects(host.gateway.compact('a', (await host.gateway.refresh('a'))!),
+    (error: unknown) => error instanceof Refusal && /resume.*message/i.test(error.message));
+  assert.equal(host.sendCount(), 0);
+  await assert.rejects(host.gateway.automatic!((await host.gateway.refresh('a'))!),
+    (error: unknown) => error instanceof Refusal && /resume.*message/i.test(error.message));
+  assert.equal(host.sendCount(), 0);
+});
+
+test('observer ownership is rechecked at the dispatch boundary', async () => {
+  const native = observer(null) as ReturnType<typeof observer> & {
+    ownsCurrentLaunch(agentId: string): Promise<boolean>;
+  };
+  let ownershipChecks = 0;
+  let markerPersisted = false;
+  native.ownsCurrentLaunch = async () => { ownershipChecks++; return !markerPersisted; };
+  const host = fixture([], undefined, false, [], { observer: native });
+  Object.assign(host.ref, { reload: async () => null });
+  const result = await host.gateway.compact('a', (await host.gateway.refresh('a'))!, {
+    id: 'ownership-race', sendBy: Date.now() + 30_000,
+    checkpoint: async evidence => { markerPersisted ||= evidence.dispatchStartedAt !== undefined; },
+    current: () => true,
+  });
+  assert.equal(result.status, 'unknown');
+  assert.match(result.detail, /observer changed.*no automatic retry/i);
+  assert.equal(ownershipChecks, 3);
+  assert.equal(host.sendCount(), 0);
+});
+
+test('an absent observer is not misreported as a session awaiting reload', async () => {
+  const native = observer(null) as ReturnType<typeof observer> & {
+    ownsCurrentLaunch(agentId: string): Promise<boolean | null>;
+  };
+  native.ownsCurrentLaunch = async () => null;
+  native.prepare = async () => { throw new Refusal('Claude observer unavailable'); };
+  const host = fixture([], undefined, false, [], { observer: native });
+  Object.assign(host.ref, { reload: async () => null });
+  await assert.rejects(host.gateway.compact('a', (await host.gateway.refresh('a'))!),
+    (error: unknown) => error instanceof Refusal && /observer unavailable/i.test(error.message) &&
+      !/resume.*message/i.test(error.message));
   assert.equal(host.sendCount(), 0);
 });
 

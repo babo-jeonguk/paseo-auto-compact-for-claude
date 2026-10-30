@@ -11,8 +11,14 @@ async function fixture() {
   const home = await mkdtemp(join(tmpdir(), 'compact-observer-'));
   let time = 1_000_000;
   const observer = createObserver({ home, now: () => time });
-  const request: PluginSessionOpenRequest = { agentId: 'a', workspaceId: 'w', provider: 'claude',
-    purpose: 'interactive', reason: 'create', cwd: home, env: { CLAUDE_CODE_PLUGIN_DIRS: '/existing', OTHER: 'preserved' } };
+  // The additive 0.14 fields are harmless to 0.12/0.13 and verify that the
+  // observer preserves the complete session-open request across SDK versions.
+  const request = { agentId: 'a', workspaceId: 'w', provider: 'claude',
+    purpose: 'interactive', reason: 'create', cwd: home, title: 'Conversation',
+    labels: { retained: 'yes' }, tools: [], mcpServers: {},
+    env: { CLAUDE_CODE_PLUGIN_DIRS: '/existing', OTHER: 'preserved' } } as PluginSessionOpenRequest & {
+      readonly title: string; readonly labels: Readonly<Record<string, string>>;
+    };
   const prepared = await observer.prepareSession(request, true);
   const parent = join(home, 'plugin-data/auto-compact-for-claude/observers',
     (await readdir(join(home, 'plugin-data/auto-compact-for-claude/observers')))[0]);
@@ -38,6 +44,11 @@ test('observer session preparation preserves provider environment and ignores hi
   const f = await fixture();
   try {
     assert.equal(f.prepared.env.OTHER, 'preserved');
+    assert.equal((f.prepared as typeof f.request).title, 'Conversation');
+    assert.deepEqual((f.prepared as typeof f.request).labels, { retained: 'yes' });
+    assert.equal(await f.observer.ownsCurrentLaunch('a'), true);
+    assert.equal(await createObserver({ home: f.home, now: () => 1_000_000 }).ownsCurrentLaunch('a'), false);
+    assert.equal(await f.observer.ownsCurrentLaunch('missing'), null);
     assert(f.prepared.env.CLAUDE_CODE_PLUGIN_DIRS.startsWith('/existing' + delimiter));
     assert.equal(await f.observer.prepareSession(f.request, false), f.request);
     const history = { ...f.request, purpose: 'history' as const };

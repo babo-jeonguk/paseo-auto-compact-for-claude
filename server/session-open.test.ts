@@ -29,8 +29,10 @@ test("plugin state or observer failures cannot prevent a Claude session from ope
   await writeFile(join(data, "state.json"), "{ corrupt");
   const dispose = contribute(server);
   try {
-    const request: PluginSessionOpenRequest = { agentId: "a", workspaceId: "w", provider: "claude",
-      purpose: "interactive", reason: "create", cwd: home, env: { CLAUDE_CODE_PLUGIN_DIRS: "/existing" } };
+    const request = { agentId: "a", workspaceId: "w", provider: "claude",
+      purpose: "interactive", reason: "create", cwd: home, title: "Conversation",
+      labels: { retained: "yes" }, tools: [], mcpServers: {},
+      env: { CLAUDE_CODE_PLUGIN_DIRS: "/existing" } } as PluginSessionOpenRequest;
     const paseo = { config: { get: async () => ({ config: { providers: {} } }) } };
     const opened = await open!({ request }, { paseo });
     const dirs = opened.env.CLAUDE_CODE_PLUGIN_DIRS.split(delimiter);

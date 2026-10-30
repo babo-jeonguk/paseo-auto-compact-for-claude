@@ -14,8 +14,8 @@ assert(playwright && executablePath, 'Specify --playwright /path/to/playwright-c
 const { chromium }=await import(pathToFileURL(resolve(playwright)));
 const req=createRequire(join(plugin,'tests/simulation/package.json'));
 const version=value('--paseo','0.12.0');
-assert(['0.12.0','0.13.0'].includes(version), 'Unsupported Paseo version');
-const alias=version === '0.12.0' ? '0-12' : '0-13';
+assert(['0.12.0','0.13.0','0.14.0'].includes(version), 'Unsupported Paseo version');
+const alias=version.split('.').slice(0,2).join('-');
 const reportDir=join(resolve(value('--report-dir',join(plugin,'test-results'))),`browser-${version}`);
 await mkdir(reportDir,{recursive:true});
 const root=await mkdtemp(join(tmpdir(),'paseo-ui-validation-'));

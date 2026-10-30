@@ -27,6 +27,7 @@ const paseoRequested = value('--paseo', '0.12.0');
 const paseoPackages = new Map([
   ['0.12.0', '@getpaseo/cli-0-12'],
   ['0.13.0', '@getpaseo/cli-0-13'],
+  ['0.14.0', '@getpaseo/cli-0-14'],
 ]);
 assert(paseoPackages.has(paseoRequested), `Unsupported Paseo simulation version: ${paseoRequested}`);
 const reportRoot = resolve(value('--report-dir', join(plugin, 'test-results', `${process.platform}-${process.arch}`)));

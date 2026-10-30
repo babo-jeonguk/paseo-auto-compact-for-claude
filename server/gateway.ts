@@ -18,6 +18,7 @@ const commandBoundary = (item: TimelineItem, turnId: string | null | undefined, 
   item.type === "compaction" && item.status === "completed" && item.trigger === "manual" &&
   commandTurn !== null && turnId === commandTurn;
 const RECOVERED = "Recovered matching native completion and command boundary";
+const SESSION_RESUME_REQUIRED = "Session must resume after plugin reload; send a message before compacting";
 // Unchanged evidence is still checkpointed this often, as a sign of progress.
 const CHECKPOINT_INTERVAL_MS = 5_000;
 export function createGateway(options: {
@@ -32,6 +33,12 @@ export function createGateway(options: {
   const requireApi = () => {
     if (!api) throw new Error("Waiting for a conversation lifecycle event or plugin request");
     return api;
+  };
+  const reopensStalePluginSession = (ref: object) =>
+    typeof Reflect.get(ref, "reload") === "function";
+  const requiresSessionResume = async (agentId: string, ref: object) => {
+    if (!observer || !reopensStalePluginSession(ref)) return false;
+    return await observer.ownsCurrentLaunch(agentId) === false;
   };
   async function observation(agent: Agent, providers?: Record<string, unknown>): Promise<Observation> {
     providers ??= (await requireApi().config.get()).config.providers;
@@ -85,7 +92,11 @@ export function createGateway(options: {
     },
     ...(observer ? {
       automatic: (expected: Observation, guard?: DispatchGuard, execution?: ExecutionContext) => compact(expected.agentId, expected, true, guard, execution),
-      readiness: (expected: Observation, dueAt?: number) => observer.readiness(expected, dueAt),
+      readiness: async (expected: Observation, dueAt?: number) => {
+        const ref = requireApi().agents.ref(expected.agentId);
+        if (await requiresSessionResume(expected.agentId, ref)) return SESSION_RESUME_REQUIRED;
+        return observer.readiness(expected, dueAt);
+      },
     } : {}),
     compact: (id, expected, execution) => compact(id, expected, false, undefined, execution),
     async inspect(operation) {
@@ -149,6 +160,13 @@ export function createGateway(options: {
       // for as long as it can still be observed.
       const startBy = Math.min(guard?.expiresAt ?? Infinity, sendBy);
       if (observer) {
+        // Paseo 0.14 reopens stale plugin sessions immediately before their next
+        // prompt. A /compact prepared against the previous Mod launch would run
+        // in the new launch without its request ID, splitting native completion
+        // from the durable operation. Wait for an ordinary prompt to perform the
+        // reopen; hosts without ref.reload retain the 0.12/0.13 behavior.
+        if (await read(requiresSessionResume(agentId, ref)))
+          throw new Refusal(SESSION_RESUME_REQUIRED);
         operation = await read(observer.prepare(before, automatic, observationEndBy(sendBy), id));
         const { launchId, generation, sessionId, revision } = operation;
         evidence.native = { id, launchId, generation, sessionId, revision };
@@ -173,6 +191,11 @@ export function createGateway(options: {
       if (!current?.idle || !unchanged({ revision: before.revision, target: targetOf(before) }, current) ||
           (guard && !await read(guard.allowed())))
         throw new Refusal("Reservation cancelled or session changed before send");
+      // Preparation and the last host/policy checks are asynchronous. Recheck
+      // ownership at the dispatch boundary so a reload during that interval
+      // cannot send a request prepared for the previous observer launch.
+      if (await read(requiresSessionResume(agentId, ref)))
+        throw new Refusal(SESSION_RESUME_REQUIRED);
       // Durable marker must precede the external side effect. Recovery never
       // resends once this marker exists, even if a crash preceded ref.send.
       evidence.dispatchStartedAt = now();
@@ -180,6 +203,11 @@ export function createGateway(options: {
       deadline = now() + live;
       if (!currentWorker() || cancelled)
         return { status: "unknown", detail: "Worker stopped at dispatch boundary; no automatic retry" };
+      // No awaited work remains after this ownership read and before send. The
+      // durable marker makes a failure here conservative: nothing was sent, but
+      // recovery must not assume it is safe to retry after a possible crash.
+      if (await read(requiresSessionResume(agentId, ref)))
+        return { status: "unknown", detail: "Observer changed at dispatch boundary; no automatic retry" };
       armed = true;
       sent = true;
       const send = ref.send("/compact", { messageId: id });
