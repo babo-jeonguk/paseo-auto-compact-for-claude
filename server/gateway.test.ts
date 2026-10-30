@@ -247,13 +247,11 @@ test('a host that reopens stale plugin sessions never sends against an observer 
   native.ownsCurrentLaunch = async () => false;
   const host = fixture([], undefined, false, [], { observer: native });
   Object.assign(host.ref, { reload: async () => null });
-  const result = await host.gateway.compact('a', (await host.gateway.refresh('a'))!);
-  assert.equal(result.status, 'failed');
-  assert.match(result.detail, /resume.*message/i);
+  await assert.rejects(host.gateway.compact('a', (await host.gateway.refresh('a'))!),
+    (error: unknown) => error instanceof Refusal && /resume.*message/i.test(error.message));
   assert.equal(host.sendCount(), 0);
-  const automatic = await host.gateway.automatic!((await host.gateway.refresh('a'))!);
-  assert.equal(automatic.status, 'failed');
-  assert.match(automatic.detail, /resume.*message/i);
+  await assert.rejects(host.gateway.automatic!((await host.gateway.refresh('a'))!),
+    (error: unknown) => error instanceof Refusal && /resume.*message/i.test(error.message));
   assert.equal(host.sendCount(), 0);
 });
 
@@ -267,7 +265,7 @@ test('observer ownership is rechecked at the dispatch boundary', async () => {
   const host = fixture([], undefined, false, [], { observer: native });
   Object.assign(host.ref, { reload: async () => null });
   const result = await host.gateway.compact('a', (await host.gateway.refresh('a'))!, {
-    id: 'ownership-race', deadlineAt: Date.now() + 30_000,
+    id: 'ownership-race', sendBy: Date.now() + 30_000,
     checkpoint: async evidence => { markerPersisted ||= evidence.dispatchStartedAt !== undefined; },
     current: () => true,
   });
@@ -285,10 +283,9 @@ test('an absent observer is not misreported as a session awaiting reload', async
   native.prepare = async () => { throw new Refusal('Claude observer unavailable'); };
   const host = fixture([], undefined, false, [], { observer: native });
   Object.assign(host.ref, { reload: async () => null });
-  const result = await host.gateway.compact('a', (await host.gateway.refresh('a'))!);
-  assert.equal(result.status, 'failed');
-  assert.match(result.detail, /observer unavailable/i);
-  assert.doesNotMatch(result.detail, /resume.*message/i);
+  await assert.rejects(host.gateway.compact('a', (await host.gateway.refresh('a'))!),
+    (error: unknown) => error instanceof Refusal && /observer unavailable/i.test(error.message) &&
+      !/resume.*message/i.test(error.message));
   assert.equal(host.sendCount(), 0);
 });
 
