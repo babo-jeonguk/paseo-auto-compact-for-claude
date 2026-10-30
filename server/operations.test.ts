@@ -132,6 +132,7 @@ test("faults before the dispatch marker are retried with persisted backoff until
   assert.equal(f.operation.result?.code, "expired_before_dispatch");
   assert.ok(f.operation.attempt! > 3, "the send deadline, not a count, bounds the retries");
   assert.equal(f.sends, 0);
+  assert.deepEqual(f.errors.map(String), ["Error: disconnected"], "only the fault that ended the request is reported");
   worker.stop();
 });
 
@@ -167,7 +168,7 @@ test("a gateway fault before the dispatch marker is retried; nothing is sent unt
   await worker.reconcile();
   assert.equal(f.operation.state, "requested");
   assert.equal(f.operation.attempt, 1);
-  assert.equal(f.errors.length, 1);
+  assert.equal(f.errors.length, 0, "a fault that is retried is not reported");
   f.gateway.compact = compact;
   f.advance(2000); await worker.reconcile();
   assert.equal(f.operation.state, "succeeded");
@@ -287,4 +288,17 @@ test("an unreadable observer or settings is retried, never read as a changed ses
     assert.equal(f.operation.result, null, fault);
     assert.equal(f.sends, 0, fault);
   }
+});
+
+test("a finished operation retires its native request, so it cannot claim a later /compact", async () => {
+  const f = fixture();
+  const released: string[] = [];
+  f.gateway.release = async operation => { released.push(`${operation.id}:${operation.state}`); };
+  f.operation.evidence = { native: { id: "operation-a", launchId: "launch", generation: "generation",
+    sessionId: "native", revision: 1 }, dispatchStartedAt: 1000 };
+  f.operation.state = "observing";
+  f.advance(180_000);
+  await f.make().reconcile();
+  assert.equal(f.operation.state, "unknown");
+  assert.deepEqual(released, ["operation-a:unknown"]);
 });

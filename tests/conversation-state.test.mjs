@@ -117,19 +117,31 @@ test("only the matching Compact now operation produces a final toast notice", ()
 });
 
 test("a Compact now reply and a polled operation use the same wording", () => {
-  for (const status of ["completed", "unknown", "expired", "failed"])
-    assert.deepEqual(compactOutcomeNotice(status),
-      compactCompletionNotice({ operationId: "operation-a", status }, "operation-a"), status);
-  // The result code says whether trying again is safe.
-  assert.deepEqual(compactOutcomeNotice("failed", undefined, "failed_before_dispatch"),
-    compactCompletionNotice({ operationId: "operation-a", status: "failed", code: "failed_before_dispatch" }, "operation-a"));
-  assert.deepEqual(compactOutcomeNotice("failed", undefined, "failed_before_dispatch"),
-    { variant: "error", message: "Couldn’t start compaction; nothing was sent. Try again." });
-  assert.deepEqual(compactOutcomeNotice("failed", undefined, "failed_after_dispatch"),
+  const reports = [{ status: "completed" }, { status: "unknown" }, { status: "expired" }, { status: "failed" },
+    { status: "failed", detail: "Claude is still working", code: "failed_before_dispatch" }];
+  for (const report of reports)
+    assert.deepEqual(compactOutcomeNotice(report),
+      compactCompletionNotice({ ...report, operationId: "operation-a" }, "operation-a"), JSON.stringify(report));
+  // When nothing was sent, the server's reason says what to do before trying again.
+  assert.deepEqual(compactOutcomeNotice({ status: "failed", code: "failed_before_dispatch",
+    detail: "Session must resume after plugin reload; send a message before compacting" }),
+  { variant: "error", message: "Compaction didn’t start; nothing was sent. Session must resume after plugin reload; send a message before compacting." });
+  assert.deepEqual(compactOutcomeNotice({ status: "failed", code: "failed_before_dispatch" }),
+    { variant: "error", message: "Compaction didn’t start; nothing was sent. Try again." });
+  assert.deepEqual(compactOutcomeNotice({ status: "failed", code: "failed_after_dispatch", detail: "Compact turn failed" }),
     { variant: "error", message: "Couldn’t compact. Check the conversation." });
-  assert.deepEqual(compactOutcomeNotice("expired"),
-    { variant: "error", message: "Compaction request expired before it could start." });
-  assert.deepEqual(compactOutcomeNotice("blocked", "The conversation is busy. Wait until it finishes"),
+  assert.deepEqual(compactOutcomeNotice({ status: "expired" }),
+    { variant: "error", message: "Compaction request expired before it could start; nothing was sent. Try again." });
+  assert.deepEqual(compactOutcomeNotice({ status: "blocked", detail: "The conversation is busy. Wait until it finishes" }),
     { variant: "error", message: "The conversation is busy. Wait until it finishes." });
-  assert.equal(compactOutcomeNotice("running"), null);
+  assert.equal(compactOutcomeNotice({ status: "running" }), null);
+});
+
+test("the row tells a failure that sent nothing, and a session awaiting resume, from one to check", () => {
+  const settings = { ...DEFAULT_SETTINGS };
+  const failed = (code) => ({ ...row, status: "failed", latestOperation: { result: { code, message: "reason" } } });
+  assert.match(sessionPresentation(failed("failed_before_dispatch"), settings, 0).description, /nothing was sent/);
+  assert.match(sessionPresentation(failed("failed_after_dispatch"), settings, 0).description, /Check the conversation/);
+  const held = { ...row, status: "blocked", detail: "Session must resume after plugin reload; send a message before compacting" };
+  assert.match(sessionPresentation(held, settings, 0).description, /Send a message to resume/);
 });

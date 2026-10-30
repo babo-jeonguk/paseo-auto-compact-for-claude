@@ -45,7 +45,8 @@ export function createObserver(options: { home?: string; now?: () => number } = 
   const base = join(options.home ?? process.env.PASEO_HOME ?? join(homedir(), '.paseo'),
     'plugin-data', 'auto-compact-for-claude', 'observers');
   const now = options.now ?? Date.now;
-  const currentLaunches = new Map<string, string>();
+  // The observer launch this plugin instance last started for each agent.
+  const launchesStartedHere = new Map<string, string>();
   const cacheWindow = createCacheReader();
   const agentDirectory = (id: string) => join(base, createHash('sha256').update(id).digest('hex'));
   const receiptName = (id: string) => encodeURIComponent(id) + '.json';
@@ -122,6 +123,16 @@ export function createObserver(options: { home?: string; now?: () => number } = 
     if (dueAt >= ledger.cacheDeadline - 30_000) return `Idle delay exceeds the ${ledger.cache?.ttlMinutes}-minute cache window (${ledger.cache?.source})`;
     return null;
   }
+  async function cancel(operation: { directory: string; id: string }, sent = true) {
+    const path = join(operation.directory, 'request.json');
+    const request = JSON.parse(await readFile(path, 'utf8'));
+    if (request.id !== operation.id) return;
+    const ledger = LedgerSchema.safeParse(JSON.parse(await readFile(join(operation.directory, 'ledger.json'), 'utf8')));
+    const consumed = ledger.success && ledger.data.compact?.id === operation.id;
+    // Settled requests must not intercept later ordinary/manual compaction.
+    // An unobserved send remains cancelled so a late PreCompact cannot run it.
+    await atomic(path, { id: operation.id, status: !sent || consumed ? 'settled' : 'cancelled' });
+  }
   return {
     read,
     async removeReceipt(agentId: string, operationId: string) {
@@ -181,17 +192,15 @@ export function createObserver(options: { home?: string; now?: () => number } = 
       await writeFile(join(mod, 'hooks', 'register.mjs'), observerAsset.source + '\nexport function register(on) { registerObserver(on, ' +
         JSON.stringify(configuration) + '); }\n', { mode: 0o600 });
       await atomic(join(parent, 'current.json'), { launchId, build: observerAsset.version });
-      currentLaunches.set(request.agentId, launchId);
+      launchesStartedHere.set(request.agentId, launchId);
       await prune(parent, launchId).catch(() => {});
       const existing = request.env.CLAUDE_CODE_PLUGIN_DIRS?.split(delimiter)
         .filter(path => path && !path.startsWith(parent + sep));
       return { ...request, env: { ...request.env,
         CLAUDE_CODE_PLUGIN_DIRS: [...(existing ?? []), mod].join(delimiter) } };
     },
-    async ownsCurrentLaunch(agentId: string) {
-      const current = await read(agentId);
-      return current ? currentLaunches.get(agentId) === current.ledger.launchId : null;
-    },
+    // In memory, so it never fails: whether this instance started that launch.
+    startedHere: (agentId: string, launchId: string) => launchesStartedHere.get(agentId) === launchId,
     async readiness(agent: Observation, dueAt?: number) {
       // A status display; an unreadable observer is reported, never thrown.
       const current = await read(agent.agentId).catch(() => undefined);
@@ -244,15 +253,14 @@ export function createObserver(options: { home?: string; now?: () => number } = 
       return { status: ledger.compact.status, detail: ledger.compact.reason ??
         (ledger.compact.status === 'completed' ? 'Claude observed compaction completion' : 'Compaction did not complete') };
     },
-    async cancel(operation: { directory: string; id: string }, sent = true) {
-      const path = join(operation.directory, 'request.json');
-      const request = JSON.parse(await readFile(path, 'utf8'));
-      if (request.id !== operation.id) return;
-      const ledger = LedgerSchema.safeParse(JSON.parse(await readFile(join(operation.directory, 'ledger.json'), 'utf8')));
-      const consumed = ledger.success && ledger.data.compact?.id === operation.id;
-      // Settled requests must not intercept later ordinary/manual compaction.
-      // An unobserved send remains cancelled so a late PreCompact cannot run it.
-      await atomic(path, { id: operation.id, status: !sent || consumed ? 'settled' : 'cancelled' });
+    cancel,
+    // A finished operation whose call did not end normally, such as one
+    // recovered after a restart, may leave its native request prepared. Retire
+    // it so that it can no longer claim a later /compact.
+    async release(agentId: string, operation: Pick<NativeOperation, 'id' | 'launchId'>, sent: boolean) {
+      const directory = join(agentDirectory(agentId), operation.launchId);
+      const request = JSON.parse(await readFile(join(directory, 'request.json'), 'utf8'));
+      if (request.id === operation.id && request.status === 'prepared') await cancel({ directory, id: operation.id }, sent);
     },
   };
 }

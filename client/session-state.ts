@@ -1,4 +1,4 @@
-import type { ResultCode, Row } from "../shared/rpc";
+import { sentNothing, type Row } from "../shared/rpc";
 import type { Settings } from "../shared/settings";
 import { formatTokenThreshold } from "./format";
 
@@ -14,18 +14,22 @@ export type CompactCompletionNotice =
   | { variant: "success"; message: "Conversation compacted" }
   | { variant: "error"; message: string };
 
+// An outcome as the server reports it: a row status, the server's reason, and
+// the result code that says whether anything was sent.
+export interface CompactOutcomeReport { status: Row["status"]; detail?: string; code?: string }
+
 // One wording per outcome, whether it arrives in the request's reply or later
-// from polling the operation. Null while the outcome is still pending. The
-// result code says whether anything was sent, and so whether to try again.
-export function compactOutcomeNotice(status: Row["status"], detail?: string, code?: string): CompactCompletionNotice | null {
+// from polling the operation. Null while the outcome is still pending. When
+// nothing was sent the server's reason says what to do before trying again.
+export function compactOutcomeNotice({ status, detail, code }: CompactOutcomeReport): CompactCompletionNotice | null {
   if (status === "completed")
     return { variant: "success", message: "Conversation compacted" };
   if (status === "unknown")
     return { variant: "error", message: "Check the conversation before trying again." };
   if (status === "expired")
-    return { variant: "error", message: "Compaction request expired before it could start." };
-  if (status === "failed" && code === ("failed_before_dispatch" satisfies ResultCode))
-    return { variant: "error", message: "Couldn’t start compaction; nothing was sent. Try again." };
+    return { variant: "error", message: "Compaction request expired before it could start; nothing was sent. Try again." };
+  if (status === "failed" && sentNothing(code))
+    return { variant: "error", message: `Compaction didn’t start; nothing was sent. ${detail ? `${detail}.` : "Try again."}` };
   if (status === "failed")
     return { variant: "error", message: "Couldn’t compact. Check the conversation." };
   if (status === "blocked" && detail)
@@ -34,11 +38,11 @@ export function compactOutcomeNotice(status: Row["status"], detail?: string, cod
 }
 
 export function compactCompletionNotice(
-  tracked: Pick<Row, "operationId" | "status"> & { code?: string } | null | undefined,
+  tracked: CompactOutcomeReport & { operationId: string | null } | null | undefined,
   operationId: string | null
 ): CompactCompletionNotice | null {
   if (!tracked || !operationId || tracked.operationId !== operationId) return null;
-  return compactOutcomeNotice(tracked.status, undefined, tracked.code);
+  return compactOutcomeNotice(tracked);
 }
 
 export const STATUS_GRACE_MS = 10_000;
@@ -67,6 +71,8 @@ export function sessionPresentation(row: Row, settings: Settings, now: number): 
   };
   if (row.status === "unknown")
     return check("Compaction could not be confirmed. Check the conversation before trying again.");
+  if (row.status === "failed" && sentNothing(row.latestOperation?.result?.code))
+    return check("Compaction didn’t start; nothing was sent. You can try again.");
   if (row.status === "failed")
     return check("Compaction failed. Check the conversation before trying again.");
   if (row.status === "busy") {
@@ -79,6 +85,8 @@ export function sessionPresentation(row: Row, settings: Settings, now: number): 
     return on("A new schedule will be checked after the current reply finishes.");
   }
   if (row.status === "blocked") {
+    if (/resume/i.test(row.detail))
+      return check("Paseo restarted this plugin. Send a message to resume the conversation; automatic compaction is scheduled again after the reply.");
     if (/settings/i.test(row.detail))
       return check("Compact settings could not be read. Open Settings to check them.");
     if (/observer/i.test(row.detail))

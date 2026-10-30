@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { bounded, INSPECT_TIMEOUT_MS, SEND_DEADLINE_MS } from "./deadline";
 import type { Settings } from "../shared/settings";
 import { operationPending, operationRowStatus, type CompactTarget, type Row } from "../shared/rpc";
-import { targetOf, unchanged, type Gateway, type Job, type Observation, type State, type StateStore,
+import { SESSION_RESUME_REQUIRED, targetOf, unchanged, type Gateway, type Job, type Observation, type State, type StateStore,
   type StoredOperation } from "./model";
 import { createOperationWorker, recoverOperations, inputFingerprint, mayHaveSent,
   publicOperation, sameActivity, syncJobs } from "./operations";
@@ -138,6 +138,9 @@ export function createScheduler(options: {
       } else if (!gateway.automatic) {
         status = "blocked";
         detail = "A Claude observer is required for automatic compaction";
+      } else if (agent.resumeRequired) {
+        status = "blocked";
+        detail = SESSION_RESUME_REQUIRED;
       } else if (gateway.readiness) {
         const blocked = await bounded(gateway.readiness(
           agent,
@@ -353,6 +356,8 @@ export function createScheduler(options: {
           ? "This conversation is unavailable for compaction"
           : agent.observerUnreadable
           ? "Claude observer status unavailable. Try again"
+          : agent.resumeRequired
+          ? SESSION_RESUME_REQUIRED
           : agent.revision !== revision
           ? "The conversation changed. Refresh and try again"
           : target && !unchanged({ revision, target }, agent)
@@ -441,10 +446,9 @@ export function createScheduler(options: {
             changed = true;
             continue;
           }
-          if (!gateway.automatic) {
+          if (!gateway.automatic || agent.resumeRequired) {
             job.status = "blocked";
-            job.detail =
-              "Claude observer unavailable; nothing sent";
+            job.detail = agent.resumeRequired ? SESSION_RESUME_REQUIRED : "Claude observer unavailable; nothing sent";
             changed = true;
             continue;
           }

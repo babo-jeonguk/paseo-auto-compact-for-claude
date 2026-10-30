@@ -87,6 +87,8 @@ export function createOperationWorker(options: {
   const owner = randomUUID();
   // Outcomes whose terminal write failed; they are written again, never re-earned.
   const outcomes = new Map<string, Ending>();
+  // The last fault of work being retried; reported only if the work expires.
+  const faults = new Map<string, unknown>();
   let running = false, again = false, stopped = false, lastConnected = true;
   let retry: ReturnType<typeof setTimeout> | undefined;
   // Pending work this worker claimed and still holds.
@@ -98,13 +100,23 @@ export function createOperationWorker(options: {
     operation.updatedAt = now();
     delete operation.owner;
   }
+  // Sending must start by sendBy, and automatic work within its delivery window.
+  const expiredUnsent = (operation: StoredOperation) =>
+    now() >= operation.sendBy! || now() > (operation.deliveryExpiresAt ?? Infinity);
   async function finish(id: string, ending: Ending) {
     outcomes.set(id, ending);
-    await update(state => {
+    const finished = await update(state => {
       const operation = state.operations.find(entry => entry.id === id);
-      if (held(operation)) settle(operation, ending);
+      if (!held(operation)) return null;
+      settle(operation, ending);
+      return structuredClone(operation);
     });
     outcomes.delete(id);
+    const fault = faults.get(id);
+    faults.delete(id);
+    if (finished && ending === "expired" && fault !== undefined) onError(fault);
+    if (finished?.evidence?.native && gateway.release)
+      await bounded(gateway.release(finished), INSPECT_TIMEOUT_MS).catch(() => {});
   }
   // A request that arrives during a pass runs another pass right after it, so
   // a new operation never waits for the next tick. Callers do not wait for a
@@ -119,7 +131,7 @@ export function createOperationWorker(options: {
     } finally { running = false; }
   }
   async function pass(connected: boolean) {
-    let claimedId: string | undefined;
+    let claimed: StoredOperation | undefined;
     try {
       const candidate = (await store.read()).operations.find(operationPending);
       if (!candidate) return;
@@ -140,7 +152,7 @@ export function createOperationWorker(options: {
         return structuredClone(current);
       });
       if (!operation) return;
-      claimedId = operation.id;
+      claimed = operation;
       const remembered = outcomes.get(operation.id);
       if (remembered) return await finish(operation.id, remembered);
       if (operation.evidence?.dispatchStartedAt !== undefined) {
@@ -156,8 +168,7 @@ export function createOperationWorker(options: {
       }
       // Sending must start by this time; observation then has its own deadline.
       const sendBy = operation.sendBy!;
-      if (now() >= sendBy || now() > (operation.deliveryExpiresAt ?? Infinity))
-        return await finish(operation.id, "expired");
+      if (expiredUnsent(operation)) return await finish(operation.id, "expired");
       const wait = <T>(work: Promise<T>) => readWithin(work, sendBy, now());
       // Reading nothing is not evidence of change: an unreadable host, observer
       // or setting is thrown as a fault and retried; only a reading that shows a
@@ -176,7 +187,7 @@ export function createOperationWorker(options: {
       if (!agent?.eligible || !agent.idle || !unchanged(operation, agent) ||
           (operation.kind === "automatic" && (!gateway.automatic || !await allowed())))
         return await finish(operation.id,
-          { status: "failed", detail: "Session, activity or policy changed before dispatch; nothing sent" });
+          { status: "failed", detail: "Session, activity or policy changed before dispatch" });
       let observeUntil: number | null = null;
       const execution = {
         id: operation.id, sendBy: sendBy,
@@ -208,39 +219,33 @@ export function createOperationWorker(options: {
     } catch (error) {
       // The one place an error before the dispatch marker is classified. A
       // refusal ends the attempt with nothing sent. A fault keeps the durable
-      // record and is retried until the send deadline, then expires unsent.
-      // Marked work is never retransmitted.
-      if (claimedId && !outcomes.has(claimedId) && !stopped && error instanceof Refusal) {
-        try { return await finish(claimedId, { status: "failed", detail: `Compaction stopped before send: ${error.message}` }); }
-        catch (writeError) { return onError(writeError); }
-      }
-      onError(error);
-      if (claimedId && !outcomes.has(claimedId) && !stopped) {
-        try {
-          const delay = await update(state => {
-            const current = state.operations.find(entry => entry.id === claimedId);
-            if (!held(current) || current.evidence?.dispatchStartedAt !== undefined) return null;
-            if (now() >= (current.sendBy ?? 0) || now() > (current.deliveryExpiresAt ?? Infinity)) {
-              settle(current, "expired");
-              return null;
-            }
-            // Never wait past the send deadline: the expiry is reported on time.
-            const wait = Math.min(1_000 * 2 ** Math.max(0, (current.attempt ?? 1) - 1) + Math.floor(Math.random() * 500),
-              MAX_RETRY_DELAY_MS, current.sendBy! - now());
-            current.state = "requested";
-            current.nextAttemptAt = now() + wait;
-            delete current.owner;
-            current.updatedAt = now();
-            return wait;
-          });
-          // The worker wakes itself for the retry rather than waiting for a tick.
-          if (delay !== null) {
-            clearTimeout(retry);
-            retry = setTimeout(() => { void reconcile(lastConnected).catch(onError); }, delay);
-            retry.unref?.();
-          }
-        } catch (writeError) { onError(writeError); }
-      }
+      // record and is retried until the send deadline, then expires unsent;
+      // only the fault that ends it is reported. Marked work is never resent.
+      if (!claimed || outcomes.has(claimed.id) || stopped) return onError(error);
+      try {
+        if (error instanceof Refusal) return await finish(claimed.id, { status: "failed", detail: error.message });
+        faults.set(claimed.id, error);
+        if (expiredUnsent(claimed)) return await finish(claimed.id, "expired");
+        const id = claimed.id;
+        const delay = await update(state => {
+          const current = state.operations.find(entry => entry.id === id);
+          if (!held(current) || current.evidence?.dispatchStartedAt !== undefined) return null;
+          // Never wait past the send deadline: the expiry is reported on time.
+          const wait = Math.min(1_000 * 2 ** Math.max(0, (current.attempt ?? 1) - 1) + Math.floor(Math.random() * 500),
+            MAX_RETRY_DELAY_MS, current.sendBy! - now());
+          current.state = "requested";
+          current.nextAttemptAt = now() + wait;
+          delete current.owner;
+          current.updatedAt = now();
+          return wait;
+        });
+        // The worker wakes itself for the retry rather than waiting for a tick.
+        if (delay !== null) {
+          clearTimeout(retry);
+          retry = setTimeout(() => { void reconcile(lastConnected).catch(onError); }, delay);
+          retry.unref?.();
+        }
+      } catch (writeError) { onError(writeError); }
     }
   }
   return { reconcile, stop() { stopped = true; clearTimeout(retry); } };

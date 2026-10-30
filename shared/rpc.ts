@@ -40,6 +40,9 @@ export type CompactOperation = z.infer<typeof CompactOperationSchema>;
 export const RESULT_CODES = ["completed", "unknown", "failed_before_dispatch", "failed_after_dispatch",
   "expired_before_dispatch", "legacy_outcome"] as const;
 export type ResultCode = typeof RESULT_CODES[number];
+const SENT_NOTHING: readonly ResultCode[] = ["failed_before_dispatch", "expired_before_dispatch"];
+// Whether a result proves nothing was sent, so trying again is safe.
+export const sentNothing = (code: string | undefined) => SENT_NOTHING.includes(code as ResultCode);
 export const operationPending = (operation: Pick<CompactOperation, "state">) =>
   ["requested", "dispatching", "observing"].includes(operation.state);
 // The two directions between an operation's state and a row/outcome status;

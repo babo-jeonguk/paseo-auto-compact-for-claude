@@ -1043,3 +1043,20 @@ test("a Compact now that cannot be prepared ends within seconds, unsent and retr
   assert.equal((await s.compactNow("a", revision, "request-b")).code, "accepted", "nothing was sent, so it can be tried again");
   s.stop();
 });
+
+test("a session awaiting resume is refused at once and holds its reservation, without a request that would fail later", async () => {
+  const f = fixture(), s = f.make(); await s.ready;
+  await s.observedTurn(f.agents[0]);
+  f.agents[0].resumeRequired = true;
+  const refused = await s.compactNow("a", f.agents[0].revision!, "request-a");
+  assert.equal(refused.status, "blocked");
+  assert.match(refused.detail, /resume/i);
+  assert.equal(refused.operation, null);
+  assert.equal((await s.session("a"))?.status, "blocked");
+  f.advance(55 * 60_000);
+  await s.tick();
+  assert.equal(f.state.jobs[0].status, "blocked");
+  assert.match(f.state.jobs[0].detail, /resume/i);
+  assert.equal(f.state.operations.length, 0);
+  assert.equal(f.calls, 0);
+});

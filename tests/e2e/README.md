@@ -32,7 +32,7 @@ npm run test:e2e -- --paseo 0.13.0 --to <branch, tag or commit>
 
 | Flag | Meaning |
 |---|---|
-| `--paseo` | `0.12.0` or `0.13.0` (default `0.13.0`) |
+| `--paseo` | `0.12.0`, `0.13.0` or `0.14.0` (default `0.13.0`) |
 | `--from` | Release installed first and rolled back to (default `v1.0.2`) |
 | `--to` | Ref under test (default `main`) |
 | `--source` | Plugin Git source (default `git:babo-jeonguk/paseo-auto-compact-for-claude`) |
@@ -50,7 +50,7 @@ Each run writes `report.json` and the daemon logs to `<report-dir>/<platform>-pa
 |---|---|
 | 1 | `--from` installs from GitHub at the expected revision and answers its RPCs |
 | 2 | `--from` records a real reservation, a conversation OFF and a completed Compact now in state v1 |
-| 3 | Update to `--to` at the expected revision: the state stays version 1 with operation history added, keeps OFF and the reservation time, turns the earlier compaction into a queryable `legacy` operation, and a new Compact now of the same activity sends nothing; then Compact now of a fresh activity on `--to` compacts once |
+| 3 | Update to `--to` at the expected revision: the state stays version 1 with operation history added, keeps OFF and the reservation time, turns the earlier compaction into a queryable `legacy` operation, and a new Compact now of the same activity sends nothing; then Compact now of a fresh activity on `--to` compacts once. On Paseo 0.14 the reservation is instead held as `blocked` until an ordinary message resumes the session, which then earns a new reservation |
 | 4 | All native simulation scenarios (`tests/simulation/scenarios.mjs`) against the updated install |
 | 5 | Rollback to `--from` reads the state, keeps OFF, shows both compacted activities as completed, so its timer will not repeat them, and sends nothing |
 | 6 | Update to `--to` again keeps OFF and turns the history `--from` dropped back into `legacy` operations that still guard their activities, without replay |

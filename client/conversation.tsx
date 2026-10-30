@@ -168,7 +168,8 @@ export function ConversationControls({
           toast.show("Compaction requested");
         } else {
           setCompactOperationId(null);
-          const notice = compactOutcomeNotice(result.status, result.detail, result.operation?.result?.code) ??
+          const notice = compactOutcomeNotice({ status: result.status, detail: result.detail,
+            code: result.operation?.result?.code }) ??
             { variant: "error", message: "Couldn’t compact. Check the conversation." };
           if (notice.variant === "success") toast.show(notice.message, { variant: "success" });
           else toast.error(notice.message);
@@ -190,6 +191,7 @@ export function ConversationControls({
     const notice = compactCompletionNotice(operation ? {
       operationId: operation.id,
       status: operationRowStatus(operation),
+      detail: operation.result?.message,
       code: operation.result?.code,
     } : null, compactOperationId);
     if (!notice) return;

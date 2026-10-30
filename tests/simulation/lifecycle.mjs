@@ -30,21 +30,21 @@ try {
  const before = model.count, operationId = randomUUID();
  assert.equal((await lifecycleFixture.client.reloadPlugin('auto-compact-for-claude')).status,'running');
  const afterReload = await lifecycleFixture.ledger(id);
- const accepted = await lifecycleFixture.rpc('now',{agentId:id, revision:beforeRow.revision, target:beforeRow.target, operationId});
- assert.equal(accepted.status, 'running');
- const blocked = await waitFor(async () => { const op = (await lifecycleFixture.rpc('operation',{operationId})).operation; return op?.state === 'failed' ? op : null; }, 'reload operation fails before dispatch');
+ // The plugin sees the session must resume, so it refuses the request instead of accepting it.
+ const blocked = await lifecycleFixture.rpc('now',{agentId:id, revision:beforeRow.revision, target:beforeRow.target, operationId});
+ assert.equal(blocked.status, 'blocked'); assert.equal(blocked.operation, null);
  const timeline = await lifecycleFixture.timeline(id);
  let receipt = null; try { receipt = await lifecycleFixture.receipt(id, operationId); } catch {}
  const unchanged = await lifecycleFixture.ledger(id);
  console.log('reload refused', JSON.stringify({old,afterReload,unchanged,session,requestDelta:model.count-before,blocked,receipt,timeline}));
- assert.match(JSON.stringify(blocked.result), /Session must resume after plugin reload; send a message before compacting/);
+ assert.match(blocked.detail, /Session must resume after plugin reload; send a message before compacting/);
  assert.equal(model.count,before); assert.equal(receipt,null);
  assert.equal(timeline.filter(e=>e.item.type==='user_message' && e.item.clientMessageId===operationId).length,0);
  assert.equal(timeline.filter(e=>e.item.type==='compaction').length,0);
  assert.equal(unchanged.launchId,old.launchId); assert.equal(unchanged.generation,old.generation);
  assert.equal((await lifecycleFixture.refresh(id)).persistence.sessionId,session);
  const duplicate = await lifecycleFixture.rpc('now',{agentId:id, revision:beforeRow.revision, target:beforeRow.target, operationId});
- assert.equal(duplicate.operation.state,'failed'); assert.equal(model.count,before);
+ assert.equal(duplicate.status,'blocked'); assert.equal(model.count,before);
  await lifecycleFixture.turn(id,'AFTER_RELOAD: reply without tools.');
  const fresh = await scheduled(id), reopened = await lifecycleFixture.ledger(id);
  assert.notEqual(reopened.launchId,old.launchId); assert.notEqual(reopened.generation,old.generation);

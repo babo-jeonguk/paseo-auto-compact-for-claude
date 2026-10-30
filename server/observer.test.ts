@@ -46,9 +46,11 @@ test('observer session preparation preserves provider environment and ignores hi
     assert.equal(f.prepared.env.OTHER, 'preserved');
     assert.equal((f.prepared as typeof f.request).title, 'Conversation');
     assert.deepEqual((f.prepared as typeof f.request).labels, { retained: 'yes' });
-    assert.equal(await f.observer.ownsCurrentLaunch('a'), true);
-    assert.equal(await createObserver({ home: f.home, now: () => 1_000_000 }).ownsCurrentLaunch('a'), false);
-    assert.equal(await f.observer.ownsCurrentLaunch('missing'), null);
+    const launch = (await f.observer.read('a'))!.ledger.launchId;
+    assert.equal(f.observer.startedHere('a', launch), true);
+    assert.equal(createObserver({ home: f.home, now: () => 1_000_000 }).startedHere('a', launch), false,
+      'a later plugin instance did not start this launch');
+    assert.equal(f.observer.startedHere('missing', launch), false);
     assert(f.prepared.env.CLAUDE_CODE_PLUGIN_DIRS.startsWith('/existing' + delimiter));
     assert.equal(await f.observer.prepareSession(f.request, false), f.request);
     const history = { ...f.request, purpose: 'history' as const };

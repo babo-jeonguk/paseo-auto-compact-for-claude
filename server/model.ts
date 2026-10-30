@@ -20,7 +20,12 @@ export interface Observation {
   cache?: CacheWindow | null;
   // The observer exists but could not be read just now (see observer.read).
   observerUnreadable?: boolean;
+  // The host reopens this session before its next prompt, because a plugin
+  // instance before this one started its observer (Paseo 0.14). Until an
+  // ordinary message has done that, nothing is compacted there.
+  resumeRequired?: boolean;
 }
+export const SESSION_RESUME_REQUIRED = "Session must resume after plugin reload; send a message before compacting";
 // Schemas are the one definition of stored records; the store validates with
 // them and the types below are inferred from them.
 export const JobSchema = z.object({
@@ -124,4 +129,6 @@ export interface Gateway {
     execution?: ExecutionContext
   ) => Promise<CompactOutcome>;
   inspect?: (operation: StoredOperation) => Promise<CompactOutcome | null>;
+  /** Retire a finished operation's native request; best effort. */
+  release?: (operation: StoredOperation) => Promise<void>;
 }
