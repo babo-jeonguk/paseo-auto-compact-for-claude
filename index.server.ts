@@ -4,6 +4,7 @@ import { createScheduler } from "./server/scheduler";
 import { bounded, INSPECT_TIMEOUT_MS } from "./server/deadline";
 import { createStore } from "./server/store";
 import { createObserver } from "./server/observer";
+import { createReporter } from "./server/report";
 import { claudeProvider } from "./shared/providers";
 import {
   compactRpc,
@@ -20,14 +21,10 @@ export default function contribute(server: PluginServerContext) {
   const settings = server.registerSettings(compactSettings);
   const observer = createObserver();
   const host = createGateway({ observer });
-  // Paseo closes this plugin's API just before calling the cleanup below, so work in
-  // flight then fails with a closed client. Everything after cleanup starts is such
-  // cut-off work: its durable state recovers on next start, and a defect in that
-  // work would also be reported outside shutdown.
-  let disposed = false;
-  const report = (error: unknown) => {
-    if (!disposed) console.error("[auto-compact-for-claude]", String(error));
-  };
+  // Work cut off by shutdown recovers from durable state on next start; see
+  // server/report.ts for how its errors are told apart from real ones.
+  const reporter = createReporter(message => console.error("[auto-compact-for-claude]", message));
+  const report = reporter.report;
   const scheduler = createScheduler({
     store: createStore(),
     gateway: host.gateway,
@@ -141,7 +138,7 @@ export default function contribute(server: PluginServerContext) {
     void observe().catch(report);
   }, 10_000);
   return () => {
-    disposed = true;
+    reporter.dispose();
     clearInterval(timer);
     scheduler.stop();
     host.stop();
