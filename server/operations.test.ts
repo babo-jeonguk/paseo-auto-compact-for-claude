@@ -2,14 +2,14 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createOperationWorker, recoverOperations } from "./operations";
 import { DEFAULT_SETTINGS, type Settings } from "../shared/settings";
-import type { CompactOutcome, Gateway, Observation, State } from "./model";
+import { Refusal, type CompactOutcome, type Gateway, type Observation, type State } from "./model";
 
 function fixture() {
   let time = 1000;
   let state: State = { version: 1, disabled: [], jobs: [], operations: [{
     id: "operation-a", agentId: "a", revision: "rev", target: { sessionId: "native", activityKey: "activity" },
     kind: "manual", state: "requested", createdAt: time, updatedAt: time, result: null,
-    inputFingerprint: "fingerprint", deadlineAt: time + 180_000, attempt: 0,
+    inputFingerprint: "fingerprint", sendBy: time + 180_000, attempt: 0,
   }] };
   let sends = 0, writesFail = false;
   const errors: unknown[] = [];
@@ -52,11 +52,11 @@ function fixture() {
 
 test("durable requested work is dispatched after restart with the original identity", async () => {
   const f = fixture(); f.recover();
-  const deadline = f.operation.deadlineAt;
+  const deadline = f.operation.sendBy;
   await f.make().reconcile();
   assert.equal(f.sends, 1);
   assert.equal(f.operation.state, "succeeded");
-  assert.equal(f.operation.deadlineAt, deadline);
+  assert.equal(f.operation.sendBy, deadline);
 });
 
 test("dispatch marker recovery observes without resending and uses matching evidence", async () => {
@@ -119,20 +119,45 @@ test("terminal persistence is retried in process and from evidence after restart
   }
 });
 
-test("pre-dispatch inspection failures use bounded attempts and persisted backoff", async () => {
+test("faults before the dispatch marker are retried with persisted backoff until the send deadline, then expire unsent", async () => {
   const f = fixture(), worker = f.make();
   f.gateway.refresh = async () => { throw new Error("disconnected"); };
   await worker.reconcile();
   assert.equal(f.operation.state, "requested");
   assert.equal(f.operation.attempt, 1);
   await worker.reconcile();
-  assert.equal(f.operation.attempt, 1);
-  f.advance(2000); await worker.reconcile();
-  assert.equal(f.operation.attempt, 2);
-  f.advance(4000); await worker.reconcile();
-  assert.equal(f.operation.state, "failed");
-  assert.equal(f.operation.result?.code, "pre_dispatch_retries_exhausted");
+  assert.equal(f.operation.attempt, 1, "the backoff is persisted");
+  while (f.operation.state === "requested") { f.advance(30_500); await worker.reconcile(); }
+  assert.equal(f.operation.state, "expired");
+  assert.equal(f.operation.result?.code, "expired_before_dispatch");
+  assert.ok(f.operation.attempt! > 3, "the send deadline, not a count, bounds the retries");
   assert.equal(f.sends, 0);
+  worker.stop();
+});
+
+test("a fault that clears before the send deadline still sends, however many attempts it took", async () => {
+  const f = fixture(), worker = f.make();
+  const refresh = f.gateway.refresh;
+  let faults = 6;
+  f.gateway.refresh = async id => { if (faults-- > 0) throw new Error("Claude observer could not be read"); return refresh(id); };
+  while (f.operation.state === "requested") { f.advance(20_000); await worker.reconcile(); }
+  assert.equal(f.operation.state, "succeeded");
+  assert.equal(f.sends, 1);
+  worker.stop();
+});
+
+test("the worker wakes itself for a retry instead of waiting for the next tick", async () => {
+  const f = fixture(), worker = f.make();
+  const compact = f.gateway.compact;
+  f.gateway.compact = async () => { throw new Error("observer preparation timed out"); };
+  await worker.reconcile();
+  assert.equal(f.operation.state, "requested");
+  f.gateway.compact = compact;
+  f.advance(2000);
+  const state = () => f.operation.state;
+  for (let i = 0; i < 40 && state() !== "succeeded"; i++) await new Promise(resolve => setTimeout(resolve, 50));
+  assert.equal(state(), "succeeded");
+  worker.stop();
 });
 
 test("a gateway fault before the dispatch marker is retried; nothing is sent until it passes", async () => {
@@ -150,12 +175,16 @@ test("a gateway fault before the dispatch marker is retried; nothing is sent unt
 });
 
 test("a refusal ends the attempt without retry and records that nothing was sent", async () => {
-  const f = fixture(), worker = f.make();
-  f.gateway.compact = async () => ({ status: "failed", detail: "Claude is still working" });
-  await worker.reconcile();
-  assert.equal(f.operation.state, "failed");
-  assert.equal(f.operation.result?.code, "failed_before_dispatch");
-  assert.equal(f.operation.evidence?.dispatchStartedAt, undefined);
+  for (const reason of ["Claude is still working", "Compaction already running for this conversation"]) {
+    const f = fixture(), worker = f.make();
+    f.gateway.compact = async () => { throw new Refusal(reason); };
+    await worker.reconcile();
+    assert.equal(f.operation.state, "failed", reason);
+    assert.equal(f.operation.result?.code, "failed_before_dispatch", reason);
+    assert.match(f.operation.result!.message, new RegExp(reason), reason);
+    assert.equal(f.operation.evidence?.dispatchStartedAt, undefined, reason);
+    assert.equal(f.errors.length, 0, "a refusal is not reported as a fault");
+  }
 });
 
 test("a failure after the dispatch marker is recorded as sent", async () => {
@@ -196,13 +225,14 @@ test("stopped workers cannot publish late results over recovered operations", as
   assert.equal(f.operation.state, "failed");
 });
 
-test("crashes cannot reset the pre-dispatch attempt budget", async () => {
+test("restarts cannot extend the send deadline", async () => {
   const f = fixture();
   f.operation.state = "dispatching";
-  f.operation.attempt = 3;
+  f.operation.attempt = 7;
+  f.advance(180_000);
   f.recover();
   await f.make().reconcile();
-  assert.equal(f.operation.state, "failed");
+  assert.equal(f.operation.state, "expired");
   assert.equal(f.sends, 0);
 });
 
@@ -218,7 +248,7 @@ test("checkpointed evidence can finish recovery before host attachment", async (
 
 test("a send late in its window is observed for the full time from the dispatch marker", async () => {
   const f = fixture();
-  f.operation.deadlineAt = 1000 + 10_000; // e.g. the end of an automatic delivery window
+  f.operation.sendBy = 1000 + 10_000; // e.g. the end of an automatic delivery window
   f.gateway.compact = async (_id, _expected, execution) => {
     f.advance(9_000);
     await execution!.checkpoint({ dispatchStartedAt: 10_000 });

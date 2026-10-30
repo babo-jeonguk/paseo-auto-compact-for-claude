@@ -120,6 +120,13 @@ test("a Compact now reply and a polled operation use the same wording", () => {
   for (const status of ["completed", "unknown", "expired", "failed"])
     assert.deepEqual(compactOutcomeNotice(status),
       compactCompletionNotice({ operationId: "operation-a", status }, "operation-a"), status);
+  // The result code says whether trying again is safe.
+  assert.deepEqual(compactOutcomeNotice("failed", undefined, "failed_before_dispatch"),
+    compactCompletionNotice({ operationId: "operation-a", status: "failed", code: "failed_before_dispatch" }, "operation-a"));
+  assert.deepEqual(compactOutcomeNotice("failed", undefined, "failed_before_dispatch"),
+    { variant: "error", message: "Couldn’t start compaction; nothing was sent. Try again." });
+  assert.deepEqual(compactOutcomeNotice("failed", undefined, "failed_after_dispatch"),
+    { variant: "error", message: "Couldn’t compact. Check the conversation." });
   assert.deepEqual(compactOutcomeNotice("expired"),
     { variant: "error", message: "Compaction request expired before it could start." });
   assert.deepEqual(compactOutcomeNotice("blocked", "The conversation is busy. Wait until it finishes"),

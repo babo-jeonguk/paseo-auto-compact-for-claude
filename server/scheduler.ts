@@ -9,7 +9,6 @@ import { createOperationWorker, recoverOperations, inputFingerprint, mayHaveSent
 import { automaticBlock, dueAt, DELIVERY_WINDOW_MS } from "./policy";
 import { HISTORY_RETENTION_MS, HISTORY_SWEEP_INTERVAL_MS, pruneOperationHistory, type OperationReceipts } from "./retention";
 
-export { DELIVERY_WINDOW_MS } from "./policy";
 const jobTarget = (job: Job): CompactTarget => ({ sessionId: job.sessionId ?? null, activityKey: job.activityKey ?? null });
 const terminal = (job: Job) =>
   ["expired", "skipped", "completed", "failed", "unknown"].includes(job.status);
@@ -23,14 +22,19 @@ export function createScheduler(options: {
   receipts?: OperationReceipts;
 }) {
   const { gateway } = options;
+  let stopped = false;
   // Every write passes through syncJobs, the only writer of jobs' attempt fields.
-  const store: StateStore = { read: () => options.store.read(), write: state => options.store.write(syncJobs(state)) };
+  // A stopped scheduler cannot write: it would put back state that a newer
+  // instance has replaced since this one read it.
+  const store: StateStore = { read: () => options.store.read(), write: async state => {
+    if (stopped) throw new Error("Plugin stopped");
+    await options.store.write(syncJobs(state));
+  } };
   const settings = () => bounded(options.settings(), INSPECT_TIMEOUT_MS);
   const refresh = (id: string) => bounded(gateway.refresh(id), INSPECT_TIMEOUT_MS);
   const now = options.now ?? Date.now;
   const onError = options.onError ?? (() => {});
   let tail: Promise<unknown> = Promise.resolve();
-  let stopped = false;
   let nextCleanupAt = -Infinity;
   const serialize = <T>(fn: () => Promise<T>): Promise<T> => {
     const result = tail.then(fn);
@@ -78,10 +82,11 @@ export function createScheduler(options: {
     } catch (error) { onError(error); }
   }
   const worker = createOperationWorker({ store, gateway, settings, now, onError,
+    // A transaction that changes nothing writes nothing.
     update: change => serialize(async () => {
-      const state = await store.read();
+      const state = await store.read(), before = JSON.stringify(state);
       const result = change(state);
-      await store.write(state);
+      if (JSON.stringify(state) !== before) await store.write(state);
       return result;
     }),
   });
@@ -188,7 +193,7 @@ export function createScheduler(options: {
     return { id, agentId: job.agentId, revision: job.revision, kind,
       target: targetOf(agent),
       inputFingerprint: fingerprint, state: "requested", createdAt: now(), updatedAt: now(), result: null,
-      deadlineAt: now() + SEND_DEADLINE_MS, reservationEndedAt: job.endedAt, attempt: 0 };
+      sendBy: now() + SEND_DEADLINE_MS, reservationEndedAt: job.endedAt, attempt: 0 };
   }
   const existingResult = (operation: StoredOperation) => ({
     status: operationRowStatus(operation), detail: operation.result?.message ?? "Compaction requested",
@@ -451,15 +456,18 @@ export function createScheduler(options: {
             continue;
           }
           // Settings can change while native observation/host refresh awaits I/O.
+          // Unreadable settings are not a change either: keep the reservation.
           const latest = await settings();
-          const block = latest ? policy(latest, agent) : null;
+          if (stopped) return;
+          if (!latest) continue;
+          const block = policy(latest, agent);
           if (block === "late") {
             job.status = "expired";
             job.detail = "Delivery window passed during inspection";
             changed = true;
             continue;
           }
-          if (stopped || !latest || block) {
+          if (block) {
             job.status = "blocked";
             job.detail =
               "Automation policy or idle delay changed before dispatch";
@@ -476,7 +484,7 @@ export function createScheduler(options: {
           const operation = newOperation(job, agent, "automatic");
           // The delivery window limits when sending may start, not how long it is observed.
           operation.deliveryExpiresAt = dueAt(job.endedAt, latest) + DELIVERY_WINDOW_MS;
-          operation.deadlineAt = Math.min(operation.deadlineAt!, operation.deliveryExpiresAt);
+          operation.sendBy = Math.min(operation.sendBy!, operation.deliveryExpiresAt);
           await reserve(job, state, operation);
           // One operation per tick, host-wide serialization across all sessions.
           return { job, agent };

@@ -280,7 +280,7 @@ export const scenarios = [
       const pendingState = JSON.parse(await readFile(statePath, 'utf8'));
       const pendingId = randomUUID(), future = Date.now() + 60 * 60_000;
       pendingState.operations.push({ ...structuredClone(old), id: pendingId, agentId: 'retention-pending-fixture',
-        state: 'requested', result: null, deadlineAt: future, nextAttemptAt: future });
+        state: 'requested', result: null, sendBy: future, nextAttemptAt: future });
       await mkdir(join(receiptPath('retention-pending-fixture', pendingId), '..'), { recursive: true });
       await writeFile(receiptPath('retention-pending-fixture', pendingId), JSON.stringify({ ...receipt, id: pendingId }));
       await writeFile(statePath, JSON.stringify(pendingState));

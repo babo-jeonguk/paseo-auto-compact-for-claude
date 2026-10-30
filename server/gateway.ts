@@ -3,7 +3,8 @@ import { randomUUID } from "node:crypto";
 import { Refusal, readable, targetOf, unchanged, type Gateway, type Observation, type DispatchGuard, type ExecutionContext,
   type OperationEvidence } from "./model";
 import type { createObserver } from "./observer";
-import { bounded, deadlineOf, inspect, SEND_DEADLINE_MS } from "./deadline";
+import { bounded, CLEANUP_TIMEOUT_MS, deadlineOf, LIVE_OBSERVATION_MS, observationEndBy, readWithin, SEND_DEADLINE_MS,
+  SEND_TIMEOUT_MS } from "./deadline";
 import { claudeProvider } from "../shared/providers";
 export { claudeProvider } from "../shared/providers";
 
@@ -113,10 +114,11 @@ export function createGateway(options: {
     // `timeoutMs` is the live-observation budget only. Until the dispatch marker
     // the send deadline applies; after it a fresh observation budget, so a late
     // send is still observed in full.
-    const live = options.timeoutMs ?? 120_000;
-    let deadline = execution?.deadlineAt ?? now() + SEND_DEADLINE_MS;
+    const live = options.timeoutMs ?? LIVE_OBSERVATION_MS;
+    const sendBy = execution?.sendBy ?? now() + SEND_DEADLINE_MS;
+    let deadline = sendBy;
     const wait = <T>(work: Promise<T>) => bounded(work, deadline - now());
-    const read = <T>(work: Promise<T>) => inspect(work, deadline, now());
+    const read = <T>(work: Promise<T>) => readWithin(work, deadline, now());
     const currentWorker = () => !stopped && (execution?.current() ?? true) && now() < deadline;
     const ref = requireApi().agents.ref(agentId);
     busy.add(agentId);
@@ -142,14 +144,16 @@ export function createGateway(options: {
       const before = readable(await read(gateway.refresh(agentId)));
       if (!before?.sessionId || !before.idle || !before.eligible ||
           (expected && !unchanged({ revision: expected.revision, target: targetOf(expected) }, before)))
-        return { status: "failed", detail: "Claude session unavailable, busy or changed" };
-      const expiresAt = Math.min(guard?.expiresAt ?? Infinity, deadline);
+        throw new Refusal("Claude session unavailable, busy or changed");
+      // Both bound only when sending may start. Claude admits the compaction
+      // for as long as it can still be observed.
+      const startBy = Math.min(guard?.expiresAt ?? Infinity, sendBy);
       if (observer) {
-        operation = await read(observer.prepare(before, automatic, expiresAt, id));
+        operation = await read(observer.prepare(before, automatic, observationEndBy(sendBy), id));
         const { launchId, generation, sessionId, revision } = operation;
         evidence.native = { id, launchId, generation, sessionId, revision };
         await checkpoint(true);
-      } else if (automatic) return { status: "failed", detail: "Claude observer unavailable" };
+      } else if (automatic) throw new Refusal("Claude observer unavailable");
       pending.set(agentId, entry);
       completions.set(agentId, event => { if (armed && event.turnId) endings.set(event.turnId, event); });
       subscription = ref.timeline.subscribe(({ event }) => {
@@ -164,10 +168,11 @@ export function createGateway(options: {
       });
       await read(subscription.ready);
       const current = readable(await read(gateway.refresh(agentId)));
-      if (!currentWorker() || cancelled || !current?.idle ||
-          !unchanged({ revision: before.revision, target: targetOf(before) }, current) ||
-          now() > expiresAt || (guard && !await read(guard.allowed())))
-        return { status: "failed", detail: "Reservation cancelled or session changed before send" };
+      // Running out of time or being stopped is not a reading of the session.
+      if (!currentWorker() || cancelled || now() > startBy) throw new Error("Send deadline passed or worker stopped before send");
+      if (!current?.idle || !unchanged({ revision: before.revision, target: targetOf(before) }, current) ||
+          (guard && !await read(guard.allowed())))
+        throw new Refusal("Reservation cancelled or session changed before send");
       // Durable marker must precede the external side effect. Recovery never
       // resends once this marker exists, even if a crash preceded ref.send.
       evidence.dispatchStartedAt = now();
@@ -180,7 +185,7 @@ export function createGateway(options: {
       const send = ref.send("/compact", { messageId: id });
       // A rejection/timeout may still mean delivery. Inspect evidence until the
       // original deadline; late send rejection is consumed by bounded().
-      await bounded(send, Math.min(options.dispatchTimeoutMs ?? 30_000, deadline - now())).catch(() => {});
+      await bounded(send, Math.min(options.dispatchTimeoutMs ?? SEND_TIMEOUT_MS, deadline - now())).catch(() => {});
       while (currentWorker() && !cancelled) {
         await checkpoint();
         if (!healthy || superseded) return { status: "unknown", detail: "Conversation changed during compaction; no automatic retry" };
@@ -204,16 +209,15 @@ export function createGateway(options: {
       return { status: "unknown", detail: "Compaction completion unconfirmed; no automatic retry" };
     } catch (error) {
       if (sent) return { status: "unknown", detail: "Compaction completion unconfirmed; no automatic retry" };
-      // Retrying is the worker's decision; report a fault rather than an outcome.
-      if (!(error instanceof Refusal)) throw error;
-      return { status: "failed", detail: `Compaction stopped before send: ${error.message}` };
+      // Before sending, refusals and faults alike are the worker's to classify.
+      throw error;
     } finally {
       armed = false;
       if (pending.get(agentId) === entry) {
         completions.delete(agentId);
         pending.delete(agentId);
       }
-      const cleanupMs = options.cleanupTimeoutMs ?? 1_000;
+      const cleanupMs = options.cleanupTimeoutMs ?? CLEANUP_TIMEOUT_MS;
       await Promise.all([
         operation ? bounded(observer!.cancel(operation, sent), cleanupMs).catch(() => {}) : undefined,
         subscription ? bounded(Promise.resolve(subscription.release()), cleanupMs).catch(() => {}) : undefined,

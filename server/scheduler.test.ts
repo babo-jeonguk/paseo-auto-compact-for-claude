@@ -5,7 +5,8 @@ import {
   SettingsSchema,
   type Settings,
 } from "../shared/settings";
-import { createScheduler, DELIVERY_WINDOW_MS } from "./scheduler";
+import { createScheduler } from "./scheduler";
+import { DELIVERY_WINDOW_MS } from "./policy";
 import type { Gateway, Observation, State, StateStore } from "./model";
 
 function fixture(automatic = true) {
@@ -989,4 +990,35 @@ test("a Compact now request arriving during a worker pass starts without waiting
   await pass;
   await waitForStatus(f, "completed");
   assert.equal(f.calls, 1, "sent by the follow-up pass, with no tick");
+});
+
+test("unreadable settings during inspection keep an automatic reservation instead of reporting a change", async () => {
+  const f = fixture(), s = f.make(); await s.ready;
+  await s.observedTurn(f.agents[0]);
+  f.advance(55 * 60_000);
+  f.gateway.readiness = async () => { f.config = null; return null; };
+  await s.tick();
+  assert.equal(f.state.jobs[0].status, "scheduled");
+  assert.equal(f.calls, 0);
+  f.gateway.readiness = async () => null;
+  f.config = { ...DEFAULT_SETTINGS };
+  await s.tick();
+  await waitForStatus(f, "completed");
+  assert.equal(f.calls, 1);
+});
+
+test("a scheduler stopped mid-request cannot put back state a newer instance replaced", async () => {
+  const f = fixture(), first = f.make(); await first.ready;
+  const refresh = f.gateway.refresh;
+  let release!: () => void;
+  f.gateway.refresh = async id => { await new Promise<void>(resolve => { release = resolve; }); return refresh(id); };
+  const stale = first.compactNow("a", f.agents[0].revision!, "request-old");
+  while (!release) await new Promise<void>(resolve => setImmediate(resolve));
+  first.stop();
+  f.gateway.refresh = refresh;
+  const second = f.make(); await second.ready;
+  await second.compactNow("a", f.agents[0].revision!, "request-new");
+  release();
+  await assert.rejects(stale, /Plugin stopped/);
+  assert.deepEqual(f.state.operations.map(operation => operation.id), ["request-new"]);
 });

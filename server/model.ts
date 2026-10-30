@@ -49,14 +49,16 @@ export const OperationEvidenceSchema = z.object({
 export type OperationEvidence = z.infer<typeof OperationEvidenceSchema>;
 export interface ExecutionContext {
   id: string;
-  deadlineAt: number;
+  // The dispatch marker must be written by this time (see deadline.ts).
+  sendBy: number;
   checkpoint(evidence: OperationEvidence): Promise<void>;
   current(): boolean;
 }
 // "failed" never says whether anything was sent; the persisted dispatch marker does.
 export type CompactOutcome = { status: "completed" | "failed" | "unknown"; detail: string };
 // A condition that makes sending wrong, not a fault: the attempt ends without
-// retry. Any other error before the dispatch marker is retried within budget.
+// retry. Any other error before the dispatch marker is a fault, retried until
+// the send deadline. The worker alone makes this distinction.
 export class Refusal extends Error {}
 
 // Displays may show an unreadable observer as none; dispatch must not act on
@@ -77,7 +79,7 @@ export const StoredOperationSchema = CompactOperationSchema.extend({
   // Canonical caller input; null identifies legacy records with no request token contract.
   inputFingerprint: z.string().nullable(),
   // The dispatch marker must be written by this time (see deadline.ts).
-  deadlineAt: z.number().finite().optional(),
+  sendBy: z.number().finite().optional(),
   deliveryExpiresAt: z.number().finite().optional(),
   reservationEndedAt: z.number().finite().optional(),
   attempt: z.number().int().nonnegative().optional(),
@@ -103,6 +105,9 @@ export interface DispatchGuard {
   expiresAt: number;
   allowed(): Promise<boolean>;
 }
+// `compact` and `automatic` return an outcome only once the dispatch marker is
+// written. Before it they throw: a Refusal when a reading shows sending would be
+// wrong, anything else when it could not be checked.
 export interface Gateway {
   list(): Promise<Observation[]>;
   refresh(agentId: string): Promise<Observation | null>;

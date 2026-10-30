@@ -176,21 +176,44 @@ test('last-moment off policy and expired delivery prevent public send', async ()
     { expiresAt: 0, allowed: async () => true },
   ]) {
     const host = fixture([], undefined, false, [], { observer: observer(null) });
-    assert.equal((await host.gateway.automatic!((await host.gateway.refresh('a'))!, guard)).status, 'failed');
+    // Policy off is a reading; running out of time is not.
+    await assert.rejects(host.gateway.automatic!((await host.gateway.refresh('a'))!, guard),
+      guard.expiresAt ? Refusal : /Send deadline passed/);
     assert.equal(host.sendCount(), 0);
   }
 });
 
-test('an observer refusal is a failed outcome; any other error before sending is thrown', async () => {
-  for (const [error, refused] of [[new Refusal('Claude is still working'), true], [new Error('EIO'), false]] as const) {
+test('before sending, a refusal and any other error are both thrown for the worker to classify', async () => {
+  for (const error of [new Refusal('Claude is still working'), new Error('EIO')]) {
     const native = observer(null)!;
     native.prepare = async () => { throw error; };
     const host = fixture([], undefined, false, [], { observer: native });
     const agent = (await host.gateway.refresh('a'))!;
-    if (refused) assert.equal((await host.gateway.compact('a', agent)).status, 'failed');
-    else await assert.rejects(host.gateway.compact('a', agent), /EIO/);
+    await assert.rejects(host.gateway.compact('a', agent), error);
     assert.equal(host.sendCount(), 0);
   }
+});
+
+test('a second call for a conversation already compacting is a refusal', async () => {
+  const host = fixture([{ type: "compaction", status: "completed", trigger: "manual" }]);
+  const first = host.gateway.compact('a');
+  await assert.rejects(host.gateway.compact('a'), (error: unknown) =>
+    error instanceof Refusal && /already running/.test(error.message));
+  assert.equal((await first).status, 'completed');
+  assert.equal(host.sendCount(), 1);
+});
+
+test('Claude admits the compaction for as long as it can be observed, not only until sending must start', async () => {
+  const native = observer(null)!;
+  const prepare = native.prepare;
+  let admitted = 0;
+  native.prepare = async (agent, cache, expiresAt, id) => { admitted = expiresAt; return prepare(agent, cache, expiresAt, id); };
+  const host = fixture([], undefined, false, [], { observer: native });
+  const sendBy = Date.now() + 1_000;
+  await host.gateway.automatic!((await host.gateway.refresh('a'))!, { expiresAt: Date.now() + 500, allowed: async () => true },
+    { id: 'late-admission', sendBy, checkpoint: async () => {}, current: () => true });
+  assert.equal(admitted, sendBy + OBSERVATION_MS);
+  assert.equal(host.sendCount(), 1);
 });
 
 test('a send that starts just before its deadline is still observed in full', async () => {
@@ -201,7 +224,7 @@ test('a send that starts just before its deadline is still observed in full', as
   // The boundary arrives after the send deadline has passed.
   host.ref.send = async (text, options) => { await new Promise(resolve => setTimeout(resolve, 80)); return send(text, options); };
   const result = await host.gateway.compact("a", undefined, {
-    id: "late-request", deadlineAt: Date.now() + 40, checkpoint: async () => {}, current: () => true,
+    id: "late-request", sendBy: Date.now() + 40, checkpoint: async () => {}, current: () => true,
   });
   assert.equal(result.status, "completed");
   assert.equal(host.sendCount(), 1);
@@ -232,7 +255,7 @@ test('idle pending input is distinguished from an active reply without allowing 
   assert.equal(stuck.idle, false);
   assert.equal(stuck.busyReason, 'input');
   assert.equal(stuck.inputIdleSince, 1000);
-  assert.equal((await host.gateway.automatic!(stuck)).status, 'failed');
+  await assert.rejects(host.gateway.automatic!(stuck), Refusal);
   assert.equal(host.sendCount(), 0);
   activeTurns = ['ordinary-reply'];
   assert.equal((await host.gateway.refresh('a'))!.inputIdleSince, null);
@@ -262,7 +285,7 @@ test("every external gateway wait is bounded, including send and release", async
     }
     // A wait that expires before sending is a fault for the worker to retry.
     if (stalled === "subscribe" || stalled === "refresh") {
-      await assert.rejects(bounded(host.gateway.compact("a", undefined, { id: "stalled", deadlineAt: Date.now() + 50,
+      await assert.rejects(bounded(host.gateway.compact("a", undefined, { id: "stalled", sendBy: Date.now() + 50,
         checkpoint: async () => {}, current: () => true }), 2_000), /deadline/i, stalled);
       assert.equal(host.sendCount(), 0, stalled);
       continue;
@@ -284,7 +307,7 @@ test("stable identity and durable send marker precede provider dispatch", async 
     return send(text, options);
   };
   const result = await host.gateway.compact("a", undefined, {
-    id: "caller-request", deadlineAt: Date.now() + 1000,
+    id: "caller-request", sendBy: Date.now() + 1000,
     checkpoint: async evidence => { checkpoints.push(evidence); }, current: () => true,
   });
   assert.equal(result.status, "completed");
@@ -296,7 +319,7 @@ test("failed marker persistence never sends and late send rejection is consumed"
   const host = fixture([]);
   // A fault before sending is the worker's to retry, so it is thrown, not an outcome.
   await assert.rejects(host.gateway.compact("a", undefined, {
-    id: "caller-request", deadlineAt: Date.now() + 1000,
+    id: "caller-request", sendBy: Date.now() + 1000,
     checkpoint: async () => { throw new Error("disk full"); }, current: () => true,
   }), /disk full/);
   assert.equal(host.sendCount(), 0);

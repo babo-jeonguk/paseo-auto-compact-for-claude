@@ -30,9 +30,16 @@ export const CompactOperationSchema = z.object({
   state: OperationStateSchema,
   createdAt: z.number().finite(),
   updatedAt: z.number().finite(),
+  // One of RESULT_CODES; read as a plain string so a code from a newer release
+  // still reads after a rollback.
   result: z.object({ code: z.string(), message: z.string() }).nullable(),
 });
 export type CompactOperation = z.infer<typeof CompactOperationSchema>;
+// Every result code this release writes. The `_before_dispatch` codes prove
+// nothing was sent; the others may have sent.
+export const RESULT_CODES = ["completed", "unknown", "failed_before_dispatch", "failed_after_dispatch",
+  "expired_before_dispatch", "legacy_outcome"] as const;
+export type ResultCode = typeof RESULT_CODES[number];
 export const operationPending = (operation: Pick<CompactOperation, "state">) =>
   ["requested", "dispatching", "observing"].includes(operation.state);
 // The two directions between an operation's state and a row/outcome status;

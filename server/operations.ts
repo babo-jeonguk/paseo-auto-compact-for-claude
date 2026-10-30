@@ -1,8 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
-import { finishedState, operationRowStatus, operationPending, type CompactOperation, type CompactTarget } from "../shared/rpc";
-import { readable, unchanged, type CompactOutcome, type Gateway, type State, type StateStore, type StoredOperation } from "./model";
+import { finishedState, operationRowStatus, operationPending, type CompactOperation, type CompactTarget,
+  type ResultCode } from "../shared/rpc";
+import { Refusal, readable, unchanged, type CompactOutcome, type Gateway, type State, type StateStore,
+  type StoredOperation } from "./model";
 import type { Settings } from "../shared/settings";
-import { bounded, deadlineOf, inspect, INSPECT_TIMEOUT_MS, OBSERVATION_MS } from "./deadline";
+import { bounded, deadlineOf, INSPECT_TIMEOUT_MS, OBSERVATION_MS, readWithin } from "./deadline";
 import { automaticBlock } from "./policy";
 
 export function inputFingerprint(agentId: string, revision: string, target?: CompactTarget) {
@@ -49,19 +51,18 @@ export function syncJobs(state: State) {
   return state;
 }
 
-const MAX_PRE_SEND_ATTEMPTS = 3;
-const budgetSpent = (failedAttempts: number) => failedAttempts >= MAX_PRE_SEND_ATTEMPTS;
+// Retries of a fault before the marker; the send deadline bounds how many.
+const MAX_RETRY_DELAY_MS = 30_000;
 
-type Ending = CompactOutcome | "expired" | "exhausted";
-function resultOf(ending: Ending, dispatched: boolean): NonNullable<StoredOperation["result"]> {
+type Ending = CompactOutcome | "expired";
+function resultOf(ending: Ending, dispatched: boolean): { code: ResultCode; message: string } {
   if (ending === "expired") return { code: "expired_before_dispatch", message: "Compaction request expired before dispatch" };
-  if (ending === "exhausted") return { code: "pre_dispatch_retries_exhausted", message: "Could not prepare compaction; nothing sent" };
   const code = ending.status === "completed" ? "completed" : ending.status === "unknown" ? "unknown"
     : dispatched ? "failed_after_dispatch" : "failed_before_dispatch";
   return { code, message: ending.detail };
 }
 const stateOf = (ending: Ending): StoredOperation["state"] =>
-  finishedState(ending === "expired" ? "expired" : ending === "exhausted" ? "failed" : ending.status);
+  finishedState(ending === "expired" ? "expired" : ending.status);
 
 export function recoverOperations(state: State, now: number) {
   for (const operation of state.operations) {
@@ -87,15 +88,21 @@ export function createOperationWorker(options: {
   // Outcomes whose terminal write failed; they are written again, never re-earned.
   const outcomes = new Map<string, Ending>();
   let running = false, again = false, stopped = false, lastConnected = true;
+  let retry: ReturnType<typeof setTimeout> | undefined;
+  // Pending work this worker claimed and still holds.
+  const held = (operation: StoredOperation | undefined): operation is StoredOperation =>
+    !stopped && !!operation && operationPending(operation) && operation.owner === owner;
+  function settle(operation: StoredOperation, ending: Ending) {
+    operation.state = stateOf(ending);
+    operation.result = resultOf(ending, operation.evidence?.dispatchStartedAt !== undefined);
+    operation.updatedAt = now();
+    delete operation.owner;
+  }
   async function finish(id: string, ending: Ending) {
     outcomes.set(id, ending);
     await update(state => {
       const operation = state.operations.find(entry => entry.id === id);
-      if (stopped || !operation || !operationPending(operation) || operation.owner !== owner) return;
-      operation.state = stateOf(ending);
-      operation.result = resultOf(ending, operation.evidence?.dispatchStartedAt !== undefined);
-      operation.updatedAt = now();
-      delete operation.owner;
+      if (held(operation)) settle(operation, ending);
     });
     outcomes.delete(id);
   }
@@ -148,12 +155,10 @@ export function createOperationWorker(options: {
         return;
       }
       // Sending must start by this time; observation then has its own deadline.
-      const sendBy = operation.deadlineAt!;
+      const sendBy = operation.sendBy!;
       if (now() >= sendBy || now() > (operation.deliveryExpiresAt ?? Infinity))
         return await finish(operation.id, "expired");
-      // This claim is attempt N; N - 1 earlier attempts failed.
-      if (budgetSpent((operation.attempt ?? 0) - 1)) return await finish(operation.id, "exhausted");
-      const wait = <T>(work: Promise<T>) => inspect(work, sendBy, now());
+      const wait = <T>(work: Promise<T>) => readWithin(work, sendBy, now());
       // Reading nothing is not evidence of change: an unreadable host, observer
       // or setting is thrown as a fault and retried; only a reading that shows a
       // change ends the attempt.
@@ -174,13 +179,12 @@ export function createOperationWorker(options: {
           { status: "failed", detail: "Session, activity or policy changed before dispatch; nothing sent" });
       let observeUntil: number | null = null;
       const execution = {
-        id: operation.id, deadlineAt: sendBy,
+        id: operation.id, sendBy: sendBy,
         current: () => !stopped && now() < (observeUntil ?? sendBy),
         checkpoint: async (evidence: NonNullable<StoredOperation["evidence"]>) => {
           await update(state => {
             const current = state.operations.find(entry => entry.id === operation.id);
-            if (stopped || !current || !operationPending(current) || current.owner !== owner ||
-                now() >= deadlineOf({ ...current, evidence: { ...current.evidence, ...evidence } }))
+            if (!held(current) || now() >= deadlineOf({ ...current, evidence: { ...current.evidence, ...evidence } }))
               throw new Error("Compaction worker ownership expired");
             current.evidence = { ...current.evidence, ...evidence,
               invalidated: !!current.evidence?.invalidated || !!evidence.invalidated };
@@ -190,8 +194,7 @@ export function createOperationWorker(options: {
           if (evidence.dispatchStartedAt !== undefined) observeUntil = evidence.dispatchStartedAt + OBSERVATION_MS;
         },
       };
-      // A refusal comes back as a failed outcome; a fault before the dispatch
-      // marker is thrown and retried below.
+      // Before the dispatch marker the gateway throws instead; see below.
       const outcome = await (operation.kind === "automatic"
         ? gateway.automatic!(agent, { expiresAt: Math.min(operation.deliveryExpiresAt ?? Infinity, sendBy), allowed }, execution)
         : gateway.compact(agent.agentId, agent, execution));
@@ -203,29 +206,41 @@ export function createOperationWorker(options: {
       }
       await finish(operation.id, outcome);
     } catch (error) {
-      // Keep the durable nonterminal record. The next reconcile retries state
-      // persistence or pre-send preparation; it never retransmits marked work.
+      // The one place an error before the dispatch marker is classified. A
+      // refusal ends the attempt with nothing sent. A fault keeps the durable
+      // record and is retried until the send deadline, then expires unsent.
+      // Marked work is never retransmitted.
+      if (claimedId && !outcomes.has(claimedId) && !stopped && error instanceof Refusal) {
+        try { return await finish(claimedId, { status: "failed", detail: `Compaction stopped before send: ${error.message}` }); }
+        catch (writeError) { return onError(writeError); }
+      }
       onError(error);
       if (claimedId && !outcomes.has(claimedId) && !stopped) {
         try {
-          await update(state => {
+          const delay = await update(state => {
             const current = state.operations.find(entry => entry.id === claimedId);
-            if (!current || !operationPending(current) || current.owner !== owner ||
-                current.evidence?.dispatchStartedAt !== undefined) return;
-            if (budgetSpent(current.attempt ?? 0)) {
-              current.state = stateOf("exhausted");
-              current.result = resultOf("exhausted", false);
-            } else {
-              current.state = "requested";
-              const delay = 1_000 * 2 ** Math.max(0, (current.attempt ?? 1) - 1);
-              current.nextAttemptAt = now() + delay + Math.floor(Math.random() * 500);
+            if (!held(current) || current.evidence?.dispatchStartedAt !== undefined) return null;
+            if (now() >= (current.sendBy ?? 0) || now() > (current.deliveryExpiresAt ?? Infinity)) {
+              settle(current, "expired");
+              return null;
             }
+            const wait = Math.min(1_000 * 2 ** Math.max(0, (current.attempt ?? 1) - 1), MAX_RETRY_DELAY_MS) +
+              Math.floor(Math.random() * 500);
+            current.state = "requested";
+            current.nextAttemptAt = now() + wait;
             delete current.owner;
             current.updatedAt = now();
+            return wait;
           });
+          // The worker wakes itself for the retry rather than waiting for a tick.
+          if (delay !== null) {
+            clearTimeout(retry);
+            retry = setTimeout(() => { void reconcile(lastConnected).catch(onError); }, delay);
+            retry.unref?.();
+          }
         } catch (writeError) { onError(writeError); }
       }
     }
   }
-  return { reconcile, stop() { stopped = true; } };
+  return { reconcile, stop() { stopped = true; clearTimeout(retry); } };
 }

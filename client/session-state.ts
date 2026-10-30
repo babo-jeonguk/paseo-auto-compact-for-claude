@@ -1,4 +1,4 @@
-import type { Row } from "../shared/rpc";
+import type { ResultCode, Row } from "../shared/rpc";
 import type { Settings } from "../shared/settings";
 import { formatTokenThreshold } from "./format";
 
@@ -15,14 +15,17 @@ export type CompactCompletionNotice =
   | { variant: "error"; message: string };
 
 // One wording per outcome, whether it arrives in the request's reply or later
-// from polling the operation. Null while the outcome is still pending.
-export function compactOutcomeNotice(status: Row["status"], detail?: string): CompactCompletionNotice | null {
+// from polling the operation. Null while the outcome is still pending. The
+// result code says whether anything was sent, and so whether to try again.
+export function compactOutcomeNotice(status: Row["status"], detail?: string, code?: string): CompactCompletionNotice | null {
   if (status === "completed")
     return { variant: "success", message: "Conversation compacted" };
   if (status === "unknown")
     return { variant: "error", message: "Check the conversation before trying again." };
   if (status === "expired")
     return { variant: "error", message: "Compaction request expired before it could start." };
+  if (status === "failed" && code === ("failed_before_dispatch" satisfies ResultCode))
+    return { variant: "error", message: "Couldn’t start compaction; nothing was sent. Try again." };
   if (status === "failed")
     return { variant: "error", message: "Couldn’t compact. Check the conversation." };
   if (status === "blocked" && detail)
@@ -31,11 +34,11 @@ export function compactOutcomeNotice(status: Row["status"], detail?: string): Co
 }
 
 export function compactCompletionNotice(
-  tracked: Pick<Row, "operationId" | "status"> | null | undefined,
+  tracked: Pick<Row, "operationId" | "status"> & { code?: string } | null | undefined,
   operationId: string | null
 ): CompactCompletionNotice | null {
   if (!tracked || !operationId || tracked.operationId !== operationId) return null;
-  return compactOutcomeNotice(tracked.status);
+  return compactOutcomeNotice(tracked.status, undefined, tracked.code);
 }
 
 export const STATUS_GRACE_MS = 10_000;
