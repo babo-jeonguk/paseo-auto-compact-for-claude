@@ -349,26 +349,22 @@ export function createScheduler(options: {
         const [config, agent] = await Promise.all([
           settings(), refresh(agentId),
         ]);
-        // An explicit request is independent of automation switches, like the threshold.
-        const refused = !config
-          ? "Compact settings could not be read"
-          : !agent?.eligible
+        // First, which activity the request is about: without it nothing can be answered.
+        const unidentified = !agent
           ? "This conversation is unavailable for compaction"
           : agent.observerUnreadable
           ? "Claude observer status unavailable. Try again"
-          : agent.resumeRequired
-          ? SESSION_RESUME_REQUIRED
           : agent.revision !== revision
           ? "The conversation changed. Refresh and try again"
           : target && !unchanged({ revision, target }, agent)
           ? "The conversation session or activity changed. Refresh and try again"
-          : !agent.idle
-          ? "The conversation is busy. Wait until it finishes"
           : null;
-        if (refused || !agent)
-          return { result: { status: "blocked" as const, detail: refused!, operationId: null,
+        if (unidentified || !agent)
+          return { result: { status: "blocked" as const, detail: unidentified!, operationId: null,
             operation: null, code: "blocked" as const } };
-        // An explicit request repeats only work that sent nothing for this activity.
+        // Then what already happened to that activity. History sends nothing, so
+        // it is answered whatever the live state, such as a session that must
+        // resume first. An explicit request repeats only work that sent nothing.
         const attempted = state.operations.find(entry => sameActivity(entry, agent) && mayHaveSent(entry));
         if (attempted) return { result: existingResult(attempted) };
         let job = state.jobs.find((job) => job.agentId === agentId);
@@ -381,6 +377,20 @@ export function createScheduler(options: {
           return { result: { status: job.status, detail: job.detail,
             operationId: job.operationId ?? null, operation: null, code: "existing" as const } };
         }
+        // Last, whether sending may start now. An explicit request is independent
+        // of automation switches, like the threshold.
+        const refused = !config
+          ? "Compact settings could not be read"
+          : !agent.eligible
+          ? "This conversation is unavailable for compaction"
+          : agent.resumeRequired
+          ? SESSION_RESUME_REQUIRED
+          : !agent.idle
+          ? "The conversation is busy. Wait until it finishes"
+          : null;
+        if (refused)
+          return { result: { status: "blocked" as const, detail: refused, operationId: null,
+            operation: null, code: "blocked" as const } };
         job = {
           agentId,
           revision,

@@ -1060,3 +1060,21 @@ test("a session awaiting resume is refused at once and holds its reservation, wi
   assert.equal(f.state.operations.length, 0);
   assert.equal(f.calls, 0);
 });
+
+test("what already happened to an activity is answered before whether sending may start", async () => {
+  const f = fixture(), s = f.make(); await s.ready;
+  f.agents[0].activityKey = "launch:generation:1";
+  await s.observedTurn(f.agents[0]);
+  const revision = f.agents[0].revision!;
+  assert.equal((await s.compactNow("a", revision, "request-a")).code, "accepted");
+  await waitForStatus(f, "completed");
+  // After a plugin reload on Paseo 0.14 the same, already compacted activity awaits a resume.
+  f.agents[0].resumeRequired = true;
+  for (const live of [{ resumeRequired: true }, { idle: false }]) {
+    Object.assign(f.agents[0], live);
+    const again = await s.compactNow("a", revision, `request-${JSON.stringify(live)}`);
+    assert.equal(again.code, "existing", JSON.stringify(live));
+    assert.equal(again.operationId, "request-a");
+  }
+  assert.equal(f.calls, 1);
+});
