@@ -1022,3 +1022,24 @@ test("a scheduler stopped mid-request cannot put back state a newer instance rep
   await assert.rejects(stale, /Plugin stopped/);
   assert.deepEqual(f.state.operations.map(operation => operation.id), ["request-new"]);
 });
+
+test("a Compact now that cannot be prepared ends within seconds, unsent and retryable", async () => {
+  const f = fixture(), s = f.make(); await s.ready;
+  const compact = f.gateway.compact;
+  let attempts = 0;
+  f.gateway.compact = async () => { attempts++; throw new Error("observer preparation timed out"); };
+  const revision = f.agents[0].revision!;
+  assert.equal((await s.compactNow("a", revision, "request-a")).code, "accepted");
+  for (let i = 0; i < 100 && attempts === 0; i++) await new Promise<void>(resolve => setImmediate(resolve));
+  f.advance(10_000);
+  for (let i = 0; i < 100 && (await s.operation("request-a"))?.state !== "expired"; i++) {
+    await s.reconcile();
+    await new Promise<void>(resolve => setImmediate(resolve));
+  }
+  const operation = await s.operation("request-a");
+  assert.equal(operation?.state, "expired");
+  assert.equal(operation?.result?.code, "expired_before_dispatch");
+  f.gateway.compact = compact;
+  assert.equal((await s.compactNow("a", revision, "request-b")).code, "accepted", "nothing was sent, so it can be tried again");
+  s.stop();
+});

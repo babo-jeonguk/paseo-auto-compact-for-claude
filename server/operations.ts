@@ -224,8 +224,9 @@ export function createOperationWorker(options: {
               settle(current, "expired");
               return null;
             }
-            const wait = Math.min(1_000 * 2 ** Math.max(0, (current.attempt ?? 1) - 1), MAX_RETRY_DELAY_MS) +
-              Math.floor(Math.random() * 500);
+            // Never wait past the send deadline: the expiry is reported on time.
+            const wait = Math.min(1_000 * 2 ** Math.max(0, (current.attempt ?? 1) - 1) + Math.floor(Math.random() * 500),
+              MAX_RETRY_DELAY_MS, current.sendBy! - now());
             current.state = "requested";
             current.nextAttemptAt = now() + wait;
             delete current.owner;

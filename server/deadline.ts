@@ -6,10 +6,12 @@ export class DeadlineExceeded extends Error {
 
 // One read of the host, settings, state or observer before anything is sent.
 export const INSPECT_TIMEOUT_MS = 5_000;
-// From acceptance to the dispatch marker (`sendBy`); an automatic reservation's
-// delivery window can shorten it. Faults before the marker are retried until
-// then; after it nothing is sent and the request expires.
-export const SEND_DEADLINE_MS = 180_000;
+// From acceptance to the dispatch marker (`sendBy`). Faults before the marker
+// are retried until then; after it nothing is sent and the request expires.
+// Someone is waiting on Compact now, so it allows a few quick retries of a
+// passing fault and no more. An automatic reservation has time to wait out a
+// longer one; its delivery window can shorten that.
+export const SEND_DEADLINE_MS = { manual: 10_000, automatic: 180_000 } as const;
 // From the dispatch marker: how long matching evidence is awaited before the
 // outcome becomes unknown. It never depends on when sending started.
 export const OBSERVATION_MS = 180_000;

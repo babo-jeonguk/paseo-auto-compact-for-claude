@@ -126,7 +126,7 @@ export function createGateway(options: {
     // the send deadline applies; after it a fresh observation budget, so a late
     // send is still observed in full.
     const live = options.timeoutMs ?? LIVE_OBSERVATION_MS;
-    const sendBy = execution?.sendBy ?? now() + SEND_DEADLINE_MS;
+    const sendBy = execution?.sendBy ?? now() + SEND_DEADLINE_MS[automatic ? "automatic" : "manual"];
     let deadline = sendBy;
     const wait = <T>(work: Promise<T>) => bounded(work, deadline - now());
     const read = <T>(work: Promise<T>) => readWithin(work, deadline, now());

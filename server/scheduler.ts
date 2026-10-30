@@ -188,12 +188,12 @@ export function createScheduler(options: {
     state.operations.push(operation);
     await store.write(state);
   }
-  function newOperation(job: Job, agent: Observation, kind: StoredOperation["kind"],
+  function newOperation(job: Job, agent: Observation, kind: "manual" | "automatic",
     id: string = randomUUID(), fingerprint: string | null = null): StoredOperation {
     return { id, agentId: job.agentId, revision: job.revision, kind,
       target: targetOf(agent),
       inputFingerprint: fingerprint, state: "requested", createdAt: now(), updatedAt: now(), result: null,
-      sendBy: now() + SEND_DEADLINE_MS, reservationEndedAt: job.endedAt, attempt: 0 };
+      sendBy: now() + SEND_DEADLINE_MS[kind], reservationEndedAt: job.endedAt, attempt: 0 };
   }
   const existingResult = (operation: StoredOperation) => ({
     status: operationRowStatus(operation), detail: operation.result?.message ?? "Compaction requested",
