@@ -14,22 +14,22 @@ npm run test:update
 
 In Windows PowerShell, `npm.cmd run test:update` also works when execution policy blocks `npm.ps1`. Run with **Windows Node** to test Windows; WSL Node tests Linux. The runner records `process.platform`, architecture, OS release, Node/Claude/Paseo versions and product source hashes.
 
-The update command runs observer consistency, type checks and the fast regression suite. After committing, run `npm run test:release` for those checks and the full native matrix on an isolated snapshot with Paseo **0.12.0**, **0.13.0**, **0.14.0** and **0.15.0-beta.1**. Install the pinned native tools once with `npm ci --prefix tests/simulation --ignore-scripts`. This needs network access and can take several minutes; later runs reuse them. Nothing is installed globally and no Claude login is required.
+The update command runs observer consistency, type checks and the fast regression suite. After committing, run `npm run test:release` for those checks and the full native matrix on an isolated snapshot with Paseo **0.12.0**, **0.13.0**, **0.14.0** and **0.15.0**. Install the pinned native tools once with `npm ci --prefix tests/simulation --ignore-scripts`. This needs network access and can take several minutes; later runs reuse them. Nothing is installed globally and no Claude login is required.
 
 ## What is real and what is simulated
 
-Each simulation starts stock **Paseo 0.12.0, 0.13.0, 0.14.0 or 0.15.0-beta.1**, native **Claude Code 2.1.306**, and this checkout's actual plugin. The client handshake uses the selected toolchain's real version. Only model responses come from a synthetic loopback HTTP server. Native transcript creation, Mod loading, public RPC, settings persistence, process restart and automatic timers run normally. The fixture reports a 500k context to a 1M model so the real 400k threshold can be exercised without sending a huge prompt.
+Each simulation starts stock **Paseo 0.12.0, 0.13.0, 0.14.0 or 0.15.0**, native **Claude Code 2.1.306**, and this checkout's actual plugin. The client handshake uses the selected toolchain's real version. Only model responses come from a synthetic loopback HTTP server. Native transcript creation, Mod loading, public RPC, settings persistence, process restart and automatic timers run normally. The fixture reports a 500k context to a 1M model so the real 400k threshold can be exercised without sending a huge prompt.
 
 Each run uses temporary HOME/USERPROFILE, Claude settings, Paseo configuration, agents and ports. The native process receives a synthetic API key and a local model URL. Existing Paseo and Claude sessions/settings are not used. Successful runs stop their process trees and delete the temporary home. Failed runs retain the temporary path in `report.json` for diagnosis.
 
 The automatic timer test first verifies real **55- and 50-minute reservation values**, then uses a one-minute idle setting and waits for the real server timer. A second one-minute wait checks that a reservation which elapsed while the plugin was stopped expires on recovery. There is no test-only product RPC and no edit to the plugin's stored reservation times.
 
-## Paseo 0.15 beta restart and browser reconnect checks
+## Paseo 0.15 restart and browser reconnect checks
 
 The preview keeps the default development SDK at 0.12.0 and tests all four pinned versions in the SDK and native matrices. The focused restart/reconnect suite can use the beta alias installed by the native tools above, or a separate CLI directory:
 
 ```sh
-npm install --prefix /tmp/auto-compact-paseo-015 --ignore-scripts --no-audit --no-fund @getpaseo/cli@0.15.0-beta.1
+npm install --prefix /tmp/auto-compact-paseo-015 --ignore-scripts --no-audit --no-fund @getpaseo/cli@0.15.0
 node --no-maglev tests/simulation/restart-reconnect.mjs \
   --tools /tmp/auto-compact-paseo-015 \
   --browser /absolute/path/to/chromium
@@ -238,3 +238,17 @@ A fifth review found that an error after the dispatch marker, written in the sam
 
 Every first failure before a rerun was a readiness or reply timeout, not a plugin assertion. Load from other projects and a concurrent emulator reached 25–50 during three install E2E attempts, which timed out waiting for native replies in different scenarios. The run passed once load fell. Two Android attempts ran next to the desktop suite and lost the emulator to its watchdog or a boot timeout. One more attempt timed out behind a System UI ANR dialog. Run alone, the Android test passed.
 
+
+## Compatibility preview — Paseo 0.15.0 stable
+
+The 1.1.1-alpha.1 preview keeps the manifest minimum at Paseo 0.12.0 and the development SDK at 0.12.0. The shared lifecycle handlers use addHook when the host exposes it and the legacy registration otherwise; each handler is registered once. No scheduler, compaction receipt, retry policy, or observer changes are required by this migration.
+
+Linux/WSL validation on 2026-11-03:
+- SDK 0.12.0, 0.13.0, 0.14.0, 0.15.0-beta.1 and 0.15.0: 171 checks passed per SDK.
+- Native Claude 2.1.306 with stock Paseo 0.12.0, 0.13.0, 0.14.0, 0.15.0-beta.1 and 0.15.0: 18/18 scenarios passed per version.
+- Stable 0.15.0 interruption checks: 2/2 passed, including the real 180-second observation deadline after forced termination.
+- Stable 0.15.0 Chromium reconnect checks: 2/2 passed without reloading the page.
+
+Stable 0.15.0 makes agent restart recovery opt-in. The focused interruption tests explicitly enable it; the normal native suite uses the stock default. Normal native shutdown still cleared the recovery candidate in the tested case, so that branch resumed with a new user message. Both paths preserved honest unknown results and did not replay compaction. This host behavior is separate from the registration migration.
+
+Only model replies are synthetic. Windows/macOS are not claimed as locally executed here. CI tests the stable SDK on Linux/macOS/Windows and native simulation on Linux/Windows. The preview remains on a separate branch for review; no main merge or stable plugin release is part of this change.

@@ -19,7 +19,7 @@ const option = (name, fallback) => {
   const at = process.argv.indexOf(name);
   return at < 0 ? fallback : process.argv[at + 1];
 };
-const version = option('--paseo', '0.15.0-beta.1');
+const version = option('--paseo', '0.15.0');
 const minimalBuiltins = process.argv.includes('--minimal-builtins');
 const suite = option('--suite', 'all');
 assert(['all', 'restart', 'browser', 'recovery', 'graceful-recovery', 'completed', 'interrupted', 'forced-interrupted', 'hooks'].includes(suite),
@@ -30,7 +30,7 @@ const tools = createRequire(join(resolve(option('--tools', here)), 'package.json
 const nativeTools = createRequire(join(here, 'package.json'));
 const cliPackage = (() => {
   try { return tools.resolve('@getpaseo/cli/package.json'); }
-  catch { return tools.resolve('@getpaseo/cli-0-15/package.json'); }
+  catch { return tools.resolve(version === '0.15.0' ? '@getpaseo/cli-0-15-stable/package.json' : '@getpaseo/cli-0-15/package.json'); }
 })();
 assert.equal(JSON.parse(await readFile(cliPackage, 'utf8')).version, version);
 const binary = join(dirname(nativeTools.resolve(`@anthropic-ai/claude-code-${process.platform}-${process.arch}/package.json`)),

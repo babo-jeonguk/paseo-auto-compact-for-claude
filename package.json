@@ -30,7 +30,8 @@
     "test:focused": "node --import tsx --test --test-isolation=none",
     "test:snapshot": "node scripts/test-snapshot.mjs",
     "test:release": "node scripts/test-snapshot.mjs --suite release",
-    "test:simulation:0.15": "node --no-maglev tests/simulation/run.mjs --paseo 0.15.0-beta.1"
+    "test:simulation:0.15": "node --no-maglev tests/simulation/run.mjs --paseo 0.15.0",
+    "test:simulation:0.15-beta": "node --no-maglev tests/simulation/run.mjs --paseo 0.15.0-beta.1"
   },
   "devDependencies": {
     "@getpaseo/client": "0.12.0",
