@@ -69,7 +69,7 @@ paseo plugin update auto-compact-for-claude
 
 Review the proposed commit before confirming. Direct GitHub updates follow the repository's default branch. Reopen Claude sessions after an update so they use the new version.
 
-On Paseo 0.14, Paseo reopens a session itself before its next message. Until then, the plugin does not compact that conversation: send a message and wait for the reply first. A countdown from before the update does not run; that reply schedules a new one.
+On Paseo 0.14 and 0.15, Paseo reopens a session itself before its next message. Until then, the plugin does not compact that conversation: send a message and wait for the reply first. A countdown from before the update does not run; that reply schedules a new one.
 
 ## Remove
 
