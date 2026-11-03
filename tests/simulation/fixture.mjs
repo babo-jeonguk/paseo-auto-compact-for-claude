@@ -24,7 +24,7 @@ export async function waitFor(fn, label, timeout = 45_000) {
 // `launcher` replaces `paseo daemon run`, e.g. with the desktop app that starts its own daemon.
 export async function startFixture({ root, plugin, cliPackage, appVersion, binary, model, reportDir, webUi = false,
   install, launcher, providerEnv: extraProviderEnv = {}, readyTimeoutMs = 90_000,
-  daemonEnv = {} }) {
+  daemonEnv = {}, recoverySettings = {} }) {
   const requireTools = createRequire(cliPackage);
   const cliRoot = dirname(cliPackage);
   const { DaemonClient } = await import(pathToFileURL(requireTools.resolve('@getpaseo/client/internal/daemon-client')));
@@ -54,7 +54,7 @@ export async function startFixture({ root, plugin, cliPackage, appVersion, binar
   await writeFile(join(home, 'config.json'), JSON.stringify({ version: 1, pluginsEnabled: true,
     daemon: { listen: target, relay: { enabled: false }, mcp: { enabled: false } },
     features: { dictation: { enabled: false }, voiceMode: { enabled: false }, webUi: { enabled: webUi } },
-    agents: { providers: {
+    agents: { ...recoverySettings, providers: {
       claude: { command: [binary], env: providerEnv },
       'claude-env': { extends: 'claude', label: 'Simulation explicit TTL', env: { CLAUDE_CODE_PROMPT_CACHE_TTL: '1h' } },
     } },
@@ -86,11 +86,27 @@ export async function startFixture({ root, plugin, cliPackage, appVersion, binar
     }
     throw new Error('Isolated Paseo daemon did not become ready');
   }
-  async function stop() {
+  async function stop({ abrupt = false, graceful = false } = {}) {
     await client?.close().catch(() => {}); client = undefined;
     if (daemon?.stop) { await daemon.stop(); daemon = undefined; return; }
     if (!daemon?.pid) return;
     const pid = daemon.pid;
+    if (process.platform !== 'win32' && (abrupt || graceful)) {
+      // A graceful daemon shutdown must capture running work before its children
+      // exit. Signalling the whole group at once would race that capture.
+      if (graceful) {
+        await promisify(execFile)(process.execPath, [join(cliRoot, 'bin/paseo'),
+          'daemon', 'stop', '--home', home, '--timeout', '30'],
+        { env: environment, timeout: 40_000, windowsHide: true });
+      } else {
+        try { process.kill(-pid, 'SIGKILL'); } catch {}
+      }
+      await waitFor(() => daemon.exitCode !== null || daemon.signalCode !== null,
+        'test daemon restart shutdown', graceful ? 30_000 : 5000);
+      try { process.kill(-pid, 'SIGKILL'); } catch {}
+      daemon = undefined;
+      return;
+    }
     if (process.platform === 'win32') {
       await promisify(execFile)(join(process.env.SystemRoot ?? 'C:\\Windows', 'System32/taskkill.exe'),
         ['/PID', String(pid), '/T', '/F'], { windowsHide: true, timeout: 15_000 }).catch(() => {});
@@ -150,7 +166,7 @@ export async function startFixture({ root, plugin, cliPackage, appVersion, binar
       return JSON.parse(await readFile(join(parent, 'receipts', `${encodeURIComponent(operationId)}.json`), 'utf8'));
     },
     async claudeSettings(values) { await writeFile(join(claude, 'settings.json'), JSON.stringify(values)); },
-    async restart() { await stop(); await start(); },
+    async restart(options) { await stop(options); await options?.onStopped?.(); await start(); },
     async close() { await stop(); },
     async remove() { await rm(root, { recursive: true, force: true, maxRetries: 12, retryDelay: 400 }); },
   };

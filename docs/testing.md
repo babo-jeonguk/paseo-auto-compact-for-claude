@@ -14,15 +14,36 @@ npm run test:update
 
 In Windows PowerShell, `npm.cmd run test:update` also works when execution policy blocks `npm.ps1`. Run with **Windows Node** to test Windows; WSL Node tests Linux. The runner records `process.platform`, architecture, OS release, Node/Claude/Paseo versions and product source hashes.
 
-The update command runs observer consistency, type checks and the fast regression suite. After committing, run `npm run test:release` for those checks and the full native matrix on an isolated snapshot with Paseo **0.12.0**, **0.13.0** and **0.14.0**. Install the pinned native tools once with `npm ci --prefix tests/simulation --ignore-scripts`. This needs network access and can take several minutes; later runs reuse them. Nothing is installed globally and no Claude login is required.
+The update command runs observer consistency, type checks and the fast regression suite. After committing, run `npm run test:release` for those checks and the full native matrix on an isolated snapshot with Paseo **0.12.0**, **0.13.0**, **0.14.0** and **0.15.0-beta.1**. Install the pinned native tools once with `npm ci --prefix tests/simulation --ignore-scripts`. This needs network access and can take several minutes; later runs reuse them. Nothing is installed globally and no Claude login is required.
 
 ## What is real and what is simulated
 
-Each simulation starts stock **Paseo 0.12.0, 0.13.0 or 0.14.0**, native **Claude Code 2.1.306**, and this checkout's actual plugin. The client handshake uses the selected toolchain's real version. Only model responses come from a synthetic loopback HTTP server. Native transcript creation, Mod loading, public RPC, settings persistence, process restart and automatic timers run normally. The fixture reports a 500k context to a 1M model so the real 400k threshold can be exercised without sending a huge prompt.
+Each simulation starts stock **Paseo 0.12.0, 0.13.0, 0.14.0 or 0.15.0-beta.1**, native **Claude Code 2.1.306**, and this checkout's actual plugin. The client handshake uses the selected toolchain's real version. Only model responses come from a synthetic loopback HTTP server. Native transcript creation, Mod loading, public RPC, settings persistence, process restart and automatic timers run normally. The fixture reports a 500k context to a 1M model so the real 400k threshold can be exercised without sending a huge prompt.
 
 Each run uses temporary HOME/USERPROFILE, Claude settings, Paseo configuration, agents and ports. The native process receives a synthetic API key and a local model URL. Existing Paseo and Claude sessions/settings are not used. Successful runs stop their process trees and delete the temporary home. Failed runs retain the temporary path in `report.json` for diagnosis.
 
 The automatic timer test first verifies real **55- and 50-minute reservation values**, then uses a one-minute idle setting and waits for the real server timer. A second one-minute wait checks that a reservation which elapsed while the plugin was stopped expires on recovery. There is no test-only product RPC and no edit to the plugin's stored reservation times.
+
+## Paseo 0.15 beta restart and browser reconnect checks
+
+The preview keeps the default development SDK at 0.12.0 and tests all four pinned versions in the SDK and native matrices. The focused restart/reconnect suite can use the beta alias installed by the native tools above, or a separate CLI directory:
+
+```sh
+npm install --prefix /tmp/auto-compact-paseo-015 --ignore-scripts --no-audit --no-fund @getpaseo/cli@0.15.0-beta.1
+node --no-maglev tests/simulation/restart-reconnect.mjs \
+  --tools /tmp/auto-compact-paseo-015 \
+  --browser /absolute/path/to/chromium
+```
+
+The suite checks completed-request deduplication after restart, interrupted compaction after graceful and forced shutdown, automatic recovery of a running ordinary turn after forced shutdown, actual `addHook` registration by an installed probe plugin, and rendered countdown/progress recovery after a browser connection outage. It uses a local forwarding proxy to disconnect only the browser while the daemon state changes, then reconnects the same document without reloading it. Model responses alone are synthetic.
+
+Use `--suite interrupted|recovery|hooks|browser|restart` to narrow a run and `--report-dir /path/to/results` to preserve separate attempts. Reports include product/test source hashes, request counts, conversation/operation evidence, and browser screenshots. Temporary homes are retained for inspection. The forced-shutdown checks currently require Linux; a Windows invocation must not be reported as equivalent graceful/forced coverage. Desktop Electron and mobile reconnection are separate tests.
+
+`--suite graceful-recovery` separately asserts that a running ordinary Claude turn is automatically resumed after the official `paseo daemon stop` command. In the initial Linux beta investigation this expectation failed: the running record became closed with `resumeOnStartup: false`, and no resume prompt reached the model. This diagnostic is separate from testing the plugin's protection against duplicate compaction and false success. The interrupted-compaction tests inspect the saved recovery eligibility and send an ordinary user message when the host did not retain an automatic recovery candidate.
+
+On a heavily loaded machine, `--minimal-builtins` omits the released server's list of unrelated bundled provider/usage plugins through a test-only module loader. It does not replace the server, plugin runtime, native Claude, or web UI. The report explicitly records this mode and the loader hash. Results in this mode do not establish coexistence with the complete default bundled-plugin set; keep stock-default results separate.
+
+2026-11-03 targeted results on Linux/WSL, Paseo 0.15.0-beta.1 and native Claude 2.1.306: the final stock-default interrupted-compaction suite passed 2/2, and the stock-default Chromium reconnect suite passed 2/2. A separately installed probe received the new lifecycle hooks, and a completed request survived restart without another model request. The forced-interruption case waited out the real 180-second observation deadline and ended unknown, with no extra compact delivery. Reconnect was tested without a page reload. These are targeted checks, not a complete beta release matrix; the separately failing graceful ordinary automatic-recovery diagnostic remains documented above.
 
 ## Covered behavior
 
