@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { mkdir, readFile, writeFile, rm } from 'node:fs/promises';
+import { mkdir, readFile, writeFile, rm, copyFile } from 'node:fs/promises';
 import { openSync, closeSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { createRequire } from 'node:module';
@@ -176,5 +176,10 @@ export async function startFixture({ root, plugin, cliPackage, appVersion, binar
     else assert.equal((await client.installDirectoryPlugin(plugin)).status, 'running');
     workspace = (await client.createWorkspace({ source: { kind: 'directory', path: root }, title: 'Auto Compact simulation' })).workspace;
     return fixture;
-  } catch (error) { await stop(); throw error; }
+  } catch (error) {
+    await stop();
+    await copyFile(join(home, 'terminal-worker.log'), join(reportDir, 'terminal-worker.log'))
+      .catch(copyError => { if (copyError.code !== 'ENOENT') console.error('Cannot collect terminal worker log:', copyError.message); });
+    throw error;
+  }
 }

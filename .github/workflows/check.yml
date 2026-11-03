@@ -52,6 +52,9 @@ jobs:
             tests/simulation/package-lock.json
       - run: npm ci --ignore-scripts
       - run: npm ci --prefix tests/simulation --ignore-scripts --no-audit --no-fund
+      - name: Diagnose Windows terminal worker startup
+        if: matrix.os == 'windows-latest' && matrix.paseo == '0.15.0'
+        run: node tests/simulation/diagnose-startup.mjs
       - run: node --no-maglev tests/simulation/run.mjs --paseo ${{ matrix.paseo }} --expect-platform ${{ matrix.platform }}
       - uses: actions/upload-artifact@v4
         if: always()
