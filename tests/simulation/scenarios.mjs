@@ -321,12 +321,22 @@ export const scenarios = [
       // unknown. Neither may be promoted to successful compaction.
       assert(result.status === 'unknown' || (result.status === 'failed' &&
         /cancel|without completing|did not complete/i.test(result.reason)), JSON.stringify(result));
-      assert.equal((await f.row(id)).status, 'busy');
+      // The native receipt can settle before the worker persists its outcome.
+      // Keep the user request held until the original operation has settled and
+      // the row reflects that the conversation is still busy.
+      await waitFor(async () => {
+        const current = (await f.rpc('operation', { operationId: operation.operationId })).operation;
+        assert.notEqual(current?.state, 'succeeded', 'overlapping input must not complete compaction');
+        if (!current || !['failed', 'unknown'].includes(current.state)) return null;
+        return (await f.row(id)).status === 'busy';
+      }, 'settled compaction and busy overlapping input');
       user.release();
       await waitFor(async () => (await f.timeline(id)).some(row => row.item.type === 'assistant_message' &&
         row.item.text.includes(`SIMULATION_REPLY_${user.requestId}`)), 'the user\'s own assistant reply');
       const fresh = await scheduled(f, id);
       assert.notEqual(fresh.revision, row.revision);
+      const settled = (await f.rpc('operation', { operationId: operation.operationId })).operation;
+      assert(['failed', 'unknown'].includes(settled?.state), JSON.stringify(settled));
     },
   },
   {
