@@ -44,8 +44,11 @@ export async function startFixture({ root, plugin, cliPackage, appVersion, binar
     LOCALAPPDATA: join(user, 'AppData/Local'), TMPDIR: root, TMP: root, TEMP: root,
     PATH: dirname(process.execPath) + delimiter + (process.env.PATH ?? ''),
     PASEO_HOME: home, PASEO_LISTEN: target, PASEO_RELAY_ENABLED: 'false' };
+  // Paseo 0.15 inspects terminal workers through Windows PowerShell. Without its
+  // module search path, CIM module discovery in a fresh profile can exceed the
+  // worker's 15-second readiness limit on Windows CI.
   for (const name of ['SystemRoot', 'SYSTEMROOT', 'WINDIR', 'ComSpec', 'COMSPEC', 'PATHEXT', 'OS',
-    'PROCESSOR_ARCHITECTURE', 'NUMBER_OF_PROCESSORS', 'CLAUDE_CODE_GIT_BASH_PATH'])
+    'PROCESSOR_ARCHITECTURE', 'NUMBER_OF_PROCESSORS', 'CLAUDE_CODE_GIT_BASH_PATH', 'PSModulePath'])
     if (process.env[name]) environment[name] = process.env[name];
   const providerEnv = { ...environment, CLAUDE_CONFIG_DIR: claude,
     ANTHROPIC_API_KEY: 'synthetic-loopback-only', ANTHROPIC_AUTH_TOKEN: '', CLAUDE_CODE_OAUTH_TOKEN: '',
