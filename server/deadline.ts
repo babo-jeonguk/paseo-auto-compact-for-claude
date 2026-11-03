@@ -4,6 +4,11 @@ export class DeadlineExceeded extends Error {
   constructor() { super("Compaction deadline exceeded"); }
 }
 
+// A VM host may step the shared wall clock back to correct drift (WSL2:
+// observed -1.8 s every few minutes). A step up to this size is not a rollback.
+// Keep equal to the constant in observer-source.mjs and below the 30 s margin
+// before a cache deadline, which absorbs the error such a step leaves behind.
+export const CLOCK_STEP_TOLERANCE_MS = 10_000;
 // One read of the host, settings, state or observer before anything is sent.
 export const INSPECT_TIMEOUT_MS = 5_000;
 // From acceptance to the dispatch marker (`sendBy`). Faults before the marker

@@ -7,6 +7,7 @@ import { z } from 'zod';
 import { observerAsset } from './observer-assets.generated';
 import { Refusal, type NativeOperation, type Observation, type StoredOperation } from './model';
 import { createCacheReader } from './cache';
+import { CLOCK_STEP_TOLERANCE_MS } from './deadline';
 
 const LedgerSchema = z.object({
   version: z.literal(1), launchId: z.string(), generation: z.string(),
@@ -31,15 +32,17 @@ const ReceiptSchema = z.object({
 const ManifestSchema = z.object({ launchId: z.string().uuid(), build: z.string() });
 // Ledgers and receipts are small; anything larger is not one of ours.
 const MAX_FILE_BYTES = 32_768;
-// The input-counting, command-guard and cancellation fixes keep the same ledger
-// and reservation contract. Keep already-open sessions observable until reopen.
+// The input-counting, command-guard, cancellation and clock-step fixes keep the
+// same ledger and reservation contract. Keep already-open sessions observable
+// until reopen.
 const compatibleBuilds = new Set([observerAsset.version,
   'f8a02403e4f6c17e010ddda4d0385109fe8c480dfc379c9bb91d309671f87c7a',
   '61a0e12639e417cd28f7a651c789c00e10606bf994d960276f1916914eb3e6d4',
   'af6c6639f8c3058a73d5e982e308b69f5572fc6439a0c8fea61c1ca629ef4239',
   '8a6c0217779bc4f83c7029c8170c35da8d2ed8028622019f4a09808491dff90f',
   '7d9c570c36bcad4db9ef816c0b704c5b0d01d12c7522b215cdfbbfc160c86648',
-  '9fa0456c8d59db1297e540db98993d8d23e34dbfb4a487843334926447ece70b']);
+  '9fa0456c8d59db1297e540db98993d8d23e34dbfb4a487843334926447ece70b',
+  'ece7bf8ce5445aedb974f30472983b78c7358b8feea99d15c1ef2369d88a26e4']);
 
 export function createObserver(options: { home?: string; now?: () => number } = {}) {
   const base = join(options.home ?? process.env.PASEO_HOME ?? join(homedir(), '.paseo'),
@@ -92,7 +95,7 @@ export function createObserver(options: { home?: string; now?: () => number } = 
     if (!info || !info.isFile() || info.isSymbolicLink() || info.size > MAX_FILE_BYTES) return null;
     const ledger = await load(async () => LedgerSchema.parse(JSON.parse(await readFile(path, 'utf8'))));
     if (!ledger || ledger.launchId !== manifest.launchId || ledger.closed ||
-        now() < ledger.updatedAt || now() - ledger.updatedAt > 60_000) return null;
+        now() < ledger.updatedAt - CLOCK_STEP_TOLERANCE_MS || now() - ledger.updatedAt > 60_000) return null;
     const cache = await cacheWindow(ledger.cacheRequest, ledger.transcriptPath,
       ledger.sessionId ?? '', ledger.ordinaryEndedAt, now());
     return { ledger: { ...ledger, cache, cacheDeadline: cache?.deadline ?? null }, directory };

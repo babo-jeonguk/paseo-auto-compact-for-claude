@@ -266,11 +266,52 @@ test('delayed heartbeat preserves the request clock; backwards clocks and sessio
   delayed.advance(30_000); await delayed.event('turn.complete', { turnId: 'child', agentId: 'child' });
   assert.equal(delayed.ledger().cacheRequest.startedAt, 1_000_000);
   const backwards = fixture(); await backwards.start(); await backwards.ordinary();
-  backwards.advance(-1); await backwards.event('turn.complete', { turnId: 'child', agentId: 'child' });
+  backwards.advance(-10_001); await backwards.event('turn.complete', { turnId: 'child', agentId: 'child' });
   assert.equal(backwards.ledger().cacheRequest, null);
   await delayed.event('session.end');
   assert.equal(delayed.ledger().closed, true);
   assert.equal(delayed.ledger().cacheRequest, null);
+});
+
+// WSL2 steps its wall clock back by a second or two (observed: -1.8 s) when
+// the host corrects drift. Those steps are not a rollback of the request.
+test('a WSL clock step back keeps the cache clock; a step beyond the tolerance still invalidates it', async () => {
+  const stepped = fixture(); await stepped.start(); await stepped.ordinary();
+  const before = stepped.ledger();
+  stepped.advance(-1_800); await stepped.event('turn.complete', { turnId: 'child', agentId: 'child' });
+  assert.deepEqual(stepped.ledger().cacheRequest, before.cacheRequest);
+  assert.equal(stepped.ledger().ordinaryEndedAt, before.ordinaryEndedAt);
+  assert.equal(stepped.ledger().clockEpoch, before.clockEpoch);
+  stepped.advance(-10_000); await stepped.event('turn.complete', { turnId: 'child', agentId: 'child' });
+  assert.equal(stepped.ledger().clockEpoch, before.clockEpoch, 'tolerance applies to each step from the last save');
+  const rolled = fixture(); await rolled.start(); await rolled.ordinary();
+  const epoch = rolled.ledger().clockEpoch;
+  rolled.advance(-10_001); await rolled.event('turn.complete', { turnId: 'child', agentId: 'child' });
+  assert.equal(rolled.ledger().clockEpoch, epoch + 1);
+});
+
+test('Compact now admits a request prepared just before a WSL clock step back', async () => {
+  // Reproduces e6ee93ba: Paseo prepared at 04.414, then Claude read 03.491.
+  for (const run of [cmd => cmd.compact(async () => {}), cmd => cmd.event('classic.PreCompact', { trigger: 'manual' })]) {
+    const f = fixture(); await f.start(); await f.ordinary();
+    f.request({ requireCache: false, preparedAt: 1_000_000 + 1_800 });
+    const result = await run(f);
+    assert.equal(result.text, undefined);
+    assert.equal(result.block, undefined);
+    assert.equal(f.ledger().compact.status, 'running');
+  }
+  const automatic = fixture(); await automatic.start(); await automatic.ordinary();
+  automatic.request({ preparedAt: 1_000_000 + 10_000 });
+  assert.equal((await automatic.event('classic.PreCompact', { trigger: 'manual' })).block, undefined);
+  assert.equal(automatic.ledger().compact.status, 'running');
+});
+
+test('a request prepared beyond the clock-step tolerance is still refused as expired', async () => {
+  const f = fixture(); await f.start(); await f.ordinary();
+  f.request({ requireCache: false, preparedAt: 1_000_000 + 10_001 });
+  const result = await f.compact(async () => { throw new Error('must not compact'); });
+  assert.match(result.text, /Reservation expired/);
+  assert.equal(f.ledger().compact.reason, 'Reservation expired');
 });
 
 test('a no-op compact or local slash command cannot leave the observer permanently busy', async () => {

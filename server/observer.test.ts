@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, symlink, utimes, writeFile } fro
 import { join, delimiter } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createObserver } from './observer';
+import { CLOCK_STEP_TOLERANCE_MS } from './deadline';
 import type { PluginSessionOpenRequest } from '@getpaseo/plugin/server';
 import type { Observation, StoredOperation } from './model';
 
@@ -69,7 +70,8 @@ test('the compatible pre-fix observer stays readable during rollout; unknown bui
     for (const build of ['af6c6639f8c3058a73d5e982e308b69f5572fc6439a0c8fea61c1ca629ef4239',
       '8a6c0217779bc4f83c7029c8170c35da8d2ed8028622019f4a09808491dff90f',
       '7d9c570c36bcad4db9ef816c0b704c5b0d01d12c7522b215cdfbbfc160c86648',
-      '9fa0456c8d59db1297e540db98993d8d23e34dbfb4a487843334926447ece70b']) {
+      '9fa0456c8d59db1297e540db98993d8d23e34dbfb4a487843334926447ece70b',
+      'ece7bf8ce5445aedb974f30472983b78c7358b8feea99d15c1ef2369d88a26e4']) {
       await writeFile(manifestPath, JSON.stringify({ ...f.manifest, build }));
       assert(await f.observer.read('a'));
       f.ledger.pendingInputs = 1; await f.save();
@@ -93,6 +95,28 @@ test('observer rejects mismatched sessions, busy native work, default TTL fallba
     f.ledger.generation = 'reloaded'; await f.save();
     assert.equal((await f.observer.result('a', manual))?.status, 'unknown');
   } finally { await f.close(); }
+});
+
+test('a ledger written just before a WSL clock step back stays readable; a far-future ledger does not', async () => {
+  const f = await fixture();
+  try {
+    // A heartbeat saved at 1_001_800, then the system clock stepped back 1.8 s.
+    f.ledger.updatedAt = 1_001_800; await f.save();
+    assert(await f.observer.read('a'));
+    assert.equal(await f.observer.readiness(f.agent, 1_060_000), null);
+    const manual = await f.observer.prepare(f.agent, false, 1_030_000);
+    assert.equal(manual.preparedAt, 1_000_000);
+    f.ledger.updatedAt = 1_010_000; await f.save();
+    assert(await f.observer.read('a'), 'the tolerance is inclusive');
+    f.ledger.updatedAt = 1_010_001; await f.save();
+    assert.equal(await f.observer.read('a'), null);
+  } finally { await f.close(); }
+});
+
+test('the observer and the server use the same clock-step tolerance', async () => {
+  const source = await readFile(new URL('./observer-source.mjs', import.meta.url), 'utf8');
+  assert.equal(Number(/const CLOCK_STEP_TOLERANCE_MS = ([\d_]+);/.exec(source)?.[1].replaceAll('_', '')),
+    CLOCK_STEP_TOLERANCE_MS);
 });
 
 test('native receipt must match operation and revision; settling preserves subsequent manual compact', async () => {
