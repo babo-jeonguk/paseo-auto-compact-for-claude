@@ -14,9 +14,7 @@ Codex subscription sessions do not need this plugin: [caches are retained indefi
 
 ## Requirements
 
-The `fix/paseo-0.15-stable-compat` branch is the **1.1.1-alpha.1 compatibility preview** for Paseo 0.15.0. It keeps Paseo 0.12+ support: hosts exposing `addHook` use the new lifecycle names, and older hosts use the existing registrations with the same handlers. The default branch and stable release are unchanged. Validate the preview against Paseo 0.15.0 before merging it. To test this preview explicitly, install with `paseo plugin install github:babo-jeonguk/paseo-auto-compact-for-claude --ref fix/paseo-0.15-stable-compat`.
-
-- **Paseo 0.12 or later**.
+- **Paseo 0.12 or later**, including Paseo 0.15.
 - A Claude provider using a native Claude Code CLI that supports Mods. Claude profiles are supported too.
 - The Paseo web, desktop or Android app. The iOS app is unverified.
 

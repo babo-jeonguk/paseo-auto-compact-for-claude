@@ -1,7 +1,7 @@
 name: Check
 on:
   push:
-    branches: [main, fix/paseo-0.15-compat, fix/paseo-0.15-stable-compat]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 permissions:

@@ -239,9 +239,9 @@ A fifth review found that an error after the dispatch marker, written in the sam
 Every first failure before a rerun was a readiness or reply timeout, not a plugin assertion. Load from other projects and a concurrent emulator reached 25–50 during three install E2E attempts, which timed out waiting for native replies in different scenarios. The run passed once load fell. Two Android attempts ran next to the desktop suite and lost the emulator to its watchdog or a boot timeout. One more attempt timed out behind a System UI ANR dialog. Run alone, the Android test passed.
 
 
-## Compatibility preview — Paseo 0.15.0 stable
+## Compatibility validation — Paseo 0.15.0 stable
 
-The 1.1.1-alpha.1 preview keeps the manifest minimum at Paseo 0.12.0 and the development SDK at 0.12.0. The shared lifecycle handlers use addHook when the host exposes it and the legacy registration otherwise; each handler is registered once. No scheduler, compaction receipt, retry policy, or observer changes are required by this migration.
+The Paseo 0.15 compatibility change keeps the manifest minimum at Paseo 0.12.0 and the development SDK at 0.12.0. The shared lifecycle handlers use addHook when the host exposes it and the legacy registration otherwise; each handler is registered once. No scheduler, compaction receipt, retry policy, or observer changes are required by this migration.
 
 Linux/WSL validation on 2026-11-03:
 - SDK 0.12.0, 0.13.0, 0.14.0, 0.15.0-beta.1 and 0.15.0: 171 checks passed per SDK.
@@ -251,4 +251,4 @@ Linux/WSL validation on 2026-11-03:
 
 Stable 0.15.0 makes agent restart recovery opt-in. The focused interruption tests explicitly enable it; the normal native suite uses the stock default. Normal native shutdown still cleared the recovery candidate in the tested case, so that branch resumed with a new user message. Both paths preserved honest unknown results and did not replay compaction. This host behavior is separate from the registration migration.
 
-Only model replies are synthetic. Windows/macOS are not claimed as locally executed here. CI tests the stable SDK on Linux/macOS/Windows and native simulation on Linux/Windows. The preview remains on a separate branch for review; no main merge or stable plugin release is part of this change.
+Only model replies are synthetic. [CI at f7b3a8c](https://github.com/babo-jeonguk/paseo-auto-compact-for-claude/actions/runs/41645166534) passed all 20 jobs: SDK checks on Linux/macOS/Windows and 18/18 native scenarios on Linux/Windows for each stable Paseo version from 0.12.0 through 0.15.0. Windows fixtures preserve PowerShell's module search path so terminal-worker identity inspection can finish within Paseo's readiness limit. macOS native execution and the iOS app remain unverified.
