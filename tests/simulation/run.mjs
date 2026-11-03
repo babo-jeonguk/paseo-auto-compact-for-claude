@@ -29,6 +29,8 @@ const paseoPackages = new Map([
   ['0.12.0', '@getpaseo/cli-0-12'],
   ['0.13.0', '@getpaseo/cli-0-13'],
   ['0.14.0', '@getpaseo/cli-0-14'],
+  ['0.15.0-beta.1', '@getpaseo/cli-0-15'],
+  ['0.15.0', '@getpaseo/cli-0-15-stable'],
 ]);
 assert(paseoPackages.has(paseoRequested), `Unsupported Paseo simulation version: ${paseoRequested}`);
 const reportRoot = resolve(value('--report-dir', join(plugin, 'test-results', `${process.platform}-${process.arch}`)));
@@ -101,7 +103,7 @@ try {
   report.claude = (await promisify(execFile)(binary, ['--version'], { timeout: 30_000, windowsHide: true })).stdout.trim();
   console.log(`Native ${process.platform}/${process.arch}; Node ${process.version}; Paseo ${report.paseo}; Claude ${report.claude}`);
   for (const path of ['index.server.ts', 'server/cache.ts', 'server/observer.ts', 'server/observer-source.mjs',
-    'server/observer-assets.generated.ts', 'server/gateway.ts', 'server/scheduler.ts', 'shared/settings.ts',
+    'server/observer-assets.generated.ts', 'server/lifecycle.ts', 'server/gateway.ts', 'server/scheduler.ts', 'shared/settings.ts',
     'server/model.ts', 'server/store.ts', 'server/operations.ts', 'server/retention.ts', 'server/deadline.ts', 'shared/rpc.ts', 'shared/providers.ts', 'paseo-plugin.json', 'package.json'])
     report.sourceFiles[path] = sha(await readFile(join(plugin, path)));
   report.simulationFiles = {};
@@ -109,7 +111,7 @@ try {
     report.simulationFiles[path] = sha(await readFile(join(here, path)));
   model = await startModel();
   fixture = await startFixture({ root, plugin, cliPackage, appVersion: report.appVersion,
-    binary, model, reportDir });
+    binary, model, reportDir, readyTimeoutMs: 240_000 });
   context = { fixture, model };
   for (const scenario of scenarios) {
     const started = Date.now();

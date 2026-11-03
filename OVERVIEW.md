@@ -2,7 +2,7 @@ Auto Compact for Claude summarizes large, idle conversations while their history
 
 Defaults are **200,000 tokens** and **55 minutes after a reply finishes**. Global settings control the threshold, delay and enabled Claude providers. Conversation controls remain available below the threshold, and scheduling continues while the conversation view is not open.
 
-Requires **Paseo 0.12 or later**, a Claude provider using a **native Claude Code CLI with Mods support**, and the Paseo web, desktop or Android app. Start or reopen a Claude conversation after installing or updating the plugin. On Paseo 0.14, send a message in an open conversation after an update before it can be compacted.
+Requires **Paseo 0.12 or later**, a Claude provider using a **native Claude Code CLI with Mods support**, and the Paseo web, desktop or Android app. Start or reopen a Claude conversation after installing or updating the plugin. On Paseo 0.14 and 0.15, send a message in an open conversation after an update before it can be compacted.
 
 When the cache lifetime is unavailable, the plugin assumes one hour. A known five-minute cache window cannot cover the default delay. Installing or updating does not schedule existing conversations retroactively. Compaction consumes tokens and can lose detail; savings are not guaranteed.
 

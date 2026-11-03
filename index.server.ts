@@ -5,6 +5,7 @@ import { bounded, INSPECT_TIMEOUT_MS } from "./server/deadline";
 import { createStore } from "./server/store";
 import { createObserver } from "./server/observer";
 import { createReporter } from "./server/report";
+import { createLifecycleHooks } from "./server/lifecycle";
 import { claudeProvider } from "./shared/providers";
 import {
   compactRpc,
@@ -18,6 +19,7 @@ import {
 import { compactSettings } from "./shared/settings";
 
 export default function contribute(server: PluginServerContext) {
+  const lifecycle = createLifecycleHooks(server);
   const settings = server.registerSettings(compactSettings);
   const observer = createObserver();
   const host = createGateway({ observer });
@@ -46,13 +48,13 @@ export default function contribute(server: PluginServerContext) {
     }
   };
   const stops = [
-    server.on("agent.turn_started", (event, { paseo }) => {
+    lifecycle.on("agent.turn.before", (event, { paseo }) => {
       host.attach(paseo);
       host.started(event);
       if (!host.ownTurn(event.agent.id, event.turnId))
         void scheduler.invalidate(event.agent.id).catch(report);
     }),
-    server.on("agent.turn_ended", (event, { paseo }) => {
+    lifecycle.on("agent.turn.after", (event, { paseo }) => {
       host.attach(paseo);
       if (host.ownTurn(event.agent.id, event.turnId)) {
         host.ended(event);
@@ -65,19 +67,19 @@ export default function contribute(server: PluginServerContext) {
     }),
     ...(
       [
-        "agent.permission_requested",
-        "agent.permission_resolved",
-        "agent.archived",
-        "agent.closed",
+        "agent.permission.before",
+        "agent.permission.after",
+        "agent.archive.after",
+        "agent.close.after",
       ] as const
     ).map((name) =>
-      server.on(name, (event, { paseo }) => {
+      lifecycle.on(name, (event, { paseo }) => {
         host.attach(paseo);
         void scheduler.invalidate(event.agent.id).catch(report);
       })
     ),
-    server.on("agent.created", (_event, { paseo }) => host.attach(paseo)),
-    server.before("agent.session_open", async ({ request }, { paseo }) => {
+    lifecycle.on("agent.create.after", (_event, { paseo }) => host.attach(paseo)),
+    lifecycle.beforeSessionOpen(async ({ request }, { paseo }) => {
       host.attach(paseo);
       // Plugin failures must not keep a conversation from opening; without an
       // observer the controls ask the user to reopen the session.

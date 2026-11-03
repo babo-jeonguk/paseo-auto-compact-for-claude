@@ -1,4 +1,5 @@
-import type { PluginHandlerContext, PluginLifecycleEvents } from "@getpaseo/plugin/server";
+import type { PluginHandlerContext } from "@getpaseo/plugin/server";
+import type { LifecycleEvents } from "./lifecycle";
 import { randomUUID } from "node:crypto";
 import { Refusal, readable, targetOf, unchanged, type Gateway, type Observation, type DispatchGuard, type ExecutionContext,
   type OperationEvidence, type StoredOperation } from "./model";
@@ -11,7 +12,7 @@ export { claudeProvider } from "../shared/providers";
 
 type Api = PluginHandlerContext["paseo"];
 type Agent = NonNullable<Awaited<ReturnType<ReturnType<Api["agents"]["ref"]>["refresh"]>>>["agent"];
-type End = PluginLifecycleEvents["agent.turn_ended"];
+type End = LifecycleEvents["agent.turn.after"];
 type Observer = ReturnType<typeof createObserver>;
 type TimelineItem = { type: string; status?: string; trigger?: string };
 // The completed manual compaction of the /compact command's own turn.
@@ -261,7 +262,7 @@ export function createGateway(options: {
     ownTurn(agentId: string, turnId: string | null) {
       return turnId !== null && pending.get(agentId)?.turnId === turnId;
     },
-    started(_event: PluginLifecycleEvents["agent.turn_started"]) {},
+    started(_event: LifecycleEvents["agent.turn.before"]) {},
     ended(event: End) { completions.get(event.agent.id)?.(event); },
     stop() { stopped = true; for (const entry of pending.values()) entry.cancel(); },
     async providers() {
