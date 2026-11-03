@@ -7,9 +7,14 @@ let lastReceiptValue = null;
 // A cancelled request blocks one late plugin /compact. Claude cannot tell that
 // command from the user's own, so later ones run as unrequested compaction.
 let consumedCancelId = null;
+// Paseo and Claude read the same wall clock, which a VM host may step back by
+// a second or two to correct drift (WSL2: observed -1.8 s every few minutes).
+// Only a larger step is a rollback. Must equal CLOCK_STEP_TOLERANCE_MS in
+// server/deadline.ts; it stays within the 30 s cache-deadline margin.
+const CLOCK_STEP_TOLERANCE_MS = 10_000;
 async function save($) {
   const now = await $.clock.now();
-  if (state.updatedAt && now < state.updatedAt) {
+  if (state.updatedAt && now < state.updatedAt - CLOCK_STEP_TOLERANCE_MS) {
     state.cacheRequest = null;
     state.ordinaryEndedAt = null;
     state.clockEpoch++;
@@ -70,7 +75,8 @@ async function admit($, trigger) {
         request.sessionId !== state.sessionId) reason = 'Claude session changed';
     else if (request.revision !== state.revision || state.activeTurns.length || state.pendingInputs)
       reason = 'New conversation activity';
-    else if (now > request.expiresAt || now < request.preparedAt) reason = 'Reservation expired';
+    else if (now > request.expiresAt || now < request.preparedAt - CLOCK_STEP_TOLERANCE_MS)
+      reason = 'Reservation expired';
     else if (request.requireCache && (request.clockEpoch !== state.clockEpoch ||
         !Number.isFinite(request.cacheDeadline) || now >= request.cacheDeadline - 30_000))
       reason = 'Cache window passed';
