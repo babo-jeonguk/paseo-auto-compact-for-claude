@@ -3,6 +3,8 @@ import { test } from "node:test";
 import { bounded, OBSERVATION_MS } from "./deadline";
 import { Refusal, type OperationEvidence, type StoredOperation } from "./model";
 import { createGateway } from "./gateway";
+import { createScheduler } from "./scheduler";
+import { DEFAULT_SETTINGS } from "../shared/settings";
 import type {
   PluginHandlerContext,
   PluginLifecycleEvents,
@@ -84,7 +86,8 @@ function fixture(
     config: { get: async () => ({ config: { providers: {} } }) },
     agents: { ref: () => ref },
   } as unknown as PluginHandlerContext["paseo"]);
-  return Object.assign(host, { ref, sendCount: () => sends });
+  return Object.assign(host, { ref, sendCount: () => sends,
+    setAgent: (patch: Record<string, unknown>) => Object.assign(agent, patch) });
 }
 
 test("gateway requires completed manual boundary from command turn and same persistence session", async () => {
@@ -122,6 +125,45 @@ test("gateway requires completed manual boundary from command turn and same pers
     "unknown",
     "historical compaction in a full lifecycle snapshot must not count as a new boundary"
   );
+});
+
+test("hidden background agents are never compaction targets; absent or false background is unchanged", async () => {
+  const host = fixture([{ type: "compaction", status: "completed", trigger: "manual" }]);
+  for (const background of [undefined, false]) {
+    host.setAgent({ background });
+    assert.equal((await host.gateway.refresh("a"))!.eligible, true);
+    assert.equal((await host.gateway.compact("a")).status, "completed");
+    assert.equal(host.sendCount(), background === false ? 2 : 1);
+  }
+  host.setAgent({ background: true });
+  const hidden = (await host.gateway.refresh("a"))!;
+  assert.equal(hidden.eligible, false);
+  await assert.rejects(host.gateway.compact("a", hidden), Refusal);
+  assert.equal(host.sendCount(), 2, "a hidden background agent must not receive /compact");
+  host.stop();
+});
+
+test("a reservation whose agent later becomes hidden background is skipped instead of dispatched", async () => {
+  const host = fixture([]);
+  let time = 1_000_000;
+  let state: import("./model").State = { version: 1, disabled: [], jobs: [], operations: [] };
+  const scheduler = createScheduler({
+    store: { read: async () => structuredClone(state), write: async next => { state = structuredClone(next); } },
+    gateway: host.gateway,
+    settings: async () => ({ ...DEFAULT_SETTINGS }),
+    now: () => time,
+  });
+  await scheduler.ready;
+  await scheduler.observedTurn((await host.gateway.refresh("a"))!);
+  assert.equal(state.jobs[0].status, "scheduled");
+  host.setAgent({ background: true });
+  time += 55 * 60_000;
+  await scheduler.tick();
+  assert.equal(host.sendCount(), 0);
+  assert.equal(state.jobs[0].status, "skipped");
+  assert.match(state.jobs[0].detail, /no longer eligible/);
+  scheduler.stop();
+  host.stop();
 });
 
 test("completed command ownership is released; stock gateway offers no automatic dispatch", async () => {

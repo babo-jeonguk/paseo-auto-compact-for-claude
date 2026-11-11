@@ -33,6 +33,7 @@ export function installConversationControls(client: PluginClientContext) {
       !!agent.workspaceId &&
       !agent.archivedAt &&
       !agent.internal &&
+      (agent as { readonly background?: boolean }).background !== true &&
       !agent.providerUnavailable &&
       !agent.labels["paseo.parent-agent-id"] &&
       agent.status !== "closed";
