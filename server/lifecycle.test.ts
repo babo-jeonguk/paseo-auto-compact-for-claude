@@ -17,7 +17,7 @@ const request: PluginSessionOpenRequest = {
   ...{
     agentId: "a", workspaceId: null, cwd: "/work", provider: "claude",
     purpose: "interactive" as const, reason: "resume" as const, env: { OTHER_PLUGIN: "keep" },
-    title: null, labels: {}, tools: [], mcpServers: {},
+    title: null, labels: {}, metadata: {}, tools: [], mcpServers: {},
   },
 };
 

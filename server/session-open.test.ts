@@ -31,7 +31,7 @@ test("plugin state or observer failures cannot prevent a Claude session from ope
   try {
     const request = { agentId: "a", workspaceId: "w", provider: "claude",
       purpose: "interactive", reason: "create", cwd: home, title: "Conversation",
-      labels: { retained: "yes" }, tools: [], mcpServers: {},
+      labels: { retained: "yes" }, metadata: {}, tools: [], mcpServers: {},
       env: { CLAUDE_CODE_PLUGIN_DIRS: "/existing" } } as PluginSessionOpenRequest;
     const paseo = { config: { get: async () => ({ config: { providers: {} } }) } };
     const opened = await open!({ request }, { paseo });
