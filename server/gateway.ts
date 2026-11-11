@@ -58,6 +58,7 @@ export function createGateway(options: {
       revision: agent.lastUserMessageAt,
       tokens: typeof tokens === "number" && Number.isFinite(tokens) && tokens >= 0 ? tokens : null,
       eligible: claudeProvider(providers, agent.provider) && !agent.archivedAt && !agent.internal &&
+        (agent as { readonly background?: boolean }).background !== true &&
         !agent.providerUnavailable && !agent.labels["paseo.parent-agent-id"] && agent.status !== "closed",
       idle: agent.status === "idle" && !agent.activeTurn && agent.pendingPermissions.length === 0 &&
         agent.attentionReason !== "permission" && (!matched ||

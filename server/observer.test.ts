@@ -16,7 +16,7 @@ async function fixture() {
   // observer preserves the complete session-open request across SDK versions.
   const request = { agentId: 'a', workspaceId: 'w', provider: 'claude',
     purpose: 'interactive', reason: 'create', cwd: home, title: 'Conversation',
-    labels: { retained: 'yes' }, tools: [], mcpServers: {},
+    labels: { retained: 'yes' }, metadata: {}, tools: [], mcpServers: {},
     env: { CLAUDE_CODE_PLUGIN_DIRS: '/existing', OTHER: 'preserved' } } as PluginSessionOpenRequest & {
       readonly title: string; readonly labels: Readonly<Record<string, string>>;
     };
