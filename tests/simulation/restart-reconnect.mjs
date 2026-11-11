@@ -30,7 +30,11 @@ const tools = createRequire(join(resolve(option('--tools', here)), 'package.json
 const nativeTools = createRequire(join(here, 'package.json'));
 const cliPackage = (() => {
   try { return tools.resolve('@getpaseo/cli/package.json'); }
-  catch { return tools.resolve(version === '0.15.0' ? '@getpaseo/cli-0-15-stable/package.json' : '@getpaseo/cli-0-15/package.json'); }
+  catch {
+    const alias = version === '0.15.0' ? '@getpaseo/cli-0-15-stable'
+      : version === '0.16.0-beta.1' ? '@getpaseo/cli-0-16-beta' : '@getpaseo/cli-0-15';
+    return tools.resolve(`${alias}/package.json`);
+  }
 })();
 assert.equal(JSON.parse(await readFile(cliPackage, 'utf8')).version, version);
 const binary = join(dirname(nativeTools.resolve(`@anthropic-ai/claude-code-${process.platform}-${process.arch}/package.json`)),

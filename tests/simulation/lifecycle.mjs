@@ -9,7 +9,14 @@ import { startFixture, waitFor } from './fixture.mjs';
 import { startModel } from './model.mjs';
 const here = dirname(fileURLToPath(import.meta.url)), plugin = resolve(here, '../..');
 const require = createRequire(join(here, 'package.json'));
-const cliPackage = require.resolve('@getpaseo/cli-0-14/package.json');
+const option = (name, fallback) => {
+  const at = process.argv.indexOf(name);
+  return at < 0 ? fallback : process.argv[at + 1];
+};
+const version = option('--paseo', '0.14.0');
+const cliAlias = new Map([['0.14.0', '@getpaseo/cli-0-14'], ['0.16.0-beta.1', '@getpaseo/cli-0-16-beta']]).get(version);
+assert(cliAlias, `Unsupported Paseo lifecycle version: ${version}`);
+const cliPackage = require.resolve(`${cliAlias}/package.json`);
 const binary = join(dirname(require.resolve(`@anthropic-ai/claude-code-${process.platform}-${process.arch}/package.json`)), process.platform === 'win32' ? 'claude.exe' : 'claude');
 const scenario = process.argv[2];
 assert(new Set(['reload', 'automatic', 'cleanup']).has(scenario),
@@ -21,7 +28,7 @@ const model = await startModel();
 let lifecycleFixture;
 const scheduled = id => waitFor(async () => { const row = await lifecycleFixture.row(id); return row.status === 'scheduled' && row.dueAt ? row : null; }, 'scheduled');
 try {
- lifecycleFixture = await startFixture({root, plugin, cliPackage, appVersion:'0.14.0', binary, model, reportDir, readyTimeoutMs:180_000,
+ lifecycleFixture = await startFixture({root, plugin, cliPackage, appVersion:version, binary, model, reportDir, readyTimeoutMs:180_000,
    daemonEnv:scenario !== 'cleanup' ? {} : {NODE_OPTIONS:`--experimental-loader=${join(here,'lifecycle-loader.mjs')}`, LIFECYCLE_CLEANUP_MARKER:marker}});
  await lifecycleFixture.settings({idleMinutes:50});
  if (scenario === 'reload') {
