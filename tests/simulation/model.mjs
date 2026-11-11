@@ -4,7 +4,7 @@ import { once } from 'node:events';
 // Only the external model is simulated. Paseo, Claude, the installed plugin,
 // native transcripts and the automatic timer remain real.
 export async function startModel() {
-  let ttl = '1h', nextGate, nextAgentBatch = false, notificationStep = 0, count = 0;
+  let ttl = '1h', nextGate, nextAgentBatch = false, nextBackgroundShell = false, notificationStep = 0, count = 0;
   const held = new Set();
   const requests = [];
   const server = createServer(async (req, res) => {
@@ -19,10 +19,16 @@ export async function startModel() {
       const agentBatch = nextAgentBatch && body.tools?.some(tool => tool.name === 'Agent');
       if (agentBatch) nextAgentBatch = false;
       const shellTool = body.tools?.find(tool => tool.name === 'Bash' || tool.name === 'PowerShell');
+      const backgroundShell = nextBackgroundShell && shellTool;
+      if (backgroundShell) nextBackgroundShell = false;
       const deliveredNotificationStep = notificationStep && shellTool ? notificationStep-- : 0;
+      const userTexts = (body.messages ?? []).filter(message => message.role === 'user')
+        .flatMap(message => typeof message.content === 'string' ? [message.content]
+          : (message.content ?? []).filter(block => block.type === 'text').map(block => block.text));
       const id = ++count, mode = ttl;
       // Keep test diagnostics metadata-only, even though all inputs are synthetic.
-      const entry = { id, ttl: mode, answered: false, cancelled: false };
+      const entry = { id, ttl: mode, answered: false, cancelled: false, at: Date.now(),
+        texts: userTexts.map(text => String(text).slice(0, 4000)) };
       requests.push(entry);
       res.on('close', () => { if (!entry.answered) entry.cancelled = true; });
       if (nextGate) {
@@ -60,6 +66,18 @@ export async function startModel() {
         events.splice(1, 3, ...blocks);
         events.find(event => event.type === 'message_delta').delta.stop_reason = 'tool_use';
       }
+      if (backgroundShell) {
+        events.splice(1, 3,
+          { type: 'content_block_start', index: 0, content_block: {
+            type: 'tool_use', id: `simulation_background_${id}`, name: shellTool.name, input: {},
+          } },
+          { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: JSON.stringify({
+            command: 'sleep 20', description: 'Synthetic background shell for compaction',
+            run_in_background: true,
+          }) } },
+          { type: 'content_block_stop', index: 0 });
+        events.find(event => event.type === 'message_delta').delta.stop_reason = 'tool_use';
+      }
       if (deliveredNotificationStep) {
         const background = deliveredNotificationStep === 2;
         const input = { command: `node -e "setTimeout(() => {}, ${background ? 1500 : 4000})"`,
@@ -84,6 +102,7 @@ export async function startModel() {
     setTtl(value) { ttl = value; },
     notifyAgentsNext() { nextAgentBatch = true; },
     notifyDuringTurnNext() { notificationStep = 2; },
+    backgroundShellNext() { nextBackgroundShell = true; },
     holdNext() {
       if (nextGate) throw new Error('A request gate is already armed');
       let arrived, release;
