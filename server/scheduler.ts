@@ -99,15 +99,31 @@ export function createScheduler(options: {
   };
   let nextFullScanAt = -Infinity;
   let observing = false;
+  // Reads run outside the state transaction, so order observations by when they
+  // were read: the newest read wins per conversation. A restart clears this
+  // because no read survives one.
+  let reads = 0;
+  const latestRead = new Map<string, number>();
+  const freshRead = (agentId: string, seq?: number) => {
+    if (seq === undefined) return true;
+    if (seq < (latestRead.get(agentId) ?? 0)) return false;
+    latestRead.set(agentId, seq);
+    return true;
+  };
+  let planStartedAt = 0;
+  let hostWork: Promise<unknown> = Promise.resolve();
+  let hostTimer: ReturnType<typeof setTimeout> | undefined;
   type Plan = { full: boolean; attention: boolean; agentIds: Set<string> };
   const newPlan = (): Plan => ({ full: false, attention: false, agentIds: new Set() });
   let pending: { plan: Plan; promise: Promise<void>; resolve(): void; reject(error: unknown): void } | null = null;
-  const observedTurns = (entries: ReadonlyArray<{ agent: Observation; endedAt: number }>) =>
+  const observedTurns = (entries: ReadonlyArray<{ agent: Observation; endedAt: number; seq?: number }>) =>
     serialize(async () => {
       const state = await store.read();
       let changed = false;
-      for (const { agent, endedAt } of entries)
+      for (const { agent, endedAt, seq } of entries) {
+        if (!freshRead(agent.agentId, seq)) continue;
         if (applyObservation(state, agent, endedAt, stopped)) changed = true;
+      }
       if (changed) await store.write(state);
     });
   function planFor(scope: ObservationScope): Plan {
@@ -125,9 +141,12 @@ export function createScheduler(options: {
     for (const id of source.agentIds) target.agentIds.add(id);
   };
   async function runPlan(plan: Plan) {
+    const seq = ++reads;
     let agents: Observation[];
     if (plan.full) {
-      agents = await bounded(gateway.list(), INSPECT_TIMEOUT_MS);
+      const listing = gateway.list();
+      hostWork = listing.then(() => {}, () => {});
+      agents = await bounded(listing, INSPECT_TIMEOUT_MS);
     } else {
       const ids = new Set(plan.agentIds);
       if (plan.attention) {
@@ -139,31 +158,46 @@ export function createScheduler(options: {
           if (operationPending(operation)) ids.add(operation.agentId);
       }
       if (ids.size === 0) return;
-      agents = plan.attention
-        ? await bounded(gateway.list({ agentIds: [...ids] }), INSPECT_TIMEOUT_MS)
-        : (await Promise.all([...ids].map(refresh)))
+      if (plan.attention) {
+        const listing = gateway.list({ agentIds: [...ids] });
+        hostWork = listing.then(() => {}, () => {});
+        agents = await bounded(listing, INSPECT_TIMEOUT_MS);
+      } else {
+        // Unbounded here: the plan holds single-flight until this read ends.
+        const reading = Promise.all([...ids].map((id) => gateway.refresh(id)));
+        hostWork = reading.then(() => {}, () => {});
+        agents = (await bounded(reading, INSPECT_TIMEOUT_MS))
           .filter((agent): agent is Observation => agent !== null);
+      }
     }
     const entries = agents
       .filter((agent) => agent.activityKey && agent.observedEndedAt != null)
-      .map((agent) => ({ agent, endedAt: agent.observedEndedAt! }));
+      .map((agent) => ({ agent, endedAt: agent.observedEndedAt!, seq }));
     if (entries.length) await observedTurns(entries);
   }
-  function finish() {
+  function release() {
+    if (hostTimer) { clearTimeout(hostTimer); hostTimer = undefined; }
     observing = false;
     const next = pending;
     pending = null;
     if (!next) return;
     if (stopped) { next.resolve(); return; }
-    observing = true;
-    const run = runPlan(next.plan);
-    run.then(
-      () => { next.resolve(); finish(); },
-      (error) => { next.reject(error); finish(); },
-    );
+    start(next.plan).then(next.resolve, next.reject);
+  }
+  function finish() {
+    // A timed-out host read is not cancelled: keep single-flight until it ends,
+    // but never longer than a full scan interval.
+    if (stopped) return release();
+    let released = false;
+    const once = () => { if (released) return; released = true; release(); };
+    hostWork.then(once, once);
+    hostTimer = setTimeout(once,
+      Math.max(0, planStartedAt + FULL_SCAN_INTERVAL_MS - now()));
   }
   function start(plan: Plan) {
     observing = true;
+    planStartedAt = now();
+    hostWork = Promise.resolve();
     const run = runPlan(plan);
     run.then(finish, finish);
     return run;
@@ -345,6 +379,8 @@ export function createScheduler(options: {
     reconcile: worker.reconcile,
     stop() {
       stopped = true;
+      if (hostTimer) { clearTimeout(hostTimer); hostTimer = undefined; }
+      release();
       worker.stop();
     },
     // Hooks are queued, but the gateway marks own turns synchronously before calling this.
@@ -367,13 +403,15 @@ export function createScheduler(options: {
     // Conversation controls remain available below the automatic token threshold.
     session: (agentId: string) =>
       serialize(async () => {
+        const seq = ++reads;
         const [state, config, agent] = await Promise.all([
           store.read(),
           settings(),
           refresh(agentId),
         ]);
         // A status read sees the reply that just ended, even before its event.
-        if (agent?.activityKey && agent.observedEndedAt != null &&
+        if (freshRead(agentId, seq) && agent?.activityKey &&
+            agent.observedEndedAt != null &&
             applyObservation(state, agent, agent.observedEndedAt, stopped))
           await store.write(state);
         return agent?.eligible ? view(agent, state, config) : null;
