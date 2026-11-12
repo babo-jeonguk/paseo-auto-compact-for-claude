@@ -177,22 +177,19 @@ export function createScheduler(options: {
         hostWork = listing.then(() => {}, () => {});
         agents = await bounded(listing, INSPECT_TIMEOUT_MS);
       } else {
-        // Unbounded here: the plan holds single-flight until every read ends.
-        // A failed read is reported after the successful observations are saved.
+        // Each read is bounded on its own, so one conversation's timeout does
+        // not hide another's result. Single-flight is still held on the raw
+        // reads until every host read ends.
         const refreshes = [...ids].map((id) => gateway.refresh(id));
         hostWork = Promise.allSettled(refreshes);
         const failures: PromiseRejectedResult[] = [];
-        for (const refresh of refreshes)
-          refresh.catch((reason) => { failures.push({ status: "rejected", reason }); });
-        let results: PromiseSettledResult<Observation | null>[];
-        try {
-          results = await bounded(Promise.allSettled(refreshes), INSPECT_TIMEOUT_MS);
-        } catch (error) {
-          // A held sibling must not hide an earlier refresh failure.
-          if (failures.length) throw failures[0].reason;
-          throw error;
-        }
-        failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+        const waits = refreshes.map((refresh) => {
+          const wait = bounded(refresh, INSPECT_TIMEOUT_MS);
+          wait.catch((reason) => { failures.push({ status: "rejected", reason }); });
+          return wait;
+        });
+        const results = await Promise.allSettled(waits);
+        failure = failures[0];
         agents = results
           .filter((result): result is PromiseFulfilledResult<Observation | null> =>
             result.status === "fulfilled")
@@ -204,7 +201,8 @@ export function createScheduler(options: {
       .filter((agent) => agent.activityKey && agent.observedEndedAt != null)
       .map((agent) => ({ agent, endedAt: agent.observedEndedAt!, seq }));
     if (entries.length) await observedTurns(entries);
-    // Record every successful observation before reporting the failure.
+    // Record every successful observation before reporting the first failure or
+    // timeout.
     if (failure) throw failure.reason;
   }
   function release() {
