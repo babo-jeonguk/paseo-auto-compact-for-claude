@@ -163,10 +163,11 @@ export function createScheduler(options: {
         hostWork = listing.then(() => {}, () => {});
         agents = await bounded(listing, INSPECT_TIMEOUT_MS);
       } else {
-        // Unbounded here: the plan holds single-flight until this read ends.
-        const reading = Promise.all([...ids].map((id) => gateway.refresh(id)));
-        hostWork = reading.then(() => {}, () => {});
-        agents = (await bounded(reading, INSPECT_TIMEOUT_MS))
+        // Unbounded here: the plan holds single-flight until every read ends.
+        // A failed read fails fast for the caller but does not end the others.
+        const refreshes = [...ids].map((id) => gateway.refresh(id));
+        hostWork = Promise.allSettled(refreshes);
+        agents = (await bounded(Promise.all(refreshes), INSPECT_TIMEOUT_MS))
           .filter((agent): agent is Observation => agent !== null);
       }
     }

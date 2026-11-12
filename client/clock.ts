@@ -1,4 +1,5 @@
 // One timer for every mounted control, set for the next visible change instead of ticking every second.
+// A boundary renders only the controls whose own display changes at it.
 export interface ClockTimers {
   now(): number;
   setTimeout(callback: () => void, ms: number): unknown;
@@ -15,7 +16,11 @@ export interface SharedClock {
   now(): number;
 }
 
-type Subscriber = { listener: (now: number) => void; nextAt: (now: number) => number | null };
+type Subscriber = {
+  listener: (now: number) => void;
+  nextAt: (now: number) => number | null;
+  next?: number | null;
+};
 
 export function createSharedClock(timers: Partial<ClockTimers> = {}): SharedClock {
   const clock: ClockTimers = {
@@ -32,8 +37,9 @@ export function createSharedClock(timers: Partial<ClockTimers> = {}): SharedCloc
     const now = clock.now();
     let at: number | null = null;
     for (const subscriber of subscribers) {
-      const next = subscriber.nextAt(now);
-      if (next !== null && (at === null || next < at)) at = next;
+      subscriber.next = subscriber.nextAt(now);
+      if (subscriber.next !== null && (at === null || subscriber.next < at))
+        at = subscriber.next;
     }
     if (at === scheduledAt) return;
     if (handle !== null) clock.clearTimeout(handle);
@@ -42,9 +48,10 @@ export function createSharedClock(timers: Partial<ClockTimers> = {}): SharedCloc
     if (at !== null) handle = clock.setTimeout(fire, Math.max(0, at - now));
   };
 
-  const notify = () => {
+  const wake = (due: (subscriber: Subscriber, now: number) => boolean) => {
     const now = clock.now();
     for (const subscriber of [...subscribers]) {
+      if (!due(subscriber, now)) continue;
       try {
         subscriber.listener(now);
       } catch {
@@ -53,10 +60,12 @@ export function createSharedClock(timers: Partial<ClockTimers> = {}): SharedCloc
     }
     reschedule();
   };
+  const notify = () => wake(() => true);
   const fire = () => {
     handle = null;
     scheduledAt = null;
-    notify();
+    // A boundary renders only the controls due by now; an early timer renders none.
+    wake((subscriber, now) => subscriber.next != null && subscriber.next <= now);
   };
 
   const subscribe = (listener: (now: number) => void, nextAt: (now: number) => number | null) => {
