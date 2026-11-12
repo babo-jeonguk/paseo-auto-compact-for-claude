@@ -14,6 +14,12 @@ function fixture(automatic = true) {
   let config: Settings | null = { ...DEFAULT_SETTINGS };
   let state: State = { version: 1, disabled: [], jobs: [], operations: [] };
   let calls = 0;
+  // Resource use the optimization promises to bound.
+  const counts = {
+    reads: 0, writes: 0, lists: [] as Array<string[] | undefined>, refreshes: [] as string[],
+    reset() { this.reads = 0; this.writes = 0; this.lists = []; this.refreshes = []; },
+  };
+  let listGate: Promise<void> | null = null;
   const agents: Observation[] = [
     {
       agentId: "a",
@@ -28,8 +34,12 @@ function fixture(automatic = true) {
     },
   ];
   const store: StateStore = {
-    read: async () => structuredClone(state),
+    read: async () => {
+      counts.reads++;
+      return structuredClone(state);
+    },
     write: async (next) => {
+      counts.writes++;
       state = structuredClone(next);
     },
   };
@@ -38,9 +48,17 @@ function fixture(automatic = true) {
     return { status: "completed", detail: "same session, completed boundary" };
   };
   const gateway: Gateway = {
-    list: async () => structuredClone(agents),
-    refresh: async (id) =>
-      structuredClone(agents.find((a) => a.agentId === id) ?? null),
+    list: async (filter?: { agentIds?: readonly string[] }) => {
+      counts.lists.push(filter?.agentIds ? [...filter.agentIds].sort() : undefined);
+      const listed = structuredClone(filter?.agentIds
+        ? agents.filter((a) => filter.agentIds!.includes(a.agentId)) : agents);
+      if (listGate) await listGate;
+      return listed;
+    },
+    refresh: async (id) => {
+      counts.refreshes.push(id);
+      return structuredClone(agents.find((a) => a.agentId === id) ?? null);
+    },
     compact,
     ...(automatic ? { automatic: async () => compact("a") } : {}),
   };
@@ -56,6 +74,13 @@ function fixture(automatic = true) {
     gateway,
     store,
     make,
+    counts,
+    // Hold agent listings (not refreshes) until released.
+    holdList() {
+      let release!: () => void;
+      listGate = new Promise<void>((resolve) => { release = resolve; });
+      return () => { listGate = null; release(); };
+    },
     get config() {
       return config;
     },
@@ -1077,4 +1102,194 @@ test("what already happened to an activity is answered before whether sending ma
     assert.equal(again.operationId, "request-a");
   }
   assert.equal(f.calls, 1);
+});
+
+// An eligible idle Claude conversation whose native turn ended at `endedAt`.
+function nativeAgent(f: ReturnType<typeof fixture>, agentId: string, activity = "1", endedAt = f.time): Observation {
+  return {
+    agentId, title: agentId, workspace: "/work", provider: "claude",
+    revision: new Date(endedAt).toISOString(), tokens: 210_000, eligible: true, idle: true,
+    sessionId: `native-${agentId}`, activityKey: `launch:${agentId}:${activity}`, observedEndedAt: endedAt,
+  };
+}
+const reserved = (f: ReturnType<typeof fixture>) =>
+  f.state.jobs.filter(job => job.status === "scheduled").map(job => job.agentId).sort();
+const settle = () => new Promise<void>(resolve => setImmediate(resolve));
+
+test("a turn-ended event observes only that conversation, without listing every agent", async () => {
+  const f = fixture();
+  f.agents.splice(0, 1, nativeAgent(f, "a"), nativeAgent(f, "b"), nativeAgent(f, "c"));
+  const s = f.make();
+  await s.ready;
+  f.counts.reset();
+  await s.observe({ kind: "agent", agentId: "b" });
+  assert.deepEqual(reserved(f), ["b"]);
+  assert.deepEqual(f.counts.lists, [], "no agent listing for a single turn end");
+  assert.deepEqual(f.counts.refreshes, ["b"]);
+});
+
+test("a conversation without observed native activity gets no reservation from observation", async () => {
+  const f = fixture();
+  const s = f.make();
+  await s.ready;
+  await s.observe({ kind: "agent", agentId: "a" });
+  await s.observe({ kind: "full" });
+  assert.equal(f.state.jobs.length, 0);
+});
+
+test("periodic observation scans every agent first, then only agents holding a reservation until a minute has passed", async () => {
+  const f = fixture();
+  f.agents.splice(0, 1, nativeAgent(f, "a"), nativeAgent(f, "b"), nativeAgent(f, "c"));
+  const s = f.make();
+  await s.ready;
+  f.counts.reset();
+  await s.observe({ kind: "periodic" });
+  assert.deepEqual(f.counts.lists, [undefined], "the first periodic pass is a full safety scan");
+  assert.deepEqual(reserved(f), ["a", "b", "c"]);
+  await s.invalidate("c");
+  f.counts.reset();
+  f.advance(10_000);
+  await s.observe({ kind: "periodic" });
+  assert.deepEqual(f.counts.lists, [["a", "b"]], "only conversations that hold a reservation");
+  f.advance(10_000);
+  await s.invalidate("a");
+  await s.invalidate("b");
+  f.counts.reset();
+  await s.observe({ kind: "periodic" });
+  assert.deepEqual(f.counts.lists, [], "nothing to watch: no listing at all");
+  f.advance(40_000);
+  await s.observe({ kind: "periodic" });
+  assert.deepEqual(f.counts.lists, [undefined], "a full safety scan every minute");
+});
+
+test("the full safety scan still finds activity no event announced", async () => {
+  const f = fixture();
+  const s = f.make();
+  await s.ready;
+  await s.observe({ kind: "periodic" });
+  // A reply ended while its turn-ended event was lost.
+  f.agents.push(nativeAgent(f, "missed"));
+  f.advance(10_000);
+  await s.observe({ kind: "periodic" });
+  assert.deepEqual(reserved(f), [], "the targeted pass does not look at unwatched conversations");
+  f.advance(50_000);
+  await s.observe({ kind: "periodic" });
+  assert.deepEqual(reserved(f), ["missed"]);
+});
+
+test("periodic observation also watches a conversation with a pending operation", async () => {
+  const f = fixture();
+  f.agents.splice(0, 1, nativeAgent(f, "a"), nativeAgent(f, "b"));
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  f.gateway.compact = async () => { await gate; return { status: "completed", detail: "Completed boundary" }; };
+  const s = f.make();
+  await s.ready;
+  await s.observe({ kind: "periodic" });
+  await s.invalidate("a");
+  await s.invalidate("b");
+  const accepted = await s.compactNow("b", f.agents[1].revision!);
+  assert.equal(accepted.status, "running");
+  f.counts.reset();
+  f.advance(10_000);
+  await s.observe({ kind: "periodic" });
+  assert.deepEqual(f.counts.lists, [["b"]]);
+  release();
+  await waitForStatus(f, "completed");
+});
+
+test("a batch of observations reads the state once and writes it once", async () => {
+  const f = fixture();
+  const agents = Array.from({ length: 25 }, (_, index) => nativeAgent(f, `agent-${index}`));
+  const s = f.make();
+  await s.ready;
+  f.counts.reset();
+  await s.observedTurns(agents.map(agent => ({ agent, endedAt: agent.observedEndedAt! })));
+  assert.equal(f.state.jobs.length, 25);
+  assert.equal(f.counts.reads, 1);
+  assert.equal(f.counts.writes, 1);
+});
+
+test("unchanged activity writes nothing and an existing reservation is never duplicated or moved", async () => {
+  const f = fixture();
+  const agents = [nativeAgent(f, "a"), nativeAgent(f, "b")];
+  const s = f.make();
+  await s.ready;
+  await s.observedTurns(agents.map(agent => ({ agent, endedAt: agent.observedEndedAt! })));
+  const before = structuredClone(f.state.jobs);
+  f.advance(30_000);
+  f.counts.reset();
+  await s.observedTurns([...agents, agents[0]].map(agent => ({ agent, endedAt: f.time })));
+  assert.equal(f.counts.writes, 0);
+  assert.deepEqual(f.state.jobs, before, "same activity keeps its original turn end");
+  // New activity of one conversation replaces only its own reservation.
+  const next = nativeAgent(f, "a", "2");
+  await s.observedTurns([{ agent: next, endedAt: f.time }, { agent: agents[1], endedAt: f.time }]);
+  assert.equal(f.state.jobs.length, 2);
+  assert.equal(f.state.jobs.find(job => job.agentId === "a")?.activityKey, next.activityKey);
+  assert.deepEqual(f.state.jobs.find(job => job.agentId === "b"), before.find(job => job.agentId === "b"));
+});
+
+test("a batch applies the same rules as a single turn end", async () => {
+  const f = fixture();
+  const busy = { ...nativeAgent(f, "busy"), idle: false };
+  const ineligible = { ...nativeAgent(f, "ineligible"), eligible: false };
+  const future = { ...nativeAgent(f, "future"), revision: new Date(f.time + 1).toISOString() };
+  const s = f.make();
+  await s.ready;
+  await s.observedTurns([busy, ineligible, future].map(agent => ({ agent, endedAt: f.time })));
+  assert.equal(f.state.jobs.length, 0);
+});
+
+test("a compaction due during a slow observation is dispatched on time", async () => {
+  const f = fixture();
+  f.agents.splice(0, 1, nativeAgent(f, "a"));
+  const s = f.make();
+  await s.ready;
+  await s.observe({ kind: "agent", agentId: "a" });
+  f.advance(55 * 60_000);
+  const release = f.holdList();
+  const scan = s.observe({ kind: "full" });
+  await settle();
+  await s.tick();
+  assert.equal(f.calls, 1, "the tick did not wait for the agent listing");
+  release();
+  await scan;
+  await s.tick();
+  assert.equal(f.calls, 1);
+});
+
+test("overlapping observations never run duplicate scans, and a turn end during a scan is not lost", async () => {
+  const f = fixture();
+  f.agents.splice(0, 1, nativeAgent(f, "a"), nativeAgent(f, "b"));
+  const s = f.make();
+  await s.ready;
+  const release = f.holdList();
+  const scans = [s.observe({ kind: "full" })];
+  await settle();
+  // The reply of b ends while the full scan is already listing.
+  f.agents[1] = nativeAgent(f, "b", "2");
+  scans.push(s.observe({ kind: "periodic" }), s.observe({ kind: "full" }),
+    s.observe({ kind: "agent", agentId: "b" }), s.observe({ kind: "agent", agentId: "b" }));
+  await settle();
+  assert.equal(f.counts.lists.length, 1, "one listing at a time");
+  release();
+  await Promise.all(scans);
+  assert.ok(f.counts.lists.length + f.counts.refreshes.length <= 3,
+    `queued requests were merged: ${JSON.stringify(f.counts)}`);
+  assert.equal(f.state.jobs.find(job => job.agentId === "b")?.activityKey, "launch:b:2");
+});
+
+test("reading a conversation's status records its finished reply, so the controls need not wait for a scan", async () => {
+  const f = fixture();
+  f.agents.splice(0, 1, nativeAgent(f, "a"));
+  const s = f.make();
+  await s.ready;
+  const row = await s.session("a");
+  assert.equal(row?.status, "scheduled");
+  assert.equal(row?.dueAt, f.time + 55 * 60_000);
+  assert.deepEqual(reserved(f), ["a"]);
+  f.counts.reset();
+  await s.session("a");
+  assert.equal(f.counts.writes, 0, "an unchanged activity is not written again");
 });
