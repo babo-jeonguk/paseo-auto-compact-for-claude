@@ -118,7 +118,7 @@ try {
     'This restart suite distinguishes Linux graceful shutdown and process-group SIGKILL; use --suite browser|hooks on other systems');
   report.claude = (await promisify(execFile)(binary, ['--version'], { timeout: 30_000 })).stdout.trim();
   for (const path of ['index.server.ts', 'server/lifecycle.ts', 'server/gateway.ts', 'server/operations.ts', 'server/observer.ts',
-    'server/scheduler.ts', 'client/conversation.tsx', 'client/conversations.tsx', 'client/cadence.ts', 'client/session-state.ts',
+    'server/scheduler.ts', 'client/conversation.tsx', 'client/conversations.tsx', 'client/cadence.ts', 'client/clock.ts', 'client/session-state.ts',
     'tests/simulation/restart-reconnect.mjs', 'tests/simulation/fixture.mjs', 'tests/simulation/model.mjs'])
     report.sources[path] = createHash('sha256').update(await readFile(join(plugin, path))).digest('hex');
   model = await startModel();
