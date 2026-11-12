@@ -572,13 +572,21 @@ export function createScheduler(options: {
     // Conversation controls remain available below the automatic token threshold.
     // Only the state read is queued: host reads and readiness checks run outside
     // the queue so one slow conversation cannot delay another's state changes.
+    // A status read also records the reply it sees, in its own transaction.
     session: async (agentId: string) => {
+      const seq = ++reads;
       const [state, config, agent] = await Promise.all([
         serialize(() => store.read()),
         settings(),
         refresh(agentId),
       ]);
-      return agent?.eligible ? view(agent, state, config) : null;
+      let recorded = false;
+      if (agent?.activityKey && agent.observedEndedAt != null) {
+        await observedTurns([{ agent, endedAt: agent.observedEndedAt, seq }]);
+        recorded = true;
+      }
+      const current = recorded ? await serialize(() => store.read()) : state;
+      return agent?.eligible ? view(agent, current, config) : null;
     },
     list: async () => {
       const [state, config, agents] = await Promise.all([
