@@ -42,9 +42,7 @@ export function createSharedClock(timers: Partial<ClockTimers> = {}): SharedCloc
     if (at !== null) handle = clock.setTimeout(fire, Math.max(0, at - now));
   };
 
-  const fire = () => {
-    handle = null;
-    scheduledAt = null;
+  const notify = () => {
     const now = clock.now();
     for (const subscriber of [...subscribers]) {
       try {
@@ -55,17 +53,10 @@ export function createSharedClock(timers: Partial<ClockTimers> = {}): SharedCloc
     }
     reschedule();
   };
-
-  const notify = () => {
-    const now = clock.now();
-    for (const subscriber of [...subscribers]) {
-      try {
-        subscriber.listener(now);
-      } catch {
-        // Same as fire: a failed listener has nothing to report here.
-      }
-    }
-    reschedule();
+  const fire = () => {
+    handle = null;
+    scheduledAt = null;
+    notify();
   };
 
   const subscribe = (listener: (now: number) => void, nextAt: (now: number) => number | null) => {

@@ -50,9 +50,12 @@ export function useConversation(hostId: string, agentId: string) {
   });
   const mutations = useIsMutating({ mutationKey: key });
   const previousActive = useRef(active);
+  const pendingSince = useRef<number | null>(null);
   useEffect(() => {
     if (active && !previousActive.current) {
       failures.current = pollFailures(failures.current, "focus");
+      // Time spent hidden is not a failed refresh: restart the grace window.
+      pendingSince.current = null;
       void queryClient.invalidateQueries({ queryKey: key });
       sharedClock.notify();
     }
@@ -70,7 +73,6 @@ export function useConversation(hostId: string, agentId: string) {
   const fresh = !query.isError && query.dataUpdatedAt > 0 && now - query.dataUpdatedAt < STATUS_FRESH_MS;
   const ready = fresh && !!row && settings.status === "ready";
   const previous = useRef<Presentation | null>(null);
-  const pendingSince = useRef<number | null>(null);
   const current = ready ? sessionPresentation(row!, settings.values, now) : null;
   if (current) {
     previous.current = current;
