@@ -46,8 +46,11 @@ export function createGateway(options: {
   async function observation(agent: Agent, providers?: Record<string, unknown>): Promise<Observation> {
     providers ??= (await requireApi().config.get()).config.providers;
     const tokens = agent.lastUsage?.contextWindowUsedTokens;
+    const eligible = claudeProvider(providers, agent.provider) && !agent.archivedAt && !agent.internal &&
+      !agent.providerUnavailable && !agent.labels["paseo.parent-agent-id"] && agent.status !== "closed";
     let observerUnreadable = false;
-    const native = (await observer?.read(agent.id).catch(() => { observerUnreadable = true; return null; }))?.ledger;
+    const native = (eligible
+      ? await observer?.read(agent.id).catch(() => { observerUnreadable = true; return null; }) : null)?.ledger;
     const matched = native?.sessionId === agent.persistence?.sessionId ? native : undefined;
     const permission = agent.pendingPermissions.length > 0 || agent.attentionReason === 'permission';
     const inputIdleSince = agent.status === 'idle' && !agent.activeTurn && !permission &&
@@ -57,8 +60,7 @@ export function createGateway(options: {
       agentId: agent.id, title: agent.title, workspace: agent.cwd, provider: agent.provider,
       revision: agent.lastUserMessageAt,
       tokens: typeof tokens === "number" && Number.isFinite(tokens) && tokens >= 0 ? tokens : null,
-      eligible: claudeProvider(providers, agent.provider) && !agent.archivedAt && !agent.internal &&
-        !agent.providerUnavailable && !agent.labels["paseo.parent-agent-id"] && agent.status !== "closed",
+      eligible,
       idle: agent.status === "idle" && !agent.activeTurn && agent.pendingPermissions.length === 0 &&
         agent.attentionReason !== "permission" && (!matched ||
           (!matched.activeTurns.length && !matched.pendingInputs && matched.compact?.status !== "running")),
@@ -78,14 +80,18 @@ export function createGateway(options: {
     };
   }
   const gateway: Gateway = {
-    async list() {
+    async list(filter) {
+      const selected = filter?.agentIds ? new Set(filter.agentIds) : undefined;
+      if (selected?.size === 0) return [];
       const { config } = await requireApi().config.get();
       const agents: Observation[] = [];
       let cursor: string | undefined;
       do {
         const page = await requireApi().agents.list({ filter: { includeBackground: true },
           page: { limit: 200, ...(cursor ? { cursor } : {}) } });
-        agents.push(...await Promise.all(page.entries.map(({ agent }) => observation(agent, config.providers))));
+        // Paseo 0.12's agent list has no ID filter; page the same list and skip unselected entries.
+        const entries = selected ? page.entries.filter(({ agent }) => selected.has(agent.id)) : page.entries;
+        agents.push(...await Promise.all(entries.map(({ agent }) => observation(agent, config.providers))));
         cursor = page.pageInfo.hasMore ? page.pageInfo.nextCursor ?? undefined : undefined;
       } while (cursor);
       return agents;
