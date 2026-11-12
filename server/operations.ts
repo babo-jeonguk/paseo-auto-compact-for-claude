@@ -154,6 +154,9 @@ export function createOperationWorker(options: {
       const operation = await update(state => {
         const current = state.operations.find(entry => entry.id === candidate.id);
         if (stopped || !current || !operationPending(current)) return null;
+        // A snapshot read before a fault must not skip the wait that fault wrote.
+        if (!outcomes.has(current.id) && now() < (current.nextAttemptAt ?? 0) &&
+            now() < deadlineOf(current)) return null;
         current.owner = owner;
         current.updatedAt = now();
         if (current.evidence?.dispatchStartedAt === undefined && !outcomes.has(current.id)) {

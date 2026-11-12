@@ -26,6 +26,7 @@ function fixture(options: { agents?: string[] } = {}) {
   let state: State = { version: 1, disabled: [], jobs: [],
     operations: (options.agents ?? ["a"]).map(id => operation(`operation-${id}`, id)) };
   let sends = 0, writesFail = false, readsFail = 0;
+  let stale: State | null = null;
   const errors: unknown[] = [], calls: string[] = [], events: string[] = [];
   const hooks = new Map<string, Hook>();
   let evidence: Evidence = null;
@@ -59,8 +60,11 @@ function fixture(options: { agents?: string[] } = {}) {
     return result;
   };
   const make = (settings = async (): Promise<Settings | null> => ({ ...DEFAULT_SETTINGS })) => createOperationWorker({ gateway,
-    store: { read: async () => { if (readsFail > 0) { readsFail--; throw new Error("EBUSY"); } return structuredClone(state); },
-      write: async next => { state = next; } },
+    store: { read: async () => {
+        if (readsFail > 0) { readsFail--; throw new Error("EBUSY"); }
+        if (stale) { const value = stale; stale = null; return structuredClone(value); }
+        return structuredClone(state);
+      }, write: async next => { state = next; } },
     update, settings, now: () => time, onError: error => errors.push(error) });
   return { make, gateway, errors, calls, events,
     get agent() { return observations.a; },
@@ -70,6 +74,8 @@ function fixture(options: { agents?: string[] } = {}) {
       assert.ok(found, `missing ${id}`);
       return found;
     },
+    get snapshot() { return structuredClone(state); },
+    readStaleOnce(value: State) { stale = structuredClone(value); },
     get sends() { return sends; },
     set evidence(value: Evidence) { evidence = value; },
     hook(id: string, work: Hook | null) { if (work) hooks.set(id, work); else hooks.delete(id); },
@@ -209,6 +215,30 @@ test("a gateway fault before the dispatch marker is retried; nothing is sent unt
   f.advance(2000); await worker.reconcile();
   assert.equal(f.operation.state, "succeeded");
   assert.equal(f.sends, 1);
+});
+
+test("a stale read cannot skip a faulted operation's retry wait", async () => {
+  const f = fixture(), worker = f.make();
+  const stale = f.snapshot;
+  const compact = f.gateway.compact;
+  f.gateway.compact = async () => { throw new Error("observer preparation timed out"); };
+  await worker.reconcile();
+  assert.equal(f.operation.state, "requested");
+  const attempt = f.operation.attempt;
+  assert.ok(f.operation.nextAttemptAt! > 1000, "the fault scheduled a retry");
+  const calls = f.calls.length;
+  f.gateway.compact = compact;
+  // This reconcile's snapshot predates the fault, so only the claim can see the wait.
+  f.readStaleOnce(stale);
+  await worker.reconcile();
+  assert.equal(f.calls.length, calls, "the stale snapshot cannot start the retry early");
+  assert.equal(f.operation.attempt, attempt, "the faulted attempt is not claimed twice");
+  assert.equal(f.operation.state, "requested");
+  f.advance(2000);
+  await worker.reconcile();
+  assert.equal(f.operation.state, "succeeded");
+  assert.equal(f.operation.attempt, attempt! + 1);
+  worker.stop();
 });
 
 test("a refusal ends the attempt without retry and records that nothing was sent", async () => {
@@ -467,8 +497,8 @@ test("concurrent reconciles start each operation only once", async () => {
   const worker = f.make();
   const first = worker.reconcile(), second = worker.reconcile();
   try {
+    // Both reconciles have passed the claim point by the time the run observes.
     await until(() => f.operation.state === "observing");
-    await new Promise<void>(resolve => setImmediate(resolve));
     assert.equal(f.calls.filter(id => id === "a").length, 1);
   } finally {
     release();

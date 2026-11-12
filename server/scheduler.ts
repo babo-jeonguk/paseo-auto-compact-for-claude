@@ -9,18 +9,23 @@ import { createOperationWorker, recoverOperations, inputFingerprint, mayHaveSent
 import { automaticBlock, dueAt, DELIVERY_WINDOW_MS } from "./policy";
 import { HISTORY_RETENTION_MS, HISTORY_SWEEP_INTERVAL_MS, pruneOperationHistory, type OperationReceipts } from "./retention";
 
-const jobTarget = (job: Job): CompactTarget => ({ sessionId: job.sessionId ?? null, activityKey: job.activityKey ?? null });
+const jobTarget = (job: { sessionId?: string | null; activityKey?: string | null }): CompactTarget =>
+  ({ sessionId: job.sessionId ?? null, activityKey: job.activityKey ?? null });
 const UNAVAILABLE = "This conversation is unavailable for compaction";
+const POLICY_CHANGED = "Automation policy or idle delay changed before dispatch";
+const LATE_DURING_INSPECTION = "Delivery window passed during inspection";
 const terminal = (job: Job) =>
   ["expired", "skipped", "completed", "failed", "unknown"].includes(job.status);
+const pendingOf = (state: State, agentId: string) =>
+  state.operations.find(entry => entry.agentId === agentId && operationPending(entry));
 
 // The reservation a tick inspected, so phase C can tell whether it is still
 // the same one after host I/O.
-type Candidate = { agentId: string; revision: string; endedAt: number;
+type Candidate = Pick<Job, "agentId" | "revision" | "endedAt"> & {
   activityKey: string | null; sessionId: string | null };
 type ReservationOutcome = { kind: "expired" | "skipped" | "blocked"; detail: string } |
   { kind: "reserve"; agent: Observation; config: Settings };
-type Decision = { job: Candidate; outcome: ReservationOutcome };
+type Decision = { candidate: Candidate; outcome: ReservationOutcome };
 
 export function createScheduler(options: {
   store: StateStore;
@@ -226,6 +231,9 @@ export function createScheduler(options: {
     // Unreadable settings keep every reservation for the next tick.
     const config = await settings();
     if (!config || stopped) return false;
+    // One policy call for every phase; `now` is read at the decision.
+    const policy = (input: { agentId: string; endedAt: number; settings: Settings;
+      disabled: readonly string[]; agent?: Observation }) => automaticBlock({ ...input, now: now() });
     // Phase A: read state under the queue and apply the timing policy.
     const { candidates, disabled } = await serialize(async () => {
       const state = await store.read();
@@ -237,11 +245,9 @@ export function createScheduler(options: {
       )) {
         if (terminal(job) || job.status === "running") continue;
         // Only this conversation's own pending operation holds its reservation.
-        if (state.operations.some(entry => entry.agentId === job.agentId && operationPending(entry)))
-          continue;
-        const policy = (settings: Settings, agent?: Observation) => automaticBlock({ agentId: job.agentId,
-          endedAt: job.endedAt, settings, disabled: state.disabled, now: now(), agent });
-        const timing = policy(config);
+        if (pendingOf(state, job.agentId)) continue;
+        const timing = policy({ agentId: job.agentId, endedAt: job.endedAt,
+          settings: config, disabled: state.disabled });
         if (timing === "late") {
           job.status = "expired";
           job.detail = "Delivery window passed; no replay after sleep";
@@ -259,45 +265,42 @@ export function createScheduler(options: {
     // error leaves only that conversation's reservation untouched.
     const decisions = await Promise.all(candidates.map(async (candidate): Promise<Decision | null> => {
       try {
-        const policy = (settings: Settings, agent?: Observation) => automaticBlock({ agentId: candidate.agentId,
-          endedAt: candidate.endedAt, settings, disabled, now: now(), agent });
         const agent = await refresh(candidate.agentId);
         // An unreadable observer is not a changed session: keep the reservation.
         if (agent?.observerUnreadable) return null;
         if (
           !agent ||
-          !unchanged({ revision: candidate.revision, target: {
-            sessionId: candidate.sessionId, activityKey: candidate.activityKey } }, agent) ||
-          policy(config, agent) === "ineligible"
+          !unchanged({ revision: candidate.revision, target: jobTarget(candidate) }, agent) ||
+          policy({ agentId: candidate.agentId, endedAt: candidate.endedAt,
+            settings: config, disabled, agent }) === "ineligible"
         ) {
-          return { job: candidate, outcome: { kind: "skipped",
+          return { candidate, outcome: { kind: "skipped",
             detail: "Session changed or no longer eligible" } };
         }
         if (!gateway.automatic) {
-          return { job: candidate, outcome: { kind: "blocked",
+          return { candidate, outcome: { kind: "blocked",
             detail: "Claude observer unavailable; nothing sent" } };
         }
         if (agent.resumeRequired) {
-          return { job: candidate, outcome: { kind: "blocked", detail: SESSION_RESUME_REQUIRED } };
+          return { candidate, outcome: { kind: "blocked", detail: SESSION_RESUME_REQUIRED } };
         }
         const blocked = gateway.readiness
           ? await bounded(gateway.readiness(agent, dueAt(candidate.endedAt, config)), INSPECT_TIMEOUT_MS)
           : null;
-        if (blocked) return { job: candidate, outcome: { kind: "blocked", detail: blocked } };
+        if (blocked) return { candidate, outcome: { kind: "blocked", detail: blocked } };
         // Settings can change while native observation/host refresh awaits I/O.
         // Unreadable settings are not a change either: keep the reservation.
         const latest = await settings();
         if (!latest) return null;
-        const block = policy(latest, agent);
+        const block = policy({ agentId: candidate.agentId, endedAt: candidate.endedAt,
+          settings: latest, disabled, agent });
         if (block === "late") {
-          return { job: candidate, outcome: { kind: "expired",
-            detail: "Delivery window passed during inspection" } };
+          return { candidate, outcome: { kind: "expired", detail: LATE_DURING_INSPECTION } };
         }
         if (block) {
-          return { job: candidate, outcome: { kind: "blocked",
-            detail: "Automation policy or idle delay changed before dispatch" } };
+          return { candidate, outcome: { kind: "blocked", detail: POLICY_CHANGED } };
         }
-        return { job: candidate, outcome: { kind: "reserve", agent, config: latest } };
+        return { candidate, outcome: { kind: "reserve", agent, config: latest } };
       } catch (error) {
         onError(error);
         return null;
@@ -311,12 +314,12 @@ export function createScheduler(options: {
       let changed = false;
       for (const decision of decisions) {
         if (!decision) continue;
-        const candidate = decision.job;
+        const { candidate, outcome } = decision;
         const job = state.jobs.find(entry => entry.agentId === candidate.agentId);
         if (!job || terminal(job) || job.status === "running") continue;
         if (job.revision !== candidate.revision || job.endedAt !== candidate.endedAt ||
-            (job.activityKey ?? null) !== candidate.activityKey) continue;
-        const outcome = decision.outcome;
+            (job.activityKey ?? null) !== candidate.activityKey ||
+            (job.sessionId ?? null) !== candidate.sessionId) continue;
         if (outcome.kind !== "reserve") {
           job.status = outcome.kind;
           job.detail = outcome.detail;
@@ -324,13 +327,13 @@ export function createScheduler(options: {
           continue;
         }
         // A Compact now accepted meanwhile wins; it sends its own operation.
-        if (state.operations.some(entry => entry.agentId === job.agentId && operationPending(entry)))
-          continue;
-        // A toggle during inspection wins.
-        if (automaticBlock({ agentId: job.agentId, endedAt: job.endedAt, settings: outcome.config,
-            disabled: state.disabled, now: now(), agent: outcome.agent })) {
-          job.status = "blocked";
-          job.detail = "Automation policy or idle delay changed before dispatch";
+        if (pendingOf(state, job.agentId)) continue;
+        // A toggle or a closed delivery window during inspection wins.
+        const block = policy({ agentId: job.agentId, endedAt: job.endedAt,
+          settings: outcome.config, disabled: state.disabled, agent: outcome.agent });
+        if (block) {
+          job.status = block === "late" ? "expired" : "blocked";
+          job.detail = block === "late" ? LATE_DURING_INSPECTION : POLICY_CHANGED;
           changed = true;
           continue;
         }
@@ -498,7 +501,7 @@ export function createScheduler(options: {
               operationId: null, operation: null, code: "idempotency_conflict" as const };
         if (stopped) return { status: "blocked" as const, detail: "Plugin is stopping",
           operationId: null, operation: null, code: "blocked" as const };
-        const pending = state.operations.find(entry => entry.agentId === agentId && operationPending(entry));
+        const pending = pendingOf(state, agentId);
         return pending ? existingResult(pending) : null;
       };
       const early = await serialize(async () => storedAnswer(await store.read()));
@@ -506,11 +509,11 @@ export function createScheduler(options: {
       // Host and observer reads stay outside the state queue: one conversation's
       // slow inspection must not delay another conversation's state changes.
       const [config, agent] = await Promise.all([settings(), refresh(agentId)]);
-      type StoredAnswer = NonNullable<ReturnType<typeof storedAnswer>> |
+      type CompactAnswer = NonNullable<ReturnType<typeof storedAnswer>> |
         { status: Job["status"]; detail: string; operationId: string | null;
           operation: null; code: "existing" };
       const prepared = await serialize(async (): Promise<
-        { result: StoredAnswer } | { job: Job; agent: Observation; operation: StoredOperation }
+        { result: CompactAnswer } | { job: Job; agent: Observation; operation: StoredOperation }
       > => {
         // A request already in flight when this instance stopped must fail like
         // the store's own refusal; a newer instance may own the state now.

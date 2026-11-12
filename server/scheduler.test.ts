@@ -101,11 +101,9 @@ function fixture(automatic = true) {
 }
 
 async function waitForStatus(f: ReturnType<typeof fixture>, status: State["jobs"][number]["status"]) {
-  for (let attempt = 0; attempt < 100; attempt++) {
-    if (f.state.jobs[0]?.status === status) return;
-    await new Promise<void>((resolve) => setImmediate(resolve));
-  }
-  assert.fail(`Timed out waiting for ${status}; current status is ${f.state.jobs[0]?.status}`);
+  const agentId = f.state.jobs[0]?.agentId;
+  assert.ok(agentId, "expected a job to wait for");
+  await waitForAgentStatus(f, agentId, status);
 }
 
 async function waitForAgentStatus(f: ReturnType<typeof fixture>, agentId: string,
@@ -1490,6 +1488,41 @@ test("a toggle during a tick's inspection prevents the automatic reservation", a
   assert.equal(f.state.jobs[0].status, "blocked");
   assert.equal(f.state.jobs[0].detail,
     "Automation policy or idle delay changed before dispatch");
+});
+
+test("a reservation that becomes late during a tick's inspection expires instead of blocking", async () => {
+  const f = fixture(), s = f.make(); await s.ready;
+  await s.observedTurn(f.agents[0]);
+  f.advance(55 * 60_000);
+  const read = f.store.read;
+  let reads = 0;
+  // Phase C reads after inspection; the window closing there is the race this checks.
+  f.store.read = async () => {
+    if (++reads === 3) f.advance(DELIVERY_WINDOW_MS + 1);
+    return read();
+  };
+  await s.tick();
+  assert.equal(f.calls, 0);
+  assert.equal(f.state.operations.length, 0);
+  assert.equal(f.state.jobs[0].status, "expired");
+  assert.equal(f.state.jobs[0].detail, "Delivery window passed during inspection");
+});
+
+test("a reservation whose session changed during inspection is not applied", async () => {
+  const f = fixture(), s = f.make(); await s.ready;
+  await s.observedTurn(f.agents[0]);
+  f.advance(55 * 60_000);
+  const read = f.store.read;
+  let reads = 0;
+  // Phase C reads fresh state; a different session there is not this reservation.
+  f.store.read = async () => {
+    if (++reads === 3) f.state.jobs[0].sessionId = "other-session";
+    return read();
+  };
+  await s.tick();
+  assert.equal(f.calls, 0);
+  assert.equal(f.state.operations.length, 0);
+  assert.equal(f.state.jobs[0].status, "scheduled");
 });
 
 test("one conversation's failed host read does not stop another conversation's reservation", async () => {
