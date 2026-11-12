@@ -2,7 +2,7 @@ import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { createGateway } from "./server/gateway";
 import { createScheduler } from "./server/scheduler";
 import { bounded, INSPECT_TIMEOUT_MS } from "./server/deadline";
-import { createStore } from "./server/store";
+import { createCachedStore, createStore } from "./server/store";
 import { createObserver } from "./server/observer";
 import { createReporter } from "./server/report";
 import { createLifecycleHooks } from "./server/lifecycle";
@@ -28,7 +28,7 @@ export default function contribute(server: PluginServerContext) {
   const reporter = createReporter(message => console.error("[auto-compact-for-claude]", message));
   const report = reporter.report;
   const scheduler = createScheduler({
-    store: createStore(),
+    store: createCachedStore(createStore()),
     gateway: host.gateway,
     receipts: { remove: observer.removeReceipt, sweep: observer.sweepReceipts },
     settings: async () => {

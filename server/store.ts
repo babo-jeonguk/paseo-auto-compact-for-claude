@@ -49,6 +49,27 @@ function decode(value: unknown): State {
   return StateSchema.parse({ ...legacy, operations });
 }
 
+export function createCachedStore(inner: StateStore): StateStore {
+  let cached: State | null = null;
+  let generation = 0;
+  // The plugin is the only writer; an external edit to the file is not detected.
+  return {
+    async read() {
+      if (cached) return structuredClone(cached);
+      const started = generation;
+      const state = await inner.read();
+      // A write that completed meanwhile already stored the newer snapshot.
+      if (started === generation && !cached) cached = structuredClone(state);
+      return state;
+    },
+    async write(state) {
+      await inner.write(state);
+      generation++;
+      cached = structuredClone(state);
+    },
+  };
+}
+
 export function createStore(
   path = join(
     process.env.PASEO_HOME || join(homedir(), ".paseo"),
