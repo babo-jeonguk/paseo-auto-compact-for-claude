@@ -212,29 +212,23 @@ export function createScheduler(options: {
       inputFingerprint: fingerprint, state: "requested", createdAt: now(), updatedAt: now(), result: null,
       sendBy: now() + SEND_DEADLINE_MS[kind], reservationEndedAt: job.endedAt, attempt: 0 };
   }
-  // Automatic reservations are per conversation. Host reads and policy checks
-  // run outside the state queue, and every decision is re-checked against fresh
-  // state before it is written, so one slow or failing conversation cannot
-  // delay another.
-  let reservationPass: Promise<boolean> | null = null;
-  function reserveDue(connected: boolean): Promise<boolean> {
-    // A tick that arrives during inspection joins that pass instead of starting
-    // a second one; cleanup and reconcile already tolerate overlapping calls.
-    if (reservationPass) return reservationPass;
-    const pass = reserveDueOnce(connected);
-    reservationPass = pass;
-    const reset = () => { if (reservationPass === pass) reservationPass = null; };
-    pass.then(reset, reset);
-    return pass;
-  }
-  async function reserveDueOnce(connected: boolean): Promise<boolean> {
+  // Automatic reservations are per conversation. A candidate's host reads run
+  // outside the state queue; as soon as they finish, its decision is re-checked
+  // and saved in its own transaction, and its send starts without waiting for
+  // other conversations. `inspecting` lets a later tick leave those in flight
+  // alone while it handles every other due conversation.
+  const inspecting = new Set<string>();
+  async function reserveDue(connected: boolean): Promise<void> {
     // Unreadable settings keep every reservation for the next tick.
     const config = await settings();
-    if (!config || stopped) return false;
+    if (!config || stopped) return;
+    // The helpers below close over the narrowed value; keep it explicit.
+    const phaseConfig = config;
     // One policy call for every phase; `now` is read at the decision.
     const policy = (input: { agentId: string; endedAt: number; settings: Settings;
       disabled: readonly string[]; agent?: Observation }) => automaticBlock({ ...input, now: now() });
-    // Phase A: read state under the queue and apply the timing policy.
+    // Phase A: read state under the queue and apply the timing policy. A
+    // conversation already being inspected by an earlier tick is left alone.
     const { candidates, disabled } = await serialize(async () => {
       const state = await store.read();
       if (stopped) return { candidates: [] as Candidate[], disabled: state.disabled };
@@ -243,6 +237,7 @@ export function createScheduler(options: {
       for (const job of [...state.jobs].sort(
         (a, b) => a.endedAt - b.endedAt
       )) {
+        if (inspecting.has(job.agentId)) continue;
         if (terminal(job) || job.status === "running") continue;
         // Only this conversation's own pending operation holds its reservation.
         if (pendingOf(state, job.agentId)) continue;
@@ -259,11 +254,13 @@ export function createScheduler(options: {
           activityKey: job.activityKey ?? null, sessionId: job.sessionId ?? null });
       }
       if (changed) await store.write(state);
+      // Another tick must not start inspecting these again while this one owns them.
+      for (const candidate of candidates) inspecting.add(candidate.agentId);
       return { candidates, disabled: state.disabled };
     });
     // Phase B: inspect the candidates concurrently and in isolation. A thrown
     // error leaves only that conversation's reservation untouched.
-    const decisions = await Promise.all(candidates.map(async (candidate): Promise<Decision | null> => {
+    async function inspect(candidate: Candidate): Promise<Decision | null> {
       try {
         const agent = await refresh(candidate.agentId);
         // An unreadable observer is not a changed session: keep the reservation.
@@ -272,7 +269,7 @@ export function createScheduler(options: {
           !agent ||
           !unchanged({ revision: candidate.revision, target: jobTarget(candidate) }, agent) ||
           policy({ agentId: candidate.agentId, endedAt: candidate.endedAt,
-            settings: config, disabled, agent }) === "ineligible"
+            settings: phaseConfig, disabled, agent }) === "ineligible"
         ) {
           return { candidate, outcome: { kind: "skipped",
             detail: "Session changed or no longer eligible" } };
@@ -285,7 +282,7 @@ export function createScheduler(options: {
           return { candidate, outcome: { kind: "blocked", detail: SESSION_RESUME_REQUIRED } };
         }
         const blocked = gateway.readiness
-          ? await bounded(gateway.readiness(agent, dueAt(candidate.endedAt, config)), INSPECT_TIMEOUT_MS)
+          ? await bounded(gateway.readiness(agent, dueAt(candidate.endedAt, phaseConfig)), INSPECT_TIMEOUT_MS)
           : null;
         if (blocked) return { candidate, outcome: { kind: "blocked", detail: blocked } };
         // Settings can change while native observation/host refresh awaits I/O.
@@ -305,57 +302,70 @@ export function createScheduler(options: {
         onError(error);
         return null;
       }
-    }));
-    // Phase C: apply every decision to fresh state, then write once.
-    let reserved = false;
-    await serialize(async () => {
-      if (stopped) return;
-      const state = await store.read();
-      let changed = false;
-      for (const decision of decisions) {
-        if (!decision) continue;
+    }
+    // Phase C: re-check and apply this one decision to fresh state. Each
+    // conversation writes in its own transaction, so it never waits for another
+    // conversation's inspection or commit.
+    async function apply(decision: Decision): Promise<boolean> {
+      return serialize(async () => {
+        if (stopped) return false;
+        const state = await store.read();
         const { candidate, outcome } = decision;
         const job = state.jobs.find(entry => entry.agentId === candidate.agentId);
-        if (!job || terminal(job) || job.status === "running") continue;
+        if (!job || terminal(job) || job.status === "running") return false;
         if (job.revision !== candidate.revision || job.endedAt !== candidate.endedAt ||
             (job.activityKey ?? null) !== candidate.activityKey ||
-            (job.sessionId ?? null) !== candidate.sessionId) continue;
+            (job.sessionId ?? null) !== candidate.sessionId) return false;
+        let changed = false;
+        let reserved = false;
         if (outcome.kind !== "reserve") {
           job.status = outcome.kind;
           job.detail = outcome.detail;
           changed = true;
-          continue;
+        } else if (!pendingOf(state, job.agentId)) {
+          // A toggle or a closed delivery window during inspection wins.
+          const block = policy({ agentId: job.agentId, endedAt: job.endedAt,
+            settings: outcome.config, disabled: state.disabled, agent: outcome.agent });
+          if (block) {
+            job.status = block === "late" ? "expired" : "blocked";
+            job.detail = block === "late" ? LATE_DURING_INSPECTION : POLICY_CHANGED;
+            changed = true;
+          } else {
+            // Automatic work never repeats an activity, even one whose attempt sent nothing.
+            const attempted = state.operations.find(entry => sameActivity(entry, outcome.agent));
+            if (attempted) {
+              job.operationId = attempted.id;
+              changed = true;
+            } else {
+              const operation = newOperation(job, outcome.agent, "automatic");
+              // The delivery window limits when sending may start, not how long it is observed.
+              operation.deliveryExpiresAt = dueAt(job.endedAt, outcome.config) + DELIVERY_WINDOW_MS;
+              operation.sendBy = Math.min(operation.sendBy!, operation.deliveryExpiresAt);
+              job.operationId = operation.id;
+              state.operations.push(operation);
+              changed = true;
+              reserved = true;
+            }
+          }
         }
-        // A Compact now accepted meanwhile wins; it sends its own operation.
-        if (pendingOf(state, job.agentId)) continue;
-        // A toggle or a closed delivery window during inspection wins.
-        const block = policy({ agentId: job.agentId, endedAt: job.endedAt,
-          settings: outcome.config, disabled: state.disabled, agent: outcome.agent });
-        if (block) {
-          job.status = block === "late" ? "expired" : "blocked";
-          job.detail = block === "late" ? LATE_DURING_INSPECTION : POLICY_CHANGED;
-          changed = true;
-          continue;
-        }
-        // Automatic work never repeats an activity, even one whose attempt sent nothing.
-        const attempted = state.operations.find(entry => sameActivity(entry, outcome.agent));
-        if (attempted) {
-          job.operationId = attempted.id;
-          changed = true;
-          continue;
-        }
-        const operation = newOperation(job, outcome.agent, "automatic");
-        // The delivery window limits when sending may start, not how long it is observed.
-        operation.deliveryExpiresAt = dueAt(job.endedAt, outcome.config) + DELIVERY_WINDOW_MS;
-        operation.sendBy = Math.min(operation.sendBy!, operation.deliveryExpiresAt);
-        job.operationId = operation.id;
-        state.operations.push(operation);
-        changed = true;
-        reserved = true;
+        if (changed) await store.write(state);
+        return reserved;
+      });
+    }
+    await Promise.all(candidates.map(async (candidate) => {
+      let reserved = false;
+      try {
+        const decision = await inspect(candidate);
+        if (decision) reserved = await apply(decision);
+      } catch (error) {
+        onError(error);
+      } finally {
+        inspecting.delete(candidate.agentId);
       }
-      if (changed) await store.write(state);
-    });
-    return reserved;
+      // A reservation starts its own worker pass at once, without waiting for
+      // another conversation's inspection to finish.
+      if (reserved) await worker.reconcile(connected);
+    }));
   }
   const existingResult = (operation: StoredOperation) => ({
     status: operationRowStatus(operation), detail: operation.result?.message ?? "Compaction requested",
@@ -601,7 +611,7 @@ export function createScheduler(options: {
     tick: async (connected = true) => {
       await serialize(cleanup);
       const started = [worker.reconcile(connected)];
-      if (await reserveDue(connected)) started.push(worker.reconcile(connected));
+      await reserveDue(connected);
       await Promise.all(started);
     },
   };

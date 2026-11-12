@@ -605,32 +605,6 @@ test("list and policy edits remain responsive during a compaction; another conve
     assert.equal(b.code, "accepted");
     assert.equal(b.status, "running");
     await waitForAgentStatus(f, "b", "completed");
-    assert.deepEqual(f.sent, ["a", "b"]);
-    assert.equal(f.state.jobs.find((job) => job.agentId === "a")?.status, "running");
-  } finally {
-    release();
-  }
-  await run;
-  await waitForAgentStatus(f, "a", "completed");
-  assert.deepEqual(f.state.disabled, ["b"]);
-});
-
-test("a held compaction does not delay another conversation's Compact now", async () => {
-  const f = fixture();
-  f.addAgent("b");
-  let release!: () => void;
-  const gate = new Promise<void>((resolve) => { release = resolve; });
-  let started!: () => void;
-  const start = new Promise<void>((resolve) => { started = resolve; });
-  f.holdCompact("a", async () => { started(); await gate; });
-  const s = f.make();
-  await s.ready;
-  const run = s.compactNow("a", f.agents[0].revision!);
-  await start;
-  try {
-    const b = await s.compactNow("b", f.agents[1].revision!);
-    assert.equal(b.code, "accepted");
-    await waitForAgentStatus(f, "b", "completed");
     assert.deepEqual(f.sent, ["a", "b"], "b is sent while a is still held");
     assert.equal(f.state.jobs.find((job) => job.agentId === "a")?.status, "running");
   } finally {
@@ -638,6 +612,7 @@ test("a held compaction does not delay another conversation's Compact now", asyn
   }
   await run;
   await waitForAgentStatus(f, "a", "completed");
+  assert.deepEqual(f.state.disabled, ["b"]);
 });
 
 test("a refused compaction does not affect another conversation's Compact now", async () => {
@@ -1383,6 +1358,88 @@ test("a conversation compacting does not stop a later tick from reserving anothe
   }
   await first;
   await waitForAgentStatus(f, "a", "completed");
+});
+
+test("a slow inspection of one conversation does not delay another conversation's automatic reservation", async () => {
+  const f = fixture();
+  f.addAgent("b");
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let started!: () => void;
+  const start = new Promise<void>((resolve) => { started = resolve; });
+  let held = false;
+  f.holdRefresh("a", async () => {
+    if (held) return;
+    held = true;
+    started();
+    await gate;
+  });
+  const s = f.make();
+  await s.ready;
+  await s.observedTurn(f.agents[0]);
+  await s.observedTurn(f.agents[1]);
+  f.advance(55 * 60_000);
+  const tick = s.tick();
+  await start;
+  try {
+    for (let i = 0; i < 100 && !f.sent.includes("b"); i++)
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepEqual(f.sent, ["b"], "b is sent while a's inspection is still held");
+    await waitForAgentStatus(f, "b", "completed");
+    assert.equal(f.state.jobs.find((job) => job.agentId === "b")?.status, "completed");
+    assert.equal(f.state.jobs.find((job) => job.agentId === "a")?.status, "scheduled");
+  } finally {
+    release();
+  }
+  await tick;
+  await waitForAgentStatus(f, "a", "completed");
+  assert.deepEqual([...f.sent].sort(), ["a", "b"]);
+  assert.equal(f.sent.filter((agentId) => agentId === "a").length, 1);
+  assert.equal(f.sent.filter((agentId) => agentId === "b").length, 1);
+});
+
+test("a later tick skips only the conversation being inspected and reserves another", async () => {
+  const f = fixture();
+  f.addAgent("b");
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let started!: () => void;
+  const start = new Promise<void>((resolve) => { started = resolve; });
+  let refreshes = 0;
+  let held = false;
+  f.holdRefresh("a", async () => {
+    refreshes++;
+    if (held) return;
+    held = true;
+    started();
+    await gate;
+  });
+  const s = f.make();
+  await s.ready;
+  await s.observedTurn(f.agents[0]);
+  f.advance(55 * 60_000);
+  const first = s.tick();
+  await start;
+  // b becomes due after the first tick has begun inspecting a, without moving
+  // a past its delivery window.
+  await s.observedTurn(f.agents[1]);
+  f.state.jobs.find((job) => job.agentId === "b")!.endedAt = f.time - 55 * 60_000;
+  const inspected = refreshes;
+  const second = s.tick();
+  const settled = await within(second);
+  try {
+    assert.notEqual(settled, null, "the second tick resolves while a's inspection is held");
+    assert.equal(refreshes, inspected, "the held conversation is not inspected again");
+    assert.deepEqual(f.sent, ["b"], "b is sent while a's inspection is held");
+    assert.equal(f.state.jobs.find((job) => job.agentId === "b")?.status, "completed");
+  } finally {
+    release();
+  }
+  await first;
+  await waitForAgentStatus(f, "a", "completed");
+  assert.deepEqual(f.sent, ["b", "a"]);
+  assert.equal(f.sent.filter((agentId) => agentId === "a").length, 1);
+  assert.equal(f.sent.filter((agentId) => agentId === "b").length, 1);
 });
 
 test("Compact now returns the pending automatic operation and sends once", async () => {
