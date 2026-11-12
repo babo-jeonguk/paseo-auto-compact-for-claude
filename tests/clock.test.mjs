@@ -34,18 +34,40 @@ test("controls showing countdowns share one timer set for the earliest boundary"
   assert.deepEqual(timers.active, [start + 1_000]);
 });
 
-test("every subscriber is notified at the boundary with the current time", () => {
+test("a boundary notifies only the controls whose own boundary arrived", () => {
   const timers = fakeTimers();
   const clock = createSharedClock(timers);
   const start = timers.now();
-  const first = [], second = [];
-  clock.subscribe(now => first.push(now), now => now + 30_000);
-  clock.subscribe(now => second.push(now), now => now + 1_000);
+  const later = [], soon = [], idle = [];
+  clock.subscribe(now => later.push(now), now => now < start + 30_000 ? start + 30_000 : null);
+  clock.subscribe(now => soon.push(now), now => now < start + 1_000 ? start + 1_000 : null);
+  clock.subscribe(now => idle.push(now), () => null);
   timers.advance(999);
-  assert.deepEqual([first, second], [[], []]);
+  assert.deepEqual([later, soon, idle], [[], [], []]);
   timers.advance(1);
-  assert.deepEqual(first, [start + 1_000]);
-  assert.deepEqual(second, [start + 1_000]);
+  assert.deepEqual(soon, [start + 1_000]);
+  assert.deepEqual(later, [], "a control whose display has not changed does not render");
+  timers.advance(29_000);
+  assert.deepEqual(later, [start + 30_000]);
+  assert.deepEqual(soon, [start + 1_000]);
+  assert.deepEqual(idle, [], "a control without a countdown never renders from the clock");
+});
+
+test("a countdown in its last minute does not make a minute countdown render every second", () => {
+  const timers = fakeTimers();
+  const clock = createSharedClock(timers);
+  const start = timers.now();
+  const label = dueAt => now => {
+    const remaining = dueAt - now;
+    if (remaining <= 0) return null;
+    return now + (remaining > 60_000 ? ((remaining - 1) % 60_000) + 1 : ((remaining - 1) % 1_000) + 1);
+  };
+  const seconds = [], minutes = [];
+  clock.subscribe(now => seconds.push(now), label(start + 30_000));
+  clock.subscribe(now => minutes.push(now), label(start + 10 * 60_000));
+  timers.advance(30_000);
+  assert.equal(seconds.length, 30);
+  assert.equal(minutes.length, 0);
 });
 
 test("after a boundary the clock reschedules to the next one", () => {

@@ -1400,3 +1400,33 @@ test("a listing that never ends stops blocking observation after a minute", asyn
     mock.timers.reset();
   }
 });
+
+test("a refresh that fails does not end single-flight while a sibling refresh is still running", async () => {
+  const f = fixture();
+  f.agents.splice(0, 1, nativeAgent(f, "a"), nativeAgent(f, "b"));
+  const s = f.make();
+  await s.ready;
+  let releaseB!: () => void;
+  let heldB = false;
+  const refreshed: string[] = [];
+  f.gateway.refresh = async (id) => {
+    refreshed.push(id);
+    if (id === "a") throw new Error("host failed for a");
+    if (!heldB) { heldB = true; await new Promise<void>(resolve => { releaseB = resolve; }); }
+    return structuredClone(f.agents.find(agent => agent.agentId === id) ?? null);
+  };
+  const release = f.holdList();
+  const full = s.observe({ kind: "full" });
+  await settle();
+  // Two turn ends merge into one plan that refreshes a and b together.
+  const merged = [s.observe({ kind: "agent", agentId: "a" }), s.observe({ kind: "agent", agentId: "b" })];
+  release();
+  await full;
+  await assert.rejects(merged[0], /host failed for a/);
+  const again = s.observe({ kind: "agent", agentId: "b" });
+  await settle();
+  assert.deepEqual(refreshed.filter(id => id === "b"), ["b"], "no second read of b while the first is running");
+  releaseB();
+  await again;
+  assert.deepEqual(refreshed.filter(id => id === "b"), ["b", "b"]);
+});
