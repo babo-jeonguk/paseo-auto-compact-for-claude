@@ -1997,3 +1997,37 @@ test("one conversation's failed refresh does not drop another conversation's fin
   await assert.rejects(merged[1], /host failed for a/, "the failure is still reported");
   assert.deepEqual(reserved(f), ["b"], "b's finished reply is reserved without waiting for a full scan");
 });
+
+test("a refresh that hangs past the deadline does not drop another conversation's finished reply", async () => {
+  const f = fixture();
+  f.agents.splice(0, 1);
+  const s = f.make();
+  await s.ready;
+  let releaseA!: () => void;
+  f.holdRefresh("a", () => new Promise<void>(resolve => { releaseA = resolve; }));
+  const release = f.holdList();
+  mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    // A full scan that read no conversation is still running...
+    const full = s.observe({ kind: "full" });
+    await settle();
+    // ...when replies of a and b end; their turn-end observations merge.
+    f.agents.push(nativeAgent(f, "a"), nativeAgent(f, "b"));
+    const merged = [s.observe({ kind: "agent", agentId: "a" }), s.observe({ kind: "agent", agentId: "b" })];
+    release();
+    await full;
+    await settle();
+    mock.timers.tick(5_000);
+    await assert.rejects(merged[1], "the timeout is still reported");
+    assert.deepEqual(reserved(f), ["b"], "b's finished reply is reserved although a's read is still running");
+    const again = s.observe({ kind: "agent", agentId: "b" });
+    await settle();
+    assert.deepEqual(f.counts.refreshes.filter(id => id === "b"), ["b"],
+      "observation stays single-flight while a's read is still running");
+    releaseA();
+    await again;
+  } finally {
+    releaseA?.();
+    mock.timers.reset();
+  }
+});
