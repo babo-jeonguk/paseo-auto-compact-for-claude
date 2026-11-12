@@ -1191,11 +1191,13 @@ test("periodic observation also watches a conversation with a pending operation"
   const accepted = await s.compactNow("b", f.agents[1].revision!);
   assert.equal(accepted.status, "running");
   f.counts.reset();
-  f.advance(10_000);
+  // Inside the 10-second manual send deadline, before the next full scan.
+  f.advance(1_000);
   await s.observe({ kind: "periodic" });
   assert.deepEqual(f.counts.lists, [["b"]]);
   release();
-  await waitForStatus(f, "completed");
+  for (let attempt = 0; attempt < 100 && f.state.operations[0]?.state !== "succeeded"; attempt++) await settle();
+  assert.equal(f.state.operations[0]?.state, "succeeded");
 });
 
 test("a batch of observations reads the state once and writes it once", async () => {
