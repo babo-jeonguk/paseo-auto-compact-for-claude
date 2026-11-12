@@ -74,7 +74,8 @@ export function recoverOperations(state: State, now: number) {
 }
 
 // This module owns execution/recovery; the scheduler supplies its one state
-// transaction queue so reservation changes and worker checkpoints cannot race.
+// transaction queue, so claims, checkpoints and completions of concurrent
+// conversations cannot race.
 export function createOperationWorker(options: {
   store: StateStore;
   update<T>(change: (state: State) => T): Promise<T>;
@@ -89,8 +90,13 @@ export function createOperationWorker(options: {
   const outcomes = new Map<string, Ending>();
   // The last fault of work being retried; reported only if the work expires.
   const faults = new Map<string, unknown>();
-  let running = false, again = false, stopped = false, lastConnected = true;
-  let retry: ReturnType<typeof setTimeout> | undefined;
+  let stopped = false, lastConnected = true;
+  // Runs this worker has in flight, keyed by operation, so a second reconcile
+  // never starts the same operation twice.
+  const active = new Map<string, Promise<void>>();
+  // One retry wake-up per operation: another conversation's fault cannot cancel
+  // or delay this operation's retry.
+  const retries = new Map<string, ReturnType<typeof setTimeout>>();
   // Pending work this worker claimed and still holds.
   const held = (operation: StoredOperation | undefined): operation is StoredOperation =>
     !stopped && !!operation && operationPending(operation) && operation.owner === owner;
@@ -118,23 +124,28 @@ export function createOperationWorker(options: {
     if (finished?.evidence?.native && gateway.release)
       await bounded(gateway.release(finished), INSPECT_TIMEOUT_MS).catch(() => {});
   }
-  // A request that arrives during a pass runs another pass right after it, so
-  // a new operation never waits for the next tick. Callers do not wait for a
-  // pass someone else started.
+  // Every reconcile scans all pending work: conversations run independently and
+  // a second call must not start an operation already running. Callers wait only
+  // for runs they started; a request saved during a run is picked up by the next
+  // reconcile the scheduler makes after saving it.
   async function reconcile(connected = true) {
     lastConnected = connected;
     if (stopped) return;
-    if (running) { again = true; return; }
-    running = true;
-    try {
-      do { again = false; await pass(lastConnected); } while (again && !stopped);
-    } finally { running = false; }
+    let state: State;
+    try { state = await store.read(); }
+    catch (error) { return onError(error); }
+    const started: Promise<void>[] = [];
+    for (const candidate of state.operations.filter(operationPending)) {
+      if (active.has(candidate.id)) continue;
+      const task = run(candidate, connected).catch(onError).finally(() => active.delete(candidate.id));
+      active.set(candidate.id, task);
+      started.push(task);
+    }
+    await Promise.all(started);
   }
-  async function pass(connected: boolean) {
+  async function run(candidate: StoredOperation, connected: boolean) {
     let claimed: StoredOperation | undefined;
     try {
-      const candidate = (await store.read()).operations.find(operationPending);
-      if (!candidate) return;
       if (!outcomes.has(candidate.id) && now() < (candidate.nextAttemptAt ?? 0) && now() < deadlineOf(candidate)) return;
       // Expiry and retained local outcomes can progress even before host attach.
       if (!connected && !outcomes.has(candidate.id) && !candidate.evidence?.boundary && now() < deadlineOf(candidate)) return;
@@ -222,7 +233,7 @@ export function createOperationWorker(options: {
       // record and is retried until the send deadline, then expires unsent;
       // only the fault that ends it is reported. The decision is made on the
       // stored record, never on the copy taken at claim: work whose marker was
-      // written in this pass is not ours to expire, and is never resent.
+      // written during this run is not ours to expire, and is never resent.
       if (!claimed || outcomes.has(claimed.id) || stopped) return onError(error);
       const id = claimed.id;
       try {
@@ -244,12 +255,21 @@ export function createOperationWorker(options: {
         if (next === "refused") return await finish(id, { status: "failed", detail: (error as Refusal).message });
         faults.set(id, error);
         if (next === "expired") return await finish(id, "expired");
-        // The worker wakes itself for the retry rather than waiting for a tick.
-        clearTimeout(retry);
-        retry = setTimeout(() => { void reconcile(lastConnected).catch(onError); }, next);
-        retry.unref?.();
+        // This operation wakes itself for its retry; other conversations keep running.
+        const previous = retries.get(id);
+        if (previous) clearTimeout(previous);
+        const timer = setTimeout(() => {
+          retries.delete(id);
+          void reconcile(lastConnected).catch(onError);
+        }, next);
+        timer.unref?.();
+        retries.set(id, timer);
       } catch (writeError) { onError(writeError); }
     }
   }
-  return { reconcile, stop() { stopped = true; clearTimeout(retry); } };
+  return { reconcile, stop() {
+    stopped = true;
+    for (const timer of retries.values()) clearTimeout(timer);
+    retries.clear();
+  } };
 }
