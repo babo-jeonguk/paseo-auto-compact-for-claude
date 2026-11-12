@@ -20,6 +20,23 @@ export type ObservationScope =
   | { kind: "periodic" }
   | { kind: "full" };
 
+// Native activity keys are `${launchId}:${generation}:${revision}`.
+function splitActivityKey(key: string) {
+  const at = key.lastIndexOf(":");
+  return at < 0
+    ? { epoch: key, revision: Number.NaN }
+    : { epoch: key.slice(0, at), revision: Number(key.slice(at + 1)) };
+}
+
+// Observations are read outside the state transaction, so they can commit out of order.
+function staleActivity(prior: string | undefined, next: string | undefined) {
+  if (!prior || !next) return false;
+  const before = splitActivityKey(prior), after = splitActivityKey(next);
+  return before.epoch === after.epoch &&
+    Number.isFinite(before.revision) && Number.isFinite(after.revision) &&
+    after.revision < before.revision;
+}
+
 // Apply one finished native turn to the state in memory. Returns whether the
 // state changed; the caller decides when to persist it.
 function applyObservation(state: State, agent: Observation, endedAt: number, stopped: boolean) {
@@ -32,7 +49,8 @@ function applyObservation(state: State, agent: Observation, endedAt: number, sto
     // Background notifications start native turns without a new host
     // message, so native activity identifies work when it is available.
     (agent.activityKey
-      ? prior?.activityKey === agent.activityKey
+      ? prior?.activityKey === agent.activityKey ||
+        staleActivity(prior?.activityKey, agent.activityKey)
       : prior?.revision === agent.revision) ||
     stopped
   )

@@ -51,20 +51,29 @@ function decode(value: unknown): State {
 
 export function createCachedStore(inner: StateStore): StateStore {
   let cached: State | null = null;
-  let generation = 0;
+  // Advances on every write and failed read, so an older read cannot refill the cache.
+  let epoch = 0;
   // The plugin is the only writer; an external edit to the file is not detected.
   return {
     async read() {
       if (cached) return structuredClone(cached);
-      const started = generation;
-      const state = await inner.read();
+      const started = epoch;
+      let state: State;
+      try {
+        state = await inner.read();
+      } catch (error) {
+        // The failed read invalidates whatever another read cached meanwhile.
+        cached = null;
+        epoch++;
+        throw error;
+      }
       // A write that completed meanwhile already stored the newer snapshot.
-      if (started === generation && !cached) cached = structuredClone(state);
+      if (started === epoch && !cached) cached = structuredClone(state);
       return state;
     },
     async write(state) {
       await inner.write(state);
-      generation++;
+      epoch++;
       cached = structuredClone(state);
     },
   };

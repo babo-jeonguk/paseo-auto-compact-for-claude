@@ -14,6 +14,20 @@ export function pollFailures(previous: number, event: PollEvent): number {
   return event === "failure" ? previous + 1 : 0;
 }
 
+const failuresBySession = new Map<string, number>();
+
+// Every control of one conversation shares its backoff, however many are mounted.
+export function sessionFailures(key: string): { count(): number; record(event: PollEvent): void } {
+  return {
+    count: () => failuresBySession.get(key) ?? 0,
+    record(event) {
+      const next = pollFailures(failuresBySession.get(key) ?? 0, event);
+      if (next === 0) failuresBySession.delete(key);
+      else failuresBySession.set(key, next);
+    },
+  };
+}
+
 export function sessionPollDelay(input: { active: boolean; failures: number }): number | false {
   if (!input.active) return false;
   return input.failures >= SESSION_BACKOFF_FAILURES ? SESSION_BACKOFF_MS : SESSION_POLL_MS;

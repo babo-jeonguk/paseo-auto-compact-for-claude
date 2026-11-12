@@ -19,7 +19,7 @@ import { canSkip, errorLabel, tokenLabel } from "./format";
 import { canUndoSkip, compactCompletionNotice, compactOutcomeNotice, INPUT_IDLE_GRACE_MS, pendingPresentation,
   sessionKey, sessionPresentation, STATUS_GRACE_MS, type Presentation } from "./session-state";
 import { compactSubmissions } from "./compact-submission";
-import { OPERATION_LOOKUP_MS, nextRenderAt, operationPollDelay, pollFailures,
+import { OPERATION_LOOKUP_MS, nextRenderAt, operationPollDelay, sessionFailures,
   sessionPollDelay, STATUS_FRESH_MS } from "./cadence";
 import { sharedClock } from "./clock";
 import { useClockRender, useSurfaceActive } from "./surface";
@@ -32,20 +32,20 @@ export function useConversation(hostId: string, agentId: string) {
   const paseo = usePaseo();
   const key = sessionKey(hostId, agentId);
   const active = useSurfaceActive();
-  const failures = useRef(0);
+  const failures = sessionFailures(key.join(":"));
   const query = useQuery({
     queryKey: key,
     queryFn: async () => {
       try {
         const result = await read({ agentId });
-        failures.current = pollFailures(failures.current, "success");
+        failures.record("success");
         return result;
       } catch (error) {
-        failures.current = pollFailures(failures.current, "failure");
+        failures.record("failure");
         throw error;
       }
     },
-    refetchInterval: () => sessionPollDelay({ active, failures: failures.current }),
+    refetchInterval: () => sessionPollDelay({ active, failures: failures.count() }),
     retry: false,
   });
   const mutations = useIsMutating({ mutationKey: key });
@@ -53,7 +53,7 @@ export function useConversation(hostId: string, agentId: string) {
   const pendingSince = useRef<number | null>(null);
   useEffect(() => {
     if (active && !previousActive.current) {
-      failures.current = pollFailures(failures.current, "focus");
+      failures.record("focus");
       // Time spent hidden is not a failed refresh: restart the grace window.
       pendingSince.current = null;
       void queryClient.invalidateQueries({ queryKey: key });
