@@ -50,7 +50,7 @@ function fixture(automatic = true) {
     list: async () => structuredClone(agents),
     refresh,
     compact,
-    ...(automatic ? { automatic: async () => compact("a") } : {}),
+    ...(automatic ? { automatic: async (expected: Observation) => compact(expected.agentId) } : {}),
   };
   const make = () =>
     createScheduler({
@@ -1320,5 +1320,220 @@ test("what already happened to an activity is answered before whether sending ma
     assert.equal(again.code, "existing", JSON.stringify(live));
     assert.equal(again.operationId, "request-a");
   }
+  assert.equal(f.calls, 1);
+});
+
+test("two conversations due in the same tick are both reserved and sent independently", async () => {
+  const f = fixture();
+  f.addAgent("b");
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let started!: () => void;
+  const start = new Promise<void>((resolve) => { started = resolve; });
+  f.holdCompact("a", async () => { started(); await gate; });
+  const s = f.make();
+  await s.ready;
+  await s.observedTurn(f.agents[0]);
+  await s.observedTurn(f.agents[1]);
+  f.advance(55 * 60_000);
+  const tick = s.tick();
+  await start;
+  try {
+    for (let i = 0; i < 100 && !f.sent.includes("b"); i++)
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepEqual([...f.sent].sort(), ["a", "b"], "both are sent in that tick");
+    assert.equal(f.state.operations.length, 2, "both are reserved in that tick");
+    assert.deepEqual(
+      f.state.operations.map((operation) => [operation.agentId, operation.kind]).sort(),
+      [["a", "automatic"], ["b", "automatic"]]
+    );
+    assert.equal(f.state.jobs.find((job) => job.agentId === "a")?.status, "running");
+  } finally {
+    release();
+  }
+  await tick;
+  await waitForAgentStatus(f, "a", "completed");
+  await waitForAgentStatus(f, "b", "completed");
+});
+
+test("a conversation compacting does not stop a later tick from reserving another conversation", async () => {
+  const f = fixture();
+  f.addAgent("b");
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let started!: () => void;
+  const start = new Promise<void>((resolve) => { started = resolve; });
+  f.holdCompact("a", async () => { started(); await gate; });
+  const s = f.make();
+  await s.ready;
+  await s.observedTurn(f.agents[0]);
+  f.advance(55 * 60_000);
+  const first = s.tick();
+  await start;
+  // b only becomes due after a has started compacting.
+  await s.observedTurn(f.agents[1]);
+  f.advance(55 * 60_000);
+  const second = s.tick();
+  const settled = await within(second);
+  try {
+    assert.notEqual(settled, null, "the second tick resolves without waiting for a");
+    assert.deepEqual(f.sent, ["a", "b"]);
+    assert.equal(f.state.jobs.find((job) => job.agentId === "b")?.status, "completed");
+    assert.equal(f.state.jobs.find((job) => job.agentId === "a")?.status, "running");
+  } finally {
+    release();
+  }
+  await first;
+  await waitForAgentStatus(f, "a", "completed");
+});
+
+test("Compact now returns the pending automatic operation and sends once", async () => {
+  const f = fixture();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let started!: () => void;
+  const start = new Promise<void>((resolve) => { started = resolve; });
+  f.holdCompact("a", async () => { started(); await gate; });
+  const s = f.make();
+  await s.ready;
+  await s.observedTurn(f.agents[0]);
+  f.advance(55 * 60_000);
+  const tick = s.tick();
+  await start;
+  try {
+    const existing = await s.compactNow("a", f.agents[0].revision!);
+    assert.equal(existing.code, "existing");
+    assert.equal(existing.status, "running");
+    assert.equal(existing.operation?.kind, "automatic");
+    assert.equal(f.state.operations.length, 1);
+    assert.deepEqual(f.sent, ["a"]);
+  } finally {
+    release();
+  }
+  await tick;
+  await waitForStatus(f, "completed");
+});
+
+test("a due automatic reservation is not added while Compact now is pending", async () => {
+  const f = fixture();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let started!: () => void;
+  const start = new Promise<void>((resolve) => { started = resolve; });
+  f.holdCompact("a", async () => { started(); await gate; });
+  const s = f.make();
+  await s.ready;
+  await s.observedTurn(f.agents[0]);
+  f.advance(55 * 60_000);
+  const manual = s.compactNow("a", f.agents[0].revision!);
+  await start;
+  try {
+    const tick = s.tick();
+    assert.notEqual(await within(tick), null, "the tick does not wait for the manual send");
+    assert.equal(f.state.operations.length, 1);
+    assert.equal(f.state.operations[0].kind, "manual");
+    assert.deepEqual(f.sent, ["a"]);
+  } finally {
+    release();
+  }
+  await manual;
+  await waitForStatus(f, "completed");
+});
+
+test("a Compact now accepted during a tick's inspection wins over the automatic reservation", async () => {
+  const f = fixture();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let started!: () => void;
+  const start = new Promise<void>((resolve) => { started = resolve; });
+  let held = false;
+  f.holdRefresh("a", async () => {
+    if (held) return;
+    held = true;
+    started();
+    await gate;
+  });
+  const s = f.make();
+  await s.ready;
+  await s.observedTurn(f.agents[0]);
+  f.advance(55 * 60_000);
+  const tick = s.tick();
+  await start;
+  const accepted = await s.compactNow("a", f.agents[0].revision!);
+  assert.equal(accepted.code, "accepted");
+  release();
+  await tick;
+  await waitForStatus(f, "completed");
+  assert.equal(f.state.operations.length, 1);
+  assert.equal(f.state.operations[0].kind, "manual");
+  assert.deepEqual(f.sent, ["a"]);
+});
+
+test("a toggle during a tick's inspection prevents the automatic reservation", async () => {
+  const f = fixture();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let started!: () => void;
+  const start = new Promise<void>((resolve) => { started = resolve; });
+  f.holdRefresh("a", async () => { started(); await gate; });
+  const s = f.make();
+  await s.ready;
+  await s.observedTurn(f.agents[0]);
+  f.advance(55 * 60_000);
+  const tick = s.tick();
+  await start;
+  assert.equal(await s.toggle("a", false), true);
+  release();
+  await tick;
+  assert.equal(f.calls, 0);
+  assert.equal(f.state.operations.length, 0);
+  assert.equal(f.state.jobs[0].status, "blocked");
+  assert.equal(f.state.jobs[0].detail,
+    "Automation policy or idle delay changed before dispatch");
+});
+
+test("one conversation's failed host read does not stop another conversation's reservation", async () => {
+  const f = fixture();
+  f.addAgent("b");
+  const refresh = f.gateway.refresh;
+  f.gateway.refresh = async (id) => {
+    if (id === "a") throw new Error("host read failed");
+    return refresh(id);
+  };
+  const s = f.make();
+  await s.ready;
+  await s.observedTurn(f.agents[0]);
+  await s.observedTurn(f.agents[1]);
+  f.advance(55 * 60_000);
+  await s.tick();
+  await waitForAgentStatus(f, "b", "completed");
+  assert.deepEqual(f.sent, ["b"]);
+  assert.equal(f.state.jobs.find((job) => job.agentId === "a")?.status, "scheduled");
+  assert.equal(f.state.operations.filter((operation) => operation.agentId === "a").length, 0);
+});
+
+test("a slow host read in a tick does not hold up other conversations' state changes", async () => {
+  const f = fixture();
+  f.addAgent("b");
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let started!: () => void;
+  const start = new Promise<void>((resolve) => { started = resolve; });
+  f.holdRefresh("a", async () => { started(); await gate; });
+  const s = f.make();
+  await s.ready;
+  await s.observedTurn(f.agents[0]);
+  f.advance(55 * 60_000);
+  const tick = s.tick();
+  await start;
+  const work = Promise.all([s.toggle("b", false), s.operation("missing")]);
+  const early = await within(work.then(() => true));
+  release();
+  await tick;
+  const [changed, missing] = await work;
+  assert.equal(early, true, "other conversations resolve while a's host read is held");
+  assert.equal(changed, true);
+  assert.equal(missing, null);
+  assert.deepEqual(f.state.disabled, ["b"]);
   assert.equal(f.calls, 1);
 });

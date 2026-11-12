@@ -14,6 +14,14 @@ const UNAVAILABLE = "This conversation is unavailable for compaction";
 const terminal = (job: Job) =>
   ["expired", "skipped", "completed", "failed", "unknown"].includes(job.status);
 
+// The reservation a tick inspected, so phase C can tell whether it is still
+// the same one after host I/O.
+type Candidate = { agentId: string; revision: string; endedAt: number;
+  activityKey: string | null; sessionId: string | null };
+type ReservationOutcome = { kind: "expired" | "skipped" | "blocked"; detail: string } |
+  { kind: "reserve"; agent: Observation; config: Settings };
+type Decision = { job: Candidate; outcome: ReservationOutcome };
+
 export function createScheduler(options: {
   store: StateStore;
   gateway: Gateway;
@@ -198,6 +206,153 @@ export function createScheduler(options: {
       target: targetOf(agent),
       inputFingerprint: fingerprint, state: "requested", createdAt: now(), updatedAt: now(), result: null,
       sendBy: now() + SEND_DEADLINE_MS[kind], reservationEndedAt: job.endedAt, attempt: 0 };
+  }
+  // Automatic reservations are per conversation. Host reads and policy checks
+  // run outside the state queue, and every decision is re-checked against fresh
+  // state before it is written, so one slow or failing conversation cannot
+  // delay another.
+  let reservationPass: Promise<boolean> | null = null;
+  function reserveDue(connected: boolean): Promise<boolean> {
+    // A tick that arrives during inspection joins that pass instead of starting
+    // a second one; cleanup and reconcile already tolerate overlapping calls.
+    if (reservationPass) return reservationPass;
+    const pass = reserveDueOnce(connected);
+    reservationPass = pass;
+    const reset = () => { if (reservationPass === pass) reservationPass = null; };
+    pass.then(reset, reset);
+    return pass;
+  }
+  async function reserveDueOnce(connected: boolean): Promise<boolean> {
+    // Unreadable settings keep every reservation for the next tick.
+    const config = await settings();
+    if (!config || stopped) return false;
+    // Phase A: read state under the queue and apply the timing policy.
+    const { candidates, disabled } = await serialize(async () => {
+      const state = await store.read();
+      if (stopped) return { candidates: [] as Candidate[], disabled: state.disabled };
+      let changed = false;
+      const candidates: Candidate[] = [];
+      for (const job of [...state.jobs].sort(
+        (a, b) => a.endedAt - b.endedAt
+      )) {
+        if (terminal(job) || job.status === "running") continue;
+        // Only this conversation's own pending operation holds its reservation.
+        if (state.operations.some(entry => entry.agentId === job.agentId && operationPending(entry)))
+          continue;
+        const policy = (settings: Settings, agent?: Observation) => automaticBlock({ agentId: job.agentId,
+          endedAt: job.endedAt, settings, disabled: state.disabled, now: now(), agent });
+        const timing = policy(config);
+        if (timing === "late") {
+          job.status = "expired";
+          job.detail = "Delivery window passed; no replay after sleep";
+          changed = true;
+          continue;
+        }
+        if (timing || !connected) continue;
+        candidates.push({ agentId: job.agentId, revision: job.revision, endedAt: job.endedAt,
+          activityKey: job.activityKey ?? null, sessionId: job.sessionId ?? null });
+      }
+      if (changed) await store.write(state);
+      return { candidates, disabled: state.disabled };
+    });
+    // Phase B: inspect the candidates concurrently and in isolation. A thrown
+    // error leaves only that conversation's reservation untouched.
+    const decisions = await Promise.all(candidates.map(async (candidate): Promise<Decision | null> => {
+      try {
+        const policy = (settings: Settings, agent?: Observation) => automaticBlock({ agentId: candidate.agentId,
+          endedAt: candidate.endedAt, settings, disabled, now: now(), agent });
+        const agent = await refresh(candidate.agentId);
+        // An unreadable observer is not a changed session: keep the reservation.
+        if (agent?.observerUnreadable) return null;
+        if (
+          !agent ||
+          !unchanged({ revision: candidate.revision, target: {
+            sessionId: candidate.sessionId, activityKey: candidate.activityKey } }, agent) ||
+          policy(config, agent) === "ineligible"
+        ) {
+          return { job: candidate, outcome: { kind: "skipped",
+            detail: "Session changed or no longer eligible" } };
+        }
+        if (!gateway.automatic) {
+          return { job: candidate, outcome: { kind: "blocked",
+            detail: "Claude observer unavailable; nothing sent" } };
+        }
+        if (agent.resumeRequired) {
+          return { job: candidate, outcome: { kind: "blocked", detail: SESSION_RESUME_REQUIRED } };
+        }
+        const blocked = gateway.readiness
+          ? await bounded(gateway.readiness(agent, dueAt(candidate.endedAt, config)), INSPECT_TIMEOUT_MS)
+          : null;
+        if (blocked) return { job: candidate, outcome: { kind: "blocked", detail: blocked } };
+        // Settings can change while native observation/host refresh awaits I/O.
+        // Unreadable settings are not a change either: keep the reservation.
+        const latest = await settings();
+        if (!latest) return null;
+        const block = policy(latest, agent);
+        if (block === "late") {
+          return { job: candidate, outcome: { kind: "expired",
+            detail: "Delivery window passed during inspection" } };
+        }
+        if (block) {
+          return { job: candidate, outcome: { kind: "blocked",
+            detail: "Automation policy or idle delay changed before dispatch" } };
+        }
+        return { job: candidate, outcome: { kind: "reserve", agent, config: latest } };
+      } catch (error) {
+        onError(error);
+        return null;
+      }
+    }));
+    // Phase C: apply every decision to fresh state, then write once.
+    let reserved = false;
+    await serialize(async () => {
+      if (stopped) return;
+      const state = await store.read();
+      let changed = false;
+      for (const decision of decisions) {
+        if (!decision) continue;
+        const candidate = decision.job;
+        const job = state.jobs.find(entry => entry.agentId === candidate.agentId);
+        if (!job || terminal(job) || job.status === "running") continue;
+        if (job.revision !== candidate.revision || job.endedAt !== candidate.endedAt ||
+            (job.activityKey ?? null) !== candidate.activityKey) continue;
+        const outcome = decision.outcome;
+        if (outcome.kind !== "reserve") {
+          job.status = outcome.kind;
+          job.detail = outcome.detail;
+          changed = true;
+          continue;
+        }
+        // A Compact now accepted meanwhile wins; it sends its own operation.
+        if (state.operations.some(entry => entry.agentId === job.agentId && operationPending(entry)))
+          continue;
+        // A toggle during inspection wins.
+        if (automaticBlock({ agentId: job.agentId, endedAt: job.endedAt, settings: outcome.config,
+            disabled: state.disabled, now: now(), agent: outcome.agent })) {
+          job.status = "blocked";
+          job.detail = "Automation policy or idle delay changed before dispatch";
+          changed = true;
+          continue;
+        }
+        // Automatic work never repeats an activity, even one whose attempt sent nothing.
+        const attempted = state.operations.find(entry => sameActivity(entry, outcome.agent));
+        if (attempted) {
+          job.operationId = attempted.id;
+          changed = true;
+          continue;
+        }
+        const operation = newOperation(job, outcome.agent, "automatic");
+        // The delivery window limits when sending may start, not how long it is observed.
+        operation.deliveryExpiresAt = dueAt(job.endedAt, outcome.config) + DELIVERY_WINDOW_MS;
+        operation.sendBy = Math.min(operation.sendBy!, operation.deliveryExpiresAt);
+        job.operationId = operation.id;
+        state.operations.push(operation);
+        changed = true;
+        reserved = true;
+      }
+      if (changed) await store.write(state);
+    });
+    return reserved;
   }
   const existingResult = (operation: StoredOperation) => ({
     status: operationRowStatus(operation), detail: operation.result?.message ?? "Compaction requested",
@@ -435,97 +590,16 @@ export function createScheduler(options: {
         operation: publicOperation(prepared.operation), code: "accepted" as const,
       };
     },
+    // A tick starts reconciliation, then inspects and reserves without waiting
+    // for other work. It waits only for the runs it started, so `await tick()`
+    // still means "sent". Automatic reservations are per conversation: another
+    // conversation's pending operation is irrelevant, and every due reservation
+    // of every conversation is handled in the same tick.
     tick: async (connected = true) => {
       await serialize(cleanup);
-      await worker.reconcile(connected);
-      const prepared = await serialize(async () => {
-        if (stopped) return;
-        const [state, config] = await Promise.all([store.read(), settings()]);
-        if (!config || state.operations.some(operationPending)) return;
-        let changed = false;
-        for (const job of [...state.jobs].sort(
-          (a, b) => a.endedAt - b.endedAt
-        )) {
-          if (terminal(job) || job.status === "running") continue;
-          const policy = (settings: Settings, agent?: Observation) => automaticBlock({ agentId: job.agentId,
-            endedAt: job.endedAt, settings, disabled: state.disabled, now: now(), agent });
-          const timing = policy(config);
-          if (timing === "late") {
-            job.status = "expired";
-            job.detail = "Delivery window passed; no replay after sleep";
-            changed = true;
-            continue;
-          }
-          if (timing || !connected) continue;
-          const agent = await refresh(job.agentId);
-          // An unreadable observer is not a changed session: keep the reservation.
-          if (agent?.observerUnreadable) continue;
-          if (
-            !agent ||
-            !unchanged({ revision: job.revision, target: jobTarget(job) }, agent) ||
-            policy(config, agent) === "ineligible"
-          ) {
-            job.status = "skipped";
-            job.detail = "Session changed or no longer eligible";
-            changed = true;
-            continue;
-          }
-          if (!gateway.automatic) {
-            job.status = "blocked";
-            job.detail = "Claude observer unavailable; nothing sent";
-            changed = true;
-            continue;
-          }
-          if (agent.resumeRequired) {
-            job.status = "blocked";
-            job.detail = SESSION_RESUME_REQUIRED;
-            changed = true;
-            continue;
-          }
-          const blocked = gateway.readiness ? await bounded(gateway.readiness(agent, due(job, config)), INSPECT_TIMEOUT_MS) : null;
-          if (blocked) {
-            job.status = "blocked";
-            job.detail = blocked;
-            changed = true;
-            continue;
-          }
-          // Settings can change while native observation/host refresh awaits I/O.
-          // Unreadable settings are not a change either: keep the reservation.
-          const latest = await settings();
-          if (stopped) return;
-          if (!latest) continue;
-          const block = policy(latest, agent);
-          if (block === "late") {
-            job.status = "expired";
-            job.detail = "Delivery window passed during inspection";
-            changed = true;
-            continue;
-          }
-          if (block) {
-            job.status = "blocked";
-            job.detail =
-              "Automation policy or idle delay changed before dispatch";
-            changed = true;
-            continue;
-          }
-          // Automatic work never repeats an activity, even one whose attempt sent nothing.
-          const attempted = state.operations.find(entry => sameActivity(entry, agent));
-          if (attempted) {
-            job.operationId = attempted.id;
-            changed = true;
-            continue;
-          }
-          const operation = newOperation(job, agent, "automatic");
-          // The delivery window limits when sending may start, not how long it is observed.
-          operation.deliveryExpiresAt = dueAt(job.endedAt, latest) + DELIVERY_WINDOW_MS;
-          operation.sendBy = Math.min(operation.sendBy!, operation.deliveryExpiresAt);
-          await reserve(job, state, operation);
-          // One operation per tick, host-wide serialization across all sessions.
-          return { job, agent };
-        }
-        if (changed) await store.write(state);
-      });
-      if (prepared) await worker.reconcile(connected);
+      const started = [worker.reconcile(connected)];
+      if (await reserveDue(connected)) started.push(worker.reconcile(connected));
+      await Promise.all(started);
     },
   };
 }
