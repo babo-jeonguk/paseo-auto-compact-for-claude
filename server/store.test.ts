@@ -286,3 +286,28 @@ test("the cached file store keeps today's unreadable-state failure and missing-f
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("a read error clears a snapshot that a concurrent read cached, so the next read asks the file", async () => {
+  const replies: Array<{ settle(): void }> = [];
+  let reads = 0;
+  const inner: StateStore = {
+    read: () => {
+      reads++;
+      const call = reads;
+      return new Promise<State>((resolve, reject) => replies.push({ settle: () => call === 1
+        ? resolve({ version: 1, disabled: ["cached"], jobs: [], operations: [] })
+        : reject(new Error("Auto Compact state is unreadable; automation stopped")) }));
+    },
+    write: async () => {},
+  };
+  const store = createCachedStore(inner);
+  const first = store.read(), second = store.read();
+  replies[0].settle();
+  assert.deepEqual((await first).disabled, ["cached"]);
+  replies[1].settle();
+  await assert.rejects(second, /unreadable/);
+  const third = store.read();
+  assert.equal(reads, 3, "the read after an error goes to the file again");
+  replies[2].settle();
+  await assert.rejects(third, /unreadable/);
+});

@@ -1295,3 +1295,38 @@ test("reading a conversation's status records its finished reply, so the control
   await s.session("a");
   assert.equal(f.counts.writes, 0, "an unchanged activity is not written again");
 });
+
+test("an observation older than the recorded activity cannot replace it or undo its skip", async () => {
+  const f = fixture();
+  const older = nativeAgent(f, "a", "1");
+  f.advance(1_000);
+  const newer = nativeAgent(f, "a", "2");
+  f.agents.splice(0, 1, newer);
+  const s = f.make();
+  await s.ready;
+  // A status read records the newer reply; the user skips it.
+  assert.equal((await s.session("a"))?.status, "scheduled");
+  assert.equal(await s.skip("a", newer.revision!), true);
+  // A scan that read the older reply before that commits late.
+  await s.observedTurns([{ agent: older, endedAt: older.observedEndedAt! }]);
+  assert.equal(f.state.jobs[0].activityKey, newer.activityKey);
+  assert.equal(f.state.jobs[0].status, "skipped");
+  // Observing the newer reply again keeps the skip.
+  await s.observe({ kind: "agent", agentId: "a" });
+  await s.session("a");
+  assert.equal(f.state.jobs[0].status, "skipped");
+  assert.equal(f.calls, 0);
+  f.advance(55 * 60_000);
+  await s.tick();
+  assert.equal(f.calls, 0, "a skipped reply is never compacted");
+});
+
+test("a new launch or session generation still earns a reservation, whatever its native revision", async () => {
+  const f = fixture();
+  const s = f.make();
+  await s.ready;
+  await s.observedTurns([{ agent: nativeAgent(f, "a", "9"), endedAt: f.time }]);
+  const relaunched = { ...nativeAgent(f, "a", "1"), activityKey: "relaunch:a:1" };
+  await s.observedTurns([{ agent: relaunched, endedAt: f.time }]);
+  assert.equal(f.state.jobs[0].activityKey, "relaunch:a:1");
+});

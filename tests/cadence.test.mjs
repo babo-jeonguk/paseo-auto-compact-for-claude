@@ -105,3 +105,18 @@ test("only a backgrounded or inactive app counts as hidden", () => {
   assert.equal(surfaceActive(null), true);
   assert.equal(surfaceActive(undefined), true);
 });
+
+test("every control of one conversation shares its failure count, so backoff is consistent", async () => {
+  const { sessionFailures } = await import("../client/cadence.ts");
+  const pill = sessionFailures("host:conversation-a"), popover = sessionFailures("host:conversation-a");
+  const other = sessionFailures("host:conversation-b");
+  for (let i = 0; i < 3; i++) pill.record("failure");
+  assert.equal(popover.count(), 3);
+  assert.equal(sessionPollDelay({ active: true, failures: popover.count() }), 30_000);
+  assert.equal(other.count(), 0);
+  popover.record("success");
+  assert.equal(pill.count(), 0);
+  pill.record("failure");
+  other.record("focus");
+  assert.equal(popover.count(), 1);
+});
