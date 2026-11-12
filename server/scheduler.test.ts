@@ -7,13 +7,16 @@ import {
 } from "../shared/settings";
 import { createScheduler } from "./scheduler";
 import { DELIVERY_WINDOW_MS } from "./policy";
-import type { Gateway, Observation, State, StateStore } from "./model";
+import { Refusal, type Gateway, type Observation, type State, type StateStore } from "./model";
 
 function fixture(automatic = true) {
   let time = 1_000_000;
   let config: Settings | null = { ...DEFAULT_SETTINGS };
   let state: State = { version: 1, disabled: [], jobs: [], operations: [] };
   let calls = 0;
+  const sent: string[] = [];
+  const compactHolds = new Map<string, () => Promise<void>>();
+  const refreshHolds = new Map<string, () => Promise<void>>();
   const agents: Observation[] = [
     {
       agentId: "a",
@@ -33,14 +36,19 @@ function fixture(automatic = true) {
       state = structuredClone(next);
     },
   };
-  const compact: Gateway["compact"] = async () => {
+  const compact: Gateway["compact"] = async (agentId) => {
     calls++;
+    sent.push(agentId);
+    await compactHolds.get(agentId)?.();
     return { status: "completed", detail: "same session, completed boundary" };
+  };
+  const refresh: Gateway["refresh"] = async (id) => {
+    await refreshHolds.get(id)?.();
+    return structuredClone(agents.find((a) => a.agentId === id) ?? null);
   };
   const gateway: Gateway = {
     list: async () => structuredClone(agents),
-    refresh: async (id) =>
-      structuredClone(agents.find((a) => a.agentId === id) ?? null),
+    refresh,
     compact,
     ...(automatic ? { automatic: async () => compact("a") } : {}),
   };
@@ -51,11 +59,23 @@ function fixture(automatic = true) {
       settings: async () => config,
       now: () => time,
     });
+  const addAgent = (id = "b") => {
+    const agent = { ...agents[0], agentId: id, title: `Session ${id}`, sessionId: `native-${id}` };
+    agents.push(agent);
+    return agent;
+  };
   return {
     agents,
     gateway,
     store,
     make,
+    addAgent,
+    holdCompact(agentId: string, hold: () => Promise<void>) {
+      compactHolds.set(agentId, hold);
+    },
+    holdRefresh(agentId: string, hold: () => Promise<void>) {
+      refreshHolds.set(agentId, hold);
+    },
     get config() {
       return config;
     },
@@ -67,6 +87,9 @@ function fixture(automatic = true) {
     },
     get calls() {
       return calls;
+    },
+    get sent() {
+      return sent;
     },
     get time() {
       return time;
@@ -83,6 +106,30 @@ async function waitForStatus(f: ReturnType<typeof fixture>, status: State["jobs"
     await new Promise<void>((resolve) => setImmediate(resolve));
   }
   assert.fail(`Timed out waiting for ${status}; current status is ${f.state.jobs[0]?.status}`);
+}
+
+async function waitForAgentStatus(f: ReturnType<typeof fixture>, agentId: string,
+  status: State["jobs"][number]["status"]) {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    if (f.state.jobs.find((job) => job.agentId === agentId)?.status === status) return;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  assert.fail(`Timed out waiting for ${agentId} ${status}; current status is ${
+    f.state.jobs.find((job) => job.agentId === agentId)?.status}`);
+}
+
+// Resolve to null if work is still pending after ms; the test then fails on the
+// missing progress instead of hanging on a queue that should not be held.
+async function within<T>(work: Promise<T>, ms = 250): Promise<T | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), ms);
+  });
+  try {
+    return await Promise.race([work, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 test("defaults remain 200,000 tokens and 55 minutes; invalid settings rejected", () => {
@@ -534,9 +581,9 @@ test("RPC acceptance or error cannot be promoted to completion by scheduler", as
   }
 });
 
-test("list and policy edits remain responsive during a compaction; only one send host-wide", async () => {
+test("list and policy edits remain responsive during a compaction; another conversation compacts independently", async () => {
   const f = fixture();
-  f.agents.push({ ...f.agents[0], agentId: "b", sessionId: "native-b" });
+  f.addAgent("b");
   let release!: () => void;
   const gate = new Promise<void>((resolve) => {
     release = resolve;
@@ -545,25 +592,222 @@ test("list and policy edits remain responsive during a compaction; only one send
   const start = new Promise<void>((resolve) => {
     started = resolve;
   });
-  f.gateway.compact = async () => {
+  f.holdCompact("a", async () => {
     started();
     await gate;
-    return { status: "completed", detail: "Completed boundary" };
-  };
+  });
   const s = f.make();
   await s.ready;
   const run = s.compactNow("a", f.agents[0].revision!);
   await start;
-  assert.equal((await s.list())[0].status, "running");
-  await s.toggle("b", false);
-  assert.equal(
-    (await s.compactNow("b", f.agents[1].revision!)).status,
-    "blocked"
-  );
-  release();
+  try {
+    assert.equal((await s.list())[0].status, "running");
+    await s.toggle("b", false);
+    const b = await s.compactNow("b", f.agents[1].revision!);
+    assert.equal(b.code, "accepted");
+    assert.equal(b.status, "running");
+    await waitForAgentStatus(f, "b", "completed");
+    assert.deepEqual(f.sent, ["a", "b"]);
+    assert.equal(f.state.jobs.find((job) => job.agentId === "a")?.status, "running");
+  } finally {
+    release();
+  }
   await run;
-  await waitForStatus(f, "completed");
+  await waitForAgentStatus(f, "a", "completed");
   assert.deepEqual(f.state.disabled, ["b"]);
+});
+
+test("a held compaction does not delay another conversation's Compact now", async () => {
+  const f = fixture();
+  f.addAgent("b");
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let started!: () => void;
+  const start = new Promise<void>((resolve) => { started = resolve; });
+  f.holdCompact("a", async () => { started(); await gate; });
+  const s = f.make();
+  await s.ready;
+  const run = s.compactNow("a", f.agents[0].revision!);
+  await start;
+  try {
+    const b = await s.compactNow("b", f.agents[1].revision!);
+    assert.equal(b.code, "accepted");
+    await waitForAgentStatus(f, "b", "completed");
+    assert.deepEqual(f.sent, ["a", "b"], "b is sent while a is still held");
+    assert.equal(f.state.jobs.find((job) => job.agentId === "a")?.status, "running");
+  } finally {
+    release();
+  }
+  await run;
+  await waitForAgentStatus(f, "a", "completed");
+});
+
+test("a refused compaction does not affect another conversation's Compact now", async () => {
+  const f = fixture();
+  f.addAgent("b");
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let started!: () => void;
+  const start = new Promise<void>((resolve) => { started = resolve; });
+  f.holdCompact("a", async () => {
+    started();
+    await gate;
+    throw new Refusal("Claude is still working");
+  });
+  const s = f.make();
+  await s.ready;
+  const run = s.compactNow("a", f.agents[0].revision!);
+  await start;
+  try {
+    const b = await s.compactNow("b", f.agents[1].revision!);
+    assert.equal(b.code, "accepted");
+    await waitForAgentStatus(f, "b", "completed");
+    assert.deepEqual(f.sent, ["a", "b"], "b is sent while a is still held");
+  } finally {
+    release();
+  }
+  await run;
+  await waitForAgentStatus(f, "a", "failed");
+  assert.equal(
+    f.state.operations.find((operation) => operation.agentId === "a")?.result?.code,
+    "failed_before_dispatch"
+  );
+  assert.equal(f.state.jobs.find((job) => job.agentId === "b")?.status, "completed");
+});
+
+test("a second Compact now while a conversation is pending returns that operation", async () => {
+  const f = fixture();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let started!: () => void;
+  const start = new Promise<void>((resolve) => { started = resolve; });
+  f.holdCompact("a", async () => { started(); await gate; });
+  const s = f.make();
+  await s.ready;
+  const revision = f.agents[0].revision!;
+  await s.compactNow("a", revision, "request-a");
+  await start;
+  try {
+    const second = await s.compactNow("a", revision, "request-b");
+    assert.equal(second.code, "existing");
+    assert.equal(second.operationId, "request-a");
+    assert.equal(second.status, "running");
+    assert.deepEqual(f.sent, ["a"]);
+  } finally {
+    release();
+  }
+  await waitForAgentStatus(f, "a", "completed");
+});
+
+test("an earlier intake cannot use a stale read after a newer request is saved", async () => {
+  const f = fixture();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let started!: () => void;
+  const start = new Promise<void>((resolve) => { started = resolve; });
+  let held = false;
+  f.holdRefresh("a", async () => {
+    if (held) return;
+    held = true;
+    started();
+    await gate;
+  });
+  const s = f.make();
+  await s.ready;
+  const revision = f.agents[0].revision!;
+  const first = s.compactNow("a", revision, "request-a");
+  await start;
+  const secondRequest = s.compactNow("a", revision, "request-b");
+  const second = await within(secondRequest);
+  release();
+  const secondResult = second ?? await secondRequest;
+  const firstResult = await first;
+  assert.equal(secondResult.code, "accepted");
+  assert.equal(firstResult.code, "existing");
+  assert.equal(firstResult.operationId, "request-b");
+  assert.equal(f.state.operations.length, 1);
+  assert.deepEqual(f.sent, ["a"]);
+});
+
+test("concurrent duplicate submissions return one operation and send once", async () => {
+  const f = fixture();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let started!: () => void;
+  const start = new Promise<void>((resolve) => { started = resolve; });
+  let held = false;
+  f.holdRefresh("a", async () => {
+    if (held) return;
+    held = true;
+    started();
+    await gate;
+  });
+  const s = f.make();
+  await s.ready;
+  const revision = f.agents[0].revision!;
+  const first = s.compactNow("a", revision, "request-a");
+  await start;
+  const secondRequest = s.compactNow("a", revision, "request-a");
+  const second = await within(secondRequest);
+  release();
+  const secondResult = second ?? await secondRequest;
+  const firstResult = await first;
+  assert.equal(secondResult.code, "accepted");
+  assert.equal(firstResult.code, "existing");
+  assert.equal(firstResult.operationId, secondResult.operationId);
+  assert.equal(f.state.operations.length, 1);
+  assert.deepEqual(f.sent, ["a"]);
+});
+
+test("a live read taken during intake decides the request, not an earlier snapshot", async () => {
+  const f = fixture();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let started!: () => void;
+  const start = new Promise<void>((resolve) => { started = resolve; });
+  f.holdRefresh("a", async () => { started(); await gate; });
+  const s = f.make();
+  await s.ready;
+  const request = s.compactNow("a", f.agents[0].revision!, "request-a");
+  await start;
+  f.agents[0].revision = new Date(f.time + 1_000).toISOString();
+  release();
+  const result = await request;
+  assert.equal(result.code, "blocked");
+  assert.match(result.detail, /conversation changed/);
+  assert.equal(f.state.operations.length, 0);
+  assert.deepEqual(f.sent, []);
+});
+
+test("a slow host read for one conversation does not hold up other conversations", async () => {
+  const f = fixture();
+  f.addAgent("b");
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let started!: () => void;
+  const start = new Promise<void>((resolve) => { started = resolve; });
+  f.holdRefresh("a", async () => { started(); await gate; });
+  const s = f.make();
+  await s.ready;
+  const pending = s.compactNow("a", f.agents[0].revision!);
+  await start;
+  const work = Promise.all([
+    s.session("b"),
+    s.toggle("b", false),
+    s.operation("missing"),
+    s.compactNow("b", f.agents[1].revision!),
+  ]);
+  const early = await within(work.then(() => true));
+  release();
+  const [session, changed, missing, compact] = await work;
+  assert.equal(early, true, "other conversations resolve while a's host read is held");
+  assert.equal(session?.agentId, "b");
+  assert.equal(changed, true);
+  assert.equal(missing, null);
+  assert.equal(compact.code, "accepted");
+  await waitForAgentStatus(f, "b", "completed");
+  assert.equal(f.sent.filter((agentId) => agentId === "b").length, 1);
+  await pending;
 });
 
 test("Compact now acknowledges a slow backend before the plugin RPC deadline", async () => {

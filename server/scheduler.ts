@@ -256,34 +256,34 @@ export function createScheduler(options: {
         }
       }),
     // Conversation controls remain available below the automatic token threshold.
-    session: (agentId: string) =>
-      serialize(async () => {
-        const [state, config, agent] = await Promise.all([
-          store.read(),
-          settings(),
-          refresh(agentId),
-        ]);
-        return agent?.eligible ? view(agent, state, config) : null;
-      }),
-    list: () =>
-      serialize(async () => {
-        const [state, config, agents] = await Promise.all([
-          store.read(),
-          settings(),
-          bounded(gateway.list(), INSPECT_TIMEOUT_MS),
-        ]);
-        return Promise.all(
-          agents
-            .filter(
-              (agent) =>
-                agent.eligible &&
-                (agent.tokens === null ||
-                  !config ||
-                  agent.tokens >= config.threshold)
-            )
-            .map((agent) => view(agent, state, config))
-        );
-      }),
+    // Only the state read is queued: host reads and readiness checks run outside
+    // the queue so one slow conversation cannot delay another's state changes.
+    session: async (agentId: string) => {
+      const [state, config, agent] = await Promise.all([
+        serialize(() => store.read()),
+        settings(),
+        refresh(agentId),
+      ]);
+      return agent?.eligible ? view(agent, state, config) : null;
+    },
+    list: async () => {
+      const [state, config, agents] = await Promise.all([
+        serialize(() => store.read()),
+        settings(),
+        bounded(gateway.list(), INSPECT_TIMEOUT_MS),
+      ]);
+      return Promise.all(
+        agents
+          .filter(
+            (agent) =>
+              agent.eligible &&
+              (agent.tokens === null ||
+                !config ||
+                agent.tokens >= config.threshold)
+          )
+          .map((agent) => view(agent, state, config))
+      );
+    },
     toggle: (agentId: string, enabled: boolean) =>
       serialize(async () => {
         const state = await store.read();
@@ -292,12 +292,12 @@ export function createScheduler(options: {
         await store.write(state);
         return true;
       }),
-    skip: (agentId: string, revision: string) =>
-      serialize(async () => {
+    skip: async (agentId: string, revision: string) => {
+      if (stopped) return false;
+      const [config, agent] = await Promise.all([settings(), refresh(agentId)]);
+      return serialize(async () => {
         if (stopped) return false;
-        const [state, config, agent] = await Promise.all([
-          store.read(), settings(), refresh(agentId),
-        ]);
+        const state = await store.read();
         const job = state.jobs.find(
           (job) => job.agentId === agentId && job.revision === revision
         );
@@ -311,12 +311,12 @@ export function createScheduler(options: {
         } else delete job.skip;
         await store.write(state);
         return true;
-      }),
-    undoSkip: (agentId: string, revision: string, skipId: string) =>
-      serialize(async () => {
-        const [state, config, agent] = await Promise.all([
-          store.read(), settings(), refresh(agentId),
-        ]);
+      });
+    },
+    undoSkip: async (agentId: string, revision: string, skipId: string) => {
+      const [config, agent] = await Promise.all([settings(), refresh(agentId)]);
+      return serialize(async () => {
+        const state = await store.read();
         const job = state.jobs.find(entry => entry.agentId === agentId);
         if (!agent || !job || job.revision !== revision ||
             job.skip?.id !== skipId || !reversibleSkip(job, agent, config)) return false;
@@ -325,31 +325,44 @@ export function createScheduler(options: {
         delete job.skip;
         await store.write(state);
         return true;
-      }),
+      });
+    },
     operation: (operationId: string) => serialize(async () => {
       const operation = (await store.read()).operations.find(entry => entry.id === operationId);
       return operation ? publicOperation(operation) : null;
     }),
     compactNow: async (agentId: string, revision: string, operationId: string = randomUUID(), target?: CompactTarget) => {
-      const prepared = await serialize(async () => {
-        const state = await store.read();
-        const fingerprint = inputFingerprint(agentId, revision, target);
+      const fingerprint = inputFingerprint(agentId, revision, target);
+      // Answers that depend only on stored state. Both phases check them: a
+      // request may be saved while this one runs its external reads.
+      const storedAnswer = (state: State) => {
         const prior = state.operations.find(entry => entry.id === operationId);
-        if (prior) return { result: prior.inputFingerprint === fingerprint
+        if (prior) return prior.inputFingerprint === fingerprint
           ? existingResult(prior)
           : { status: "blocked" as const, detail: "Operation ID was already used with different input",
-              operationId: null, operation: null, code: "idempotency_conflict" as const } };
-        if (stopped || state.operations.some(operationPending))
-          return {
-            result: {
-              status: "blocked" as const,
-              detail: "Another compaction is running or plugin is stopping",
-              operationId: null, operation: null, code: "blocked" as const,
-            },
-          };
-        const [config, agent] = await Promise.all([
-          settings(), refresh(agentId),
-        ]);
+              operationId: null, operation: null, code: "idempotency_conflict" as const };
+        if (stopped) return { status: "blocked" as const, detail: "Plugin is stopping",
+          operationId: null, operation: null, code: "blocked" as const };
+        const pending = state.operations.find(entry => entry.agentId === agentId && operationPending(entry));
+        return pending ? existingResult(pending) : null;
+      };
+      const early = await serialize(async () => storedAnswer(await store.read()));
+      if (early) return early;
+      // Host and observer reads stay outside the state queue: one conversation's
+      // slow inspection must not delay another conversation's state changes.
+      const [config, agent] = await Promise.all([settings(), refresh(agentId)]);
+      type StoredAnswer = NonNullable<ReturnType<typeof storedAnswer>> |
+        { status: Job["status"]; detail: string; operationId: string | null;
+          operation: null; code: "existing" };
+      const prepared = await serialize(async (): Promise<
+        { result: StoredAnswer } | { job: Job; agent: Observation; operation: StoredOperation }
+      > => {
+        // A request already in flight when this instance stopped must fail like
+        // the store's own refusal; a newer instance may own the state now.
+        if (stopped) throw new Error("Plugin stopped");
+        const state = await store.read();
+        const answered = storedAnswer(state);
+        if (answered) return { result: answered };
         // First, which activity the request is about: without it nothing can be answered.
         const unidentified = !agent
           ? UNAVAILABLE
@@ -410,7 +423,7 @@ export function createScheduler(options: {
         await reserve(job, state, operation);
         return { job, agent, operation };
       });
-      if ("result" in prepared) return prepared.result!;
+      if ("result" in prepared) return prepared.result;
       // Paseo plugin RPCs have a shorter deadline than a real Claude
       // compaction can take. Persist running before acknowledging the request,
       // then let the existing session polling observe the final outcome.
