@@ -65,6 +65,7 @@ On a heavily loaded machine, `--minimal-builtins` omits the released server's li
 | Missing TTL | Labeled default retains 50/55-minute scheduling |
 | Configuration | Explicit settings work; environment takes priority over merged settings |
 | Reload | Settings, conversation OFF and session identity preserved without replay; an in-flight operation recovers through its native receipt and exact command boundary without a second model request |
+| Concurrent conversations | Two conversations compact at the same time; each operation's receipt and completed command boundary stay with its own conversation, a second request for a held conversation returns the existing operation, and each native session is unchanged |
 | Downtime | An already-due reservation expires when the plugin returns |
 | Daemon recovery | OFF persists; reopening the same conversation supports a fresh reservation |
 
@@ -252,3 +253,9 @@ Linux/WSL validation on 2026-11-03:
 Stable 0.15.0 makes agent restart recovery opt-in. The focused interruption tests explicitly enable it; the normal native suite uses the stock default. Normal native shutdown still cleared the recovery candidate in the tested case, so that branch resumed with a new user message. Both paths preserved honest unknown results and did not replay compaction. This host behavior is separate from the registration migration.
 
 Only model replies are synthetic. [CI at f7b3a8c](https://github.com/babo-jeonguk/paseo-auto-compact-for-claude/actions/runs/41645166534) passed all 20 jobs: SDK checks on Linux/macOS/Windows and 18/18 native scenarios on Linux/Windows for each stable Paseo version from 0.12.0 through 0.15.0. Windows fixtures preserve PowerShell's module search path so terminal-worker identity inspection can finish within Paseo's readiness limit. macOS native execution and the iOS app remain unverified.
+
+## Concurrent-conversation validation — 2026-11-12
+
+The per-conversation change passed the native suite **19/19** on Linux/WSL x64 (WSL2 kernel 6.18.58.1) with Node 24.21.0 and native Claude Code 2.1.306 for stock Paseo **0.15.0, 0.12.0, 0.13.0 and 0.14.0**. Every version passed on its first attempt; no scenario was rerun. The new *Concurrent conversations* scenario held one conversation's `/compact` model request and completed a second conversation's compaction while the first was still observing, then checked that a further request for the first conversation returned its existing operation without another model request. Each conversation produced exactly one completed boundary and receipt under its own operation ID and kept its native session.
+
+A rollback probe running the **v1.1.1** source (`bafdfde`) seeded one `observing` operation with its dispatch marker, one requested manual operation and one requested automatic operation from different conversations, with their jobs. v1.1.1's store accepted the state. Its serial worker never sent the observing operation, sent each requested conversation at most once, and sent nothing again after the deadlines passed.

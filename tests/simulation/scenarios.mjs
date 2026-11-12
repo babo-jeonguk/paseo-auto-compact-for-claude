@@ -236,6 +236,71 @@ export const scenarios = [
     },
   },
   {
+    name: 'two conversations compact at the same time; each operation is linked only to its own evidence',
+    async run({ fixture: f, model }) {
+      const a = await f.agent(), b = await f.agent();
+      await f.turn(a, 'CONCURRENT_A_READY: reply without tools.');
+      await f.turn(b, 'CONCURRENT_B_READY: reply without tools.');
+      const rowA = await scheduled(f, a), rowB = await scheduled(f, b);
+      const sessionA = (await f.refresh(a)).persistence.sessionId;
+      const sessionB = (await f.refresh(b)).persistence.sessionId;
+      const before = model.count;
+      const operationA = randomUUID(), operationB = randomUUID();
+      const gate = model.holdNext();
+      const acceptedA = await f.rpc('now', { agentId: a, revision: rowA.revision, target: rowA.target, operationId: operationA });
+      assert.equal(acceptedA.status, 'running');
+      assert.equal(acceptedA.code, 'accepted');
+      assert.equal(acceptedA.operationId, operationA);
+      await waitFor(() => gate.requestId, 'in-flight compaction for conversation A');
+      assert.equal(model.count, before + 1);
+      const heldA = (await f.rpc('operation', { operationId: operationA })).operation;
+      assert(['dispatching', 'observing'].includes(heldA.state), JSON.stringify(heldA));
+      // A's compaction is now waiting on the held model request. B must not
+      // queue behind it: accepted, sent, and finished on its own.
+      const acceptedB = await f.rpc('now', { agentId: b, revision: rowB.revision, target: rowB.target, operationId: operationB });
+      assert.equal(acceptedB.status, 'running');
+      assert.equal(acceptedB.code, 'accepted');
+      assert.equal(acceptedB.operationId, operationB);
+      await waitFor(async () => {
+        const operation = (await f.rpc('operation', { operationId: operationB })).operation;
+        return operation?.state === 'succeeded' ? operation : null;
+      }, 'conversation B compaction while A is still held');
+      const stillHeldA = (await f.rpc('operation', { operationId: operationA })).operation;
+      assert(['dispatching', 'observing'].includes(stillHeldA.state),
+        `A must still be pending while B completes, not ${stillHeldA.state}`);
+      // A second request for A under a new ID returns A's existing operation.
+      const duplicateA = await f.rpc('now', {
+        agentId: a, revision: rowA.revision, target: rowA.target, operationId: randomUUID() });
+      assert.equal(duplicateA.code, 'existing');
+      assert.equal(duplicateA.operationId, operationA);
+      assert.equal(model.count, before + 2, 'the existing-operation answer and B together must send exactly two requests');
+      gate.release();
+      await waitFor(async () => {
+        const operation = (await f.rpc('operation', { operationId: operationA })).operation;
+        return operation?.state === 'succeeded' ? operation : null;
+      }, 'conversation A compaction after release');
+      assert.equal(model.count, before + 2, 'each conversation must send exactly one model request');
+      for (const [id, operationId, otherOperationId, sessionId] of
+        [[a, operationA, operationB, sessionA], [b, operationB, operationA, sessionB]]) {
+        const receipt = await f.receipt(id, operationId);
+        assert.equal(receipt.id, operationId);
+        assert.equal(receipt.status, 'completed');
+        const timeline = await f.timeline(id);
+        const command = timeline.find(entry => entry.item.type === 'user_message' && entry.item.clientMessageId === operationId);
+        assert(command?.turnId, 'the operation ID must identify its own compaction command turn');
+        const completed = boundaries(timeline);
+        assert.equal(completed.length, 1, 'only this conversation\'s compaction boundary may complete');
+        assert.equal(completed[0].turnId, command.turnId, 'the receipt and boundary must belong to the same command');
+        assert(!JSON.stringify(timeline).includes(otherOperationId),
+          'another conversation\'s operation must not appear on this timeline');
+        assert.equal((await f.refresh(id)).persistence.sessionId, sessionId,
+          'concurrent compaction must keep each native session');
+      }
+      await f.rpc('toggle', { agentId: a, enabled: false });
+      await f.rpc('toggle', { agentId: b, enabled: false });
+    },
+  },
+  {
     name: 'aged terminal records and receipts are pruned without replay; recent and pending records survive',
     async run({ fixture: f, model }) {
       const id = await f.agent();

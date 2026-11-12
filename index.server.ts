@@ -125,12 +125,11 @@ export default function contribute(server: PluginServerContext) {
     host.attach(paseo);
     return { operation: await scheduler.operation(operationId) };
   });
-  let ticking = false;
   const timer = setInterval(() => {
-    if (ticking) return;
-    ticking = true;
+    // Overlapping ticks are safe: state changes are serialized, the worker never
+    // runs one operation twice, and a reservation phase re-checks fresh state.
     // Operation recovery must progress even when native discovery fails/hangs.
-    void scheduler.tick(host.connected()).catch(report).finally(() => { ticking = false; });
+    void scheduler.tick(host.connected()).catch(report);
     if (host.connected()) void scheduler.observe({ kind: "periodic" }).catch(report);
   }, 10_000);
   return () => {
