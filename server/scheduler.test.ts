@@ -1978,3 +1978,22 @@ test("a slow host read in a tick does not hold up other conversations' state cha
   assert.deepEqual(f.state.disabled, ["b"]);
   assert.equal(f.calls, 1);
 });
+
+test("one conversation's failed refresh does not drop another conversation's finished reply", async () => {
+  const f = fixture();
+  f.agents.splice(0, 1);
+  const s = f.make();
+  await s.ready;
+  f.holdRefresh("a", async () => { throw new Error("host failed for a"); });
+  const release = f.holdList();
+  // A full scan that read no conversation is still running...
+  const full = s.observe({ kind: "full" });
+  await settle();
+  // ...when replies of a and b end; their turn-end observations merge.
+  f.agents.push(nativeAgent(f, "a"), nativeAgent(f, "b"));
+  const merged = [s.observe({ kind: "agent", agentId: "a" }), s.observe({ kind: "agent", agentId: "b" })];
+  release();
+  await full;
+  await assert.rejects(merged[1], /host failed for a/, "the failure is still reported");
+  assert.deepEqual(reserved(f), ["b"], "b's finished reply is reserved without waiting for a full scan");
+});

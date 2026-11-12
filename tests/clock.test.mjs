@@ -10,6 +10,8 @@ function fakeTimers(start = 1_000_000) {
     now: () => time,
     setTimeout(callback, ms) { const id = nextId++; pending.set(id, { at: time + Math.max(0, ms), callback }); return id; },
     clearTimeout(id) { pending.delete(id); },
+    // Move time without running timers, like a busy event loop.
+    jump(ms) { time += ms; },
     get active() { return [...pending.values()].map(entry => entry.at).sort((a, b) => a - b); },
     advance(ms) {
       const until = time + ms;
@@ -180,4 +182,22 @@ test("the clock reads the current time from its timers", () => {
   const clock = createSharedClock(timers);
   timers.advance(1234);
   assert.equal(clock.now(), timers.now());
+});
+
+test("a boundary that passed before its timer ran is still delivered after another control reschedules", () => {
+  const timers = fakeTimers();
+  const clock = createSharedClock(timers);
+  const start = timers.now();
+  const deadline = start + 25_000;
+  const stale = [];
+  // A freshness deadline: only reported while it is still ahead.
+  clock.subscribe(now => stale.push(now), now => deadline > now ? deadline : null);
+  clock.subscribe(() => {}, now => now + 60_000);
+  timers.jump(25_001);
+  // Another control renders and reschedules before the overdue timer has run.
+  clock.reschedule();
+  timers.advance(0);
+  assert.deepEqual(stale, [start + 25_001], "the overdue control is told once");
+  timers.advance(60_000);
+  assert.deepEqual(stale, [start + 25_001], "and not again after it was delivered");
 });
