@@ -22,7 +22,7 @@ const root=await mkdtemp(join(tmpdir(),'paseo-ui-validation-'));
 const model=await startModel(); let fixture,browser;
 const report={version, platform:process.platform, arch:process.arch, node:process.version, checks:[], sources:{}, startedAt:new Date().toISOString()};
 try {
- for (const path of ['index.client.tsx','client/conversation.tsx','client/compact-submission.ts','client/conversations.tsx','client/format.ts','client/session-state.ts','client/settings.tsx','client/toggle.tsx','index.server.ts',
+ for (const path of ['index.client.tsx','client/conversation.tsx','client/compact-submission.ts','client/conversations.tsx','client/format.ts','client/cadence.ts','client/session-state.ts','client/settings.tsx','client/toggle.tsx','index.server.ts',
    'server/cache.ts','server/observer.ts','server/observer-source.mjs','server/observer-assets.generated.ts',
    'server/gateway.ts','server/scheduler.ts','server/model.ts','server/store.ts','server/operations.ts',
    'server/retention.ts','server/deadline.ts','shared/rpc.ts','shared/providers.ts','shared/settings.ts',
