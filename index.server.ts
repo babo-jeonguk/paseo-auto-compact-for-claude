@@ -1,8 +1,7 @@
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { createGateway } from "./server/gateway";
 import { createScheduler } from "./server/scheduler";
-import { bounded, INSPECT_TIMEOUT_MS } from "./server/deadline";
-import { createStore } from "./server/store";
+import { createCachedStore, createStore } from "./server/store";
 import { createObserver } from "./server/observer";
 import { createReporter } from "./server/report";
 import { createLifecycleHooks } from "./server/lifecycle";
@@ -28,7 +27,7 @@ export default function contribute(server: PluginServerContext) {
   const reporter = createReporter(message => console.error("[auto-compact-for-claude]", message));
   const report = reporter.report;
   const scheduler = createScheduler({
-    store: createStore(),
+    store: createCachedStore(createStore()),
     gateway: host.gateway,
     receipts: { remove: observer.removeReceipt, sweep: observer.sweepReceipts },
     settings: async () => {
@@ -38,15 +37,10 @@ export default function contribute(server: PluginServerContext) {
     onError: report,
   });
   void scheduler.ready.then(() => scheduler.reconcile(host.connected())).catch(report);
-  // Reservations are created from native ordinary completion, including when
-  // Paseo reports a premature turn end during overlapping compaction/input.
-  const observe = async () => {
-    if (!host.connected()) return;
-    for (const agent of await bounded(host.gateway.list(), INSPECT_TIMEOUT_MS)) {
-      if (agent.activityKey && agent.observedEndedAt !== null && agent.observedEndedAt !== undefined)
-        await scheduler.observedTurn(agent, agent.observedEndedAt);
-    }
-  };
+  // Reservations come from native ordinary completion, including when Paseo
+  // reports a premature turn end during overlapping compaction/input. Turn ends
+  // observe one agent, the tick watches reservations and pending operations,
+  // and a full safety scan catches anything a missed event left unnoticed.
   const stops = [
     lifecycle.on("agent.turn.before", (event, { paseo }) => {
       host.attach(paseo);
@@ -63,7 +57,7 @@ export default function contribute(server: PluginServerContext) {
       // Paseo 0.13 no longer includes history in this event. Observe native
       // activity instead; the scheduler deduplicates the unchanged activity
       // identity produced by a manual compact on both Paseo 0.12 and 0.13.
-      void observe().catch(report);
+      void scheduler.observe({ kind: "agent", agentId: event.agent.id }).catch(report);
     }),
     ...(
       [
@@ -137,7 +131,7 @@ export default function contribute(server: PluginServerContext) {
     ticking = true;
     // Operation recovery must progress even when native discovery fails/hangs.
     void scheduler.tick(host.connected()).catch(report).finally(() => { ticking = false; });
-    void observe().catch(report);
+    if (host.connected()) void scheduler.observe({ kind: "periodic" }).catch(report);
   }, 10_000);
   return () => {
     reporter.dispose();

@@ -14,6 +14,43 @@ const UNAVAILABLE = "This conversation is unavailable for compaction";
 const terminal = (job: Job) =>
   ["expired", "skipped", "completed", "failed", "unknown"].includes(job.status);
 
+export const FULL_SCAN_INTERVAL_MS = 60_000;
+export type ObservationScope =
+  | { kind: "agent"; agentId: string }
+  | { kind: "periodic" }
+  | { kind: "full" };
+
+// Apply one finished native turn to the state in memory. Returns whether the
+// state changed; the caller decides when to persist it.
+function applyObservation(state: State, agent: Observation, endedAt: number, stopped: boolean) {
+  const prior = state.jobs.find((job) => job.agentId === agent.agentId);
+  if (
+    !agent.eligible ||
+    !agent.idle ||
+    !agent.revision ||
+    Date.parse(agent.revision) > endedAt ||
+    // Background notifications start native turns without a new host
+    // message, so native activity identifies work when it is available.
+    (agent.activityKey
+      ? prior?.activityKey === agent.activityKey
+      : prior?.revision === agent.revision) ||
+    stopped
+  )
+    return false;
+  state.jobs = state.jobs.filter((job) => job.agentId !== agent.agentId);
+  state.jobs.push({
+    agentId: agent.agentId,
+    revision: agent.revision,
+    endedAt,
+    ...(agent.activityKey ? { activityKey: agent.activityKey } : {}),
+    ...(agent.sessionId ? { sessionId: agent.sessionId } : {}),
+    status: "scheduled",
+    detail:
+      "Idle delay measured from observed Claude turn end",
+  });
+  return true;
+}
+
 export function createScheduler(options: {
   store: StateStore;
   gateway: Gateway;
@@ -41,6 +78,87 @@ export function createScheduler(options: {
     const result = tail.then(fn);
     tail = result.catch(() => {});
     return result;
+  };
+  let nextFullScanAt = -Infinity;
+  let observing = false;
+  type Plan = { full: boolean; attention: boolean; agentIds: Set<string> };
+  const newPlan = (): Plan => ({ full: false, attention: false, agentIds: new Set() });
+  let pending: { plan: Plan; promise: Promise<void>; resolve(): void; reject(error: unknown): void } | null = null;
+  const observedTurns = (entries: ReadonlyArray<{ agent: Observation; endedAt: number }>) =>
+    serialize(async () => {
+      const state = await store.read();
+      let changed = false;
+      for (const { agent, endedAt } of entries)
+        if (applyObservation(state, agent, endedAt, stopped)) changed = true;
+      if (changed) await store.write(state);
+    });
+  function planFor(scope: ObservationScope): Plan {
+    const plan = newPlan();
+    if (scope.kind === "agent") plan.agentIds.add(scope.agentId);
+    else if (scope.kind === "full" || now() >= nextFullScanAt) {
+      plan.full = true;
+      nextFullScanAt = now() + FULL_SCAN_INTERVAL_MS;
+    } else plan.attention = true;
+    return plan;
+  }
+  const mergePlan = (target: Plan, source: Plan) => {
+    target.full ||= source.full;
+    target.attention ||= source.attention;
+    for (const id of source.agentIds) target.agentIds.add(id);
+  };
+  async function runPlan(plan: Plan) {
+    let agents: Observation[];
+    if (plan.full) {
+      agents = await bounded(gateway.list(), INSPECT_TIMEOUT_MS);
+    } else {
+      const ids = new Set(plan.agentIds);
+      if (plan.attention) {
+        // Read-only, outside serialize: a slow listing must not delay a tick.
+        const state = await store.read();
+        for (const job of state.jobs)
+          if (!terminal(job)) ids.add(job.agentId);
+        for (const operation of state.operations)
+          if (operationPending(operation)) ids.add(operation.agentId);
+      }
+      if (ids.size === 0) return;
+      agents = plan.attention
+        ? await bounded(gateway.list({ agentIds: [...ids] }), INSPECT_TIMEOUT_MS)
+        : (await Promise.all([...ids].map(refresh)))
+          .filter((agent): agent is Observation => agent !== null);
+    }
+    const entries = agents
+      .filter((agent) => agent.activityKey && agent.observedEndedAt != null)
+      .map((agent) => ({ agent, endedAt: agent.observedEndedAt! }));
+    if (entries.length) await observedTurns(entries);
+  }
+  function finish() {
+    observing = false;
+    const next = pending;
+    pending = null;
+    if (!next) return;
+    if (stopped) { next.resolve(); return; }
+    observing = true;
+    const run = runPlan(next.plan);
+    run.then(
+      () => { next.resolve(); finish(); },
+      (error) => { next.reject(error); finish(); },
+    );
+  }
+  function start(plan: Plan) {
+    observing = true;
+    const run = runPlan(plan);
+    run.then(finish, finish);
+    return run;
+  }
+  const observe = (scope: ObservationScope): Promise<void> => {
+    if (stopped) return Promise.resolve();
+    const plan = planFor(scope);
+    if (!observing) return start(plan);
+    if (pending) { mergePlan(pending.plan, plan); return pending.promise; }
+    let resolve!: () => void, reject!: (error: unknown) => void;
+    const promise = new Promise<void>((ok, fail) => { resolve = ok; reject = fail; });
+    pending = { plan, promise, resolve, reject };
+    return promise;
   };
   const due = (job: Job, config: Settings) => dueAt(job.endedAt, config);
   function reversibleSkip(
@@ -212,36 +330,9 @@ export function createScheduler(options: {
       worker.stop();
     },
     // Hooks are queued, but the gateway marks own turns synchronously before calling this.
-    observedTurn: (agent: Observation, endedAt = now()) =>
-      serialize(async () => {
-        const state = await store.read();
-        const prior = state.jobs.find((job) => job.agentId === agent.agentId);
-        if (
-          !agent.eligible ||
-          !agent.idle ||
-          !agent.revision ||
-          Date.parse(agent.revision) > endedAt ||
-          // Background notifications start native turns without a new host
-          // message, so native activity identifies work when it is available.
-          (agent.activityKey
-            ? prior?.activityKey === agent.activityKey
-            : prior?.revision === agent.revision) ||
-          stopped
-        )
-          return;
-        state.jobs = state.jobs.filter((job) => job.agentId !== agent.agentId);
-        state.jobs.push({
-          agentId: agent.agentId,
-          revision: agent.revision,
-          endedAt,
-          ...(agent.activityKey ? { activityKey: agent.activityKey } : {}),
-          ...(agent.sessionId ? { sessionId: agent.sessionId } : {}),
-          status: "scheduled",
-          detail:
-            "Idle delay measured from observed Claude turn end",
-        });
-        await store.write(state);
-      }),
+    observedTurns,
+    observedTurn: (agent: Observation, endedAt = now()) => observedTurns([{ agent, endedAt }]),
+    observe,
     // Mark an old reservation unusable as soon as unrelated work starts or permission changes.
     invalidate: (agentId: string) =>
       serialize(async () => {
@@ -263,6 +354,10 @@ export function createScheduler(options: {
           settings(),
           refresh(agentId),
         ]);
+        // A status read sees the reply that just ended, even before its event.
+        if (agent?.activityKey && agent.observedEndedAt != null &&
+            applyObservation(state, agent, agent.observedEndedAt, stopped))
+          await store.write(state);
         return agent?.eligible ? view(agent, state, config) : null;
       }),
     list: () =>

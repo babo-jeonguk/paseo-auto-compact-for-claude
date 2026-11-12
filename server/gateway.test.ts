@@ -443,3 +443,107 @@ test('native activity identity survives compaction without restoring its schedul
   assert.equal((await host.gateway.refresh('a'))?.activityKey, null);
   host.stop();
 });
+
+// A host directory of many agents, paged like Paseo's agent list, with an
+// observer that records which agents' native ledgers were read.
+function directory(pageSize = 2) {
+  const base = {
+    provider: "claude", cwd: "/work", title: null, labels: {} as Record<string, string>, status: "idle",
+    activeTurn: null, pendingPermissions: [], lastUserMessageAt: new Date(1000).toISOString(),
+    lastUsage: { contextWindowUsedTokens: 210_000 },
+  };
+  const agents = [
+    { ...base, id: "a" },
+    { ...base, id: "b" },
+    { ...base, id: "c" },
+    { ...base, id: "archived", archivedAt: new Date(2000).toISOString() },
+    { ...base, id: "internal", internal: true },
+    { ...base, id: "child", labels: { "paseo.parent-agent-id": "a" } },
+    { ...base, id: "unavailable", providerUnavailable: true },
+    { ...base, id: "closed", status: "closed" },
+    { ...base, id: "codex", provider: "codex" },
+  ].map(agent => ({ ...agent, persistence: { sessionId: `native-${agent.id}` } }));
+  const reads: string[] = [];
+  let listCalls = 0;
+  const native = observer(null)!;
+  const read = native.read;
+  native.read = async (id: string) => {
+    reads.push(id);
+    const current = await read(id);
+    return current ? { ...current, ledger: { ...current.ledger, sessionId: `native-${id}` } } : null;
+  };
+  const host = createGateway({ observer: native });
+  host.attach({
+    config: { get: async () => ({ config: { providers: {} } }) },
+    agents: {
+      list: async (options: { page?: { limit?: number; cursor?: string } }) => {
+        listCalls++;
+        const start = Number(options.page?.cursor ?? 0);
+        const end = start + Math.min(pageSize, options.page?.limit ?? pageSize);
+        return {
+          entries: agents.slice(start, end).map(agent => ({ agent })),
+          pageInfo: { hasMore: end < agents.length, nextCursor: end < agents.length ? String(end) : null },
+        };
+      },
+      ref: (id: string) => ({
+        refresh: async () => {
+          const agent = agents.find(entry => entry.id === id);
+          return agent ? { agent } : null;
+        },
+      }),
+    },
+  } as unknown as PluginHandlerContext["paseo"]);
+  return { host, reads, get listCalls() { return listCalls; } };
+}
+const INELIGIBLE = ["archived", "internal", "child", "unavailable", "closed", "codex"];
+
+test("the full list still observes every agent, but reads native ledgers only for eligible Claude agents", async () => {
+  const { host, reads } = directory();
+  const observations = await host.gateway.list();
+  assert.deepEqual(observations.map(agent => agent.agentId),
+    ["a", "b", "c", ...INELIGIBLE], "every listed agent is still reported");
+  assert.deepEqual(observations.filter(agent => agent.eligible).map(agent => agent.agentId), ["a", "b", "c"]);
+  for (const agent of observations.filter(agent => agent.eligible)) {
+    assert.ok(agent.activityKey, `${agent.agentId} keeps its native activity identity`);
+    assert.equal(agent.observedEndedAt, 1000);
+    assert.equal(agent.idle, true);
+  }
+  assert.deepEqual([...reads].sort(), ["a", "b", "c"]);
+  for (const agent of observations.filter(agent => !agent.eligible)) {
+    assert.equal(agent.activityKey ?? null, null, `${agent.agentId} has no native activity to schedule`);
+    assert.equal(agent.observedEndedAt ?? null, null);
+  }
+  host.stop();
+});
+
+test("an agent filter reads only the selected agents' ledgers, across every page", async () => {
+  const { host, reads } = directory();
+  const observations = await host.gateway.list({ agentIds: ["c", "b"] });
+  assert.deepEqual(observations.map(agent => agent.agentId).sort(), ["b", "c"]);
+  assert.deepEqual([...reads].sort(), ["b", "c"]);
+  assert.ok(observations.every(agent => agent.eligible && agent.activityKey));
+  host.stop();
+});
+
+test("a filter naming ineligible or unknown agents causes no ledger read", async () => {
+  const { host, reads } = directory();
+  const observations = await host.gateway.list({ agentIds: [...INELIGIBLE, "missing"] });
+  assert.equal(reads.length, 0);
+  assert.ok(observations.every(agent => !agent.eligible));
+  assert.equal(observations.some(agent => agent.agentId === "missing"), false);
+  assert.deepEqual(await host.gateway.list({ agentIds: [] }), []);
+  assert.equal(reads.length, 0);
+  host.stop();
+});
+
+test("refreshing an ineligible agent does not read its ledger; an eligible one still does", async () => {
+  const { host, reads } = directory();
+  for (const id of INELIGIBLE) {
+    const agent = await host.gateway.refresh(id);
+    assert.equal(agent?.eligible, false, id);
+  }
+  assert.equal(reads.length, 0);
+  assert.ok((await host.gateway.refresh("a"))?.activityKey);
+  assert.deepEqual(reads, ["a"]);
+  host.stop();
+});
