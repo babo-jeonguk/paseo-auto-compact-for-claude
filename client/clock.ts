@@ -37,11 +37,13 @@ export function createSharedClock(timers: Partial<ClockTimers> = {}): SharedCloc
     const now = clock.now();
     let at: number | null = null;
     for (const subscriber of subscribers) {
-      subscriber.next = subscriber.nextAt(now);
+      // An overdue boundary is still undelivered: keep it so the timer runs at once.
+      if (subscriber.next == null || subscriber.next > now)
+        subscriber.next = subscriber.nextAt(now);
       if (subscriber.next !== null && (at === null || subscriber.next < at))
         at = subscriber.next;
     }
-    if (at === scheduledAt) return;
+    if (at === scheduledAt && (at === null || at > now)) return;
     if (handle !== null) clock.clearTimeout(handle);
     handle = null;
     scheduledAt = at;
@@ -52,6 +54,8 @@ export function createSharedClock(timers: Partial<ClockTimers> = {}): SharedCloc
     const now = clock.now();
     for (const subscriber of [...subscribers]) {
       if (!due(subscriber, now)) continue;
+      // Delivered: the next reschedule recomputes it, so an overdue boundary fires once.
+      subscriber.next = null;
       try {
         subscriber.listener(now);
       } catch {

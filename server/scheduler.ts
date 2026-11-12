@@ -156,6 +156,7 @@ export function createScheduler(options: {
   async function runPlan(plan: Plan) {
     const seq = ++reads;
     let agents: Observation[];
+    let failure: PromiseRejectedResult | undefined;
     if (plan.full) {
       const listing = gateway.list();
       hostWork = listing.then(() => {}, () => {});
@@ -177,10 +178,25 @@ export function createScheduler(options: {
         agents = await bounded(listing, INSPECT_TIMEOUT_MS);
       } else {
         // Unbounded here: the plan holds single-flight until every read ends.
-        // A failed read fails fast for the caller but does not end the others.
+        // A failed read is reported after the successful observations are saved.
         const refreshes = [...ids].map((id) => gateway.refresh(id));
         hostWork = Promise.allSettled(refreshes);
-        agents = (await bounded(Promise.all(refreshes), INSPECT_TIMEOUT_MS))
+        const failures: PromiseRejectedResult[] = [];
+        for (const refresh of refreshes)
+          refresh.catch((reason) => { failures.push({ status: "rejected", reason }); });
+        let results: PromiseSettledResult<Observation | null>[];
+        try {
+          results = await bounded(Promise.allSettled(refreshes), INSPECT_TIMEOUT_MS);
+        } catch (error) {
+          // A held sibling must not hide an earlier refresh failure.
+          if (failures.length) throw failures[0].reason;
+          throw error;
+        }
+        failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+        agents = results
+          .filter((result): result is PromiseFulfilledResult<Observation | null> =>
+            result.status === "fulfilled")
+          .map((result) => result.value)
           .filter((agent): agent is Observation => agent !== null);
       }
     }
@@ -188,6 +204,8 @@ export function createScheduler(options: {
       .filter((agent) => agent.activityKey && agent.observedEndedAt != null)
       .map((agent) => ({ agent, endedAt: agent.observedEndedAt!, seq }));
     if (entries.length) await observedTurns(entries);
+    // Record every successful observation before reporting the failure.
+    if (failure) throw failure.reason;
   }
   function release() {
     if (hostTimer) { clearTimeout(hostTimer); hostTimer = undefined; }
