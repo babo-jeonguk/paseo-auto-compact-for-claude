@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { mock, test } from "node:test";
 import {
   DEFAULT_SETTINGS,
   SettingsSchema,
@@ -1329,4 +1329,74 @@ test("a new launch or session generation still earns a reservation, whatever its
   const relaunched = { ...nativeAgent(f, "a", "1"), activityKey: "relaunch:a:1" };
   await s.observedTurns([{ agent: relaunched, endedAt: f.time }]);
   assert.equal(f.state.jobs[0].activityKey, "relaunch:a:1");
+});
+
+test("a scan read before a session's new generation cannot replace its skipped reservation", async () => {
+  const f = fixture();
+  f.agents.splice(0, 1, { ...nativeAgent(f, "a"), activityKey: "launch:old-generation:9" });
+  const s = f.make();
+  await s.ready;
+  const release = f.holdList();
+  const scan = s.observe({ kind: "full" });
+  await settle();
+  // The session reopened: a new generation's reply is recorded by a status read and skipped.
+  f.advance(1_000);
+  const current = { ...nativeAgent(f, "a"), activityKey: "launch:new-generation:1" };
+  f.agents[0] = current;
+  assert.equal((await s.session("a"))?.status, "scheduled");
+  assert.equal(await s.skip("a", current.revision!), true);
+  release();
+  await scan;
+  assert.equal(f.state.jobs[0].activityKey, "launch:new-generation:1");
+  assert.equal(f.state.jobs[0].status, "skipped");
+  await s.observe({ kind: "agent", agentId: "a" });
+  assert.equal(f.state.jobs[0].status, "skipped");
+  f.advance(55 * 60_000);
+  await s.tick();
+  assert.equal(f.calls, 0, "a skipped reply is never compacted");
+});
+
+test("a scan that times out keeps observation single-flight until its listing actually ends", async () => {
+  const f = fixture();
+  const s = f.make();
+  await s.ready;
+  mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    const release = f.holdList();
+    const first = s.observe({ kind: "full" });
+    await settle();
+    mock.timers.tick(5_000);
+    await assert.rejects(first);
+    const second = s.observe({ kind: "full" });
+    await settle();
+    assert.equal(f.counts.lists.length, 1, "no second listing while the first is still running");
+    release();
+    await second;
+    assert.equal(f.counts.lists.length, 2, "the queued scan runs once the listing ends");
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test("a listing that never ends stops blocking observation after a minute", async () => {
+  const f = fixture();
+  const s = f.make();
+  await s.ready;
+  mock.timers.enable({ apis: ["setTimeout"] });
+  const release = f.holdList();
+  try {
+    const first = s.observe({ kind: "full" });
+    await settle();
+    mock.timers.tick(5_000);
+    await assert.rejects(first);
+    mock.timers.tick(60_000);
+    await settle();
+    const second = s.observe({ kind: "agent", agentId: "a" });
+    await settle();
+    assert.deepEqual(f.counts.refreshes, ["a"], "observation resumes instead of stalling for good");
+    await second;
+  } finally {
+    release();
+    mock.timers.reset();
+  }
 });
