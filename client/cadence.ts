@@ -15,15 +15,27 @@ export function pollFailures(previous: number, event: PollEvent): number {
 }
 
 const failuresBySession = new Map<string, number>();
+const recoveryListeners = new Set<() => void>();
+
+// A status poll that recovers after failures is a reconnect signal for discovery.
+export function onSessionRecovered(listener: () => void): () => void {
+  recoveryListeners.add(listener);
+  return () => { recoveryListeners.delete(listener); };
+}
 
 // Every control of one conversation shares its backoff, however many are mounted.
 export function sessionFailures(key: string): { count(): number; record(event: PollEvent): void } {
   return {
     count: () => failuresBySession.get(key) ?? 0,
     record(event) {
-      const next = pollFailures(failuresBySession.get(key) ?? 0, event);
+      const previous = failuresBySession.get(key) ?? 0;
+      const next = pollFailures(previous, event);
       if (next === 0) failuresBySession.delete(key);
       else failuresBySession.set(key, next);
+      if (event === "success" && previous > 0)
+        for (const listener of recoveryListeners) {
+          try { listener(); } catch {} // one broken listener must not stop the rest
+        }
     },
   };
 }

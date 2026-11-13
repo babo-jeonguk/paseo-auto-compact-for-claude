@@ -123,6 +123,11 @@ export function createScheduler(options: {
     latestRead.set(agentId, seq);
     return true;
   };
+  // A successful read fences older reads of the same conversation even when it
+  // saw no finished reply.
+  const fence = (agentId: string, seq: number) => {
+    if (seq > (latestRead.get(agentId) ?? 0)) latestRead.set(agentId, seq);
+  };
   let planStartedAt = 0;
   let hostWork: Promise<unknown> = Promise.resolve();
   let hostTimer: ReturnType<typeof setTimeout> | undefined;
@@ -197,6 +202,7 @@ export function createScheduler(options: {
           .filter((agent): agent is Observation => agent !== null);
       }
     }
+    for (const agent of agents) fence(agent.agentId, seq);
     const entries = agents
       .filter((agent) => agent.activityKey && agent.observedEndedAt != null)
       .map((agent) => ({ agent, endedAt: agent.observedEndedAt!, seq }));
@@ -596,6 +602,7 @@ export function createScheduler(options: {
         settings(),
         refresh(agentId),
       ]);
+      if (agent) fence(agentId, seq);
       let recorded = false;
       if (agent?.activityKey && agent.observedEndedAt != null) {
         await observedTurns([{ agent, endedAt: agent.observedEndedAt, seq }]);

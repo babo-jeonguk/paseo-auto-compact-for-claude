@@ -7,7 +7,8 @@ import { Icon } from "@getpaseo/plugin/client/react-native";
 import { ActivityIndicator, AppState } from "react-native";
 import { useEffect } from "react";
 import { claudeProvider } from "../shared/providers";
-import { directoryRefreshDelay, surfaceActive, type DirectoryTrigger } from "./cadence";
+import { directoryRefreshDelay, onSessionRecovered, surfaceActive,
+  type DirectoryTrigger } from "./cadence";
 import { ConversationControls, useConversation } from "./conversation";
 import { onSurfaceChange } from "./surface";
 
@@ -16,7 +17,8 @@ type Agent = NonNullable<ReturnType<ReturnType<
 >["current"]>>;
 
 // Only mounted composer icons poll session state. Directory discovery refreshes
-// on mount, reconnect, visibility and directory events, with a 5-minute safety refresh.
+// on mount, reconnect (a failed directory refresh or a recovered status poll),
+// visibility and directory events, with a 5-minute safety refresh.
 export function installConversationControls(client: PluginClientContext) {
   const registrations = new Map<
     string,
@@ -159,6 +161,7 @@ export function installConversationControls(client: PluginClientContext) {
     }
   }
   schedule("mount");
+  const stopRecovered = onSessionRecovered(() => schedule("reconnect"));
   const stopSurface = onSurfaceChange(next => {
     const was = active;
     active = next;
@@ -171,6 +174,7 @@ export function installConversationControls(client: PluginClientContext) {
   return () => {
     stopped = true;
     clearTimeout(timer);
+    stopRecovered();
     stopSurface();
     unsubscribe();
     for (const { registration } of registrations.values()) registration.remove();
