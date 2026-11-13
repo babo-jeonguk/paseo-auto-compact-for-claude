@@ -7,7 +7,7 @@ import { Icon } from "@getpaseo/plugin/client/react-native";
 import { ActivityIndicator, AppState } from "react-native";
 import { useEffect } from "react";
 import { claudeProvider } from "../shared/providers";
-import { directoryRefreshDelay, onSessionRecovered, surfaceActive,
+import { directoryRefreshDelay, hostReconnected, onSessionRecovered, surfaceActive,
   type DirectoryTrigger } from "./cadence";
 import { ConversationControls, useConversation } from "./conversation";
 import { onSurfaceChange } from "./surface";
@@ -32,6 +32,7 @@ export function installConversationControls(client: PluginClientContext) {
   let timer: ReturnType<typeof setTimeout> | undefined;
   let active = surfaceActive(AppState.currentState);
   let failed = false; // last refresh failed: the next host event means the host is reachable again
+  let announced = false; // this outage already refreshed mounted status controls
   let again = false; // a trigger arrived while a refresh was running
 
   function reconcile(agent: Agent) {
@@ -100,6 +101,14 @@ export function installConversationControls(client: PluginClientContext) {
     else timer = setTimeout(() => void refreshDirectory(), delay);
   }
 
+  // Upserts arrive repeatedly during a turn, so broadcast once per outage.
+  function reconnected(force = false) {
+    schedule("reconnect");
+    if (announced && !force) return;
+    announced = true;
+    hostReconnected();
+  }
+
   const unsubscribe = client.paseo.agents.subscribe((update) => {
     if (update.kind !== "upsert") {
       schedule("agents-changed");
@@ -108,7 +117,7 @@ export function installConversationControls(client: PluginClientContext) {
     const { agent } = update;
     observed.set(agent.id, { agent, version: ++version });
     reconcile(agent);
-    if (failed) schedule("reconnect");
+    if (failed) reconnected();
   });
 
   async function refreshDirectory() {
@@ -152,6 +161,7 @@ export function installConversationControls(client: PluginClientContext) {
       // Visible badges report their own RPC errors. Retry directory discovery
       // after reconnect without destroying an already open conversation control.
       failed = true;
+      announced = false;
     } finally {
       loading = false;
       if (again) {
@@ -161,7 +171,7 @@ export function installConversationControls(client: PluginClientContext) {
     }
   }
   schedule("mount");
-  const stopRecovered = onSessionRecovered(() => schedule("reconnect"));
+  const stopRecovered = onSessionRecovered(() => reconnected(true));
   const stopSurface = onSurfaceChange(next => {
     const was = active;
     active = next;

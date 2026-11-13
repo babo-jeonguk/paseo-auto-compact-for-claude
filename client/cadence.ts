@@ -16,11 +16,26 @@ export function pollFailures(previous: number, event: PollEvent): number {
 
 const failuresBySession = new Map<string, number>();
 const recoveryListeners = new Set<() => void>();
+const reconnectListeners = new Set<() => void>();
 
 // A status poll that recovers after failures is a reconnect signal for discovery.
 export function onSessionRecovered(listener: () => void): () => void {
   recoveryListeners.add(listener);
   return () => { recoveryListeners.delete(listener); };
+}
+
+// A detected reconnect refreshes every mounted status control.
+export function onHostReconnected(listener: () => void): () => void {
+  reconnectListeners.add(listener);
+  return () => { reconnectListeners.delete(listener); };
+}
+
+// Every conversation starts over from the ten-second poll after a reconnect.
+export function hostReconnected(): void {
+  failuresBySession.clear();
+  for (const listener of reconnectListeners) {
+    try { listener(); } catch {} // one broken listener must not stop the rest
+  }
 }
 
 // Every control of one conversation shares its backoff, however many are mounted.

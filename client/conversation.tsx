@@ -19,8 +19,8 @@ import { canSkip, errorLabel, tokenLabel } from "./format";
 import { canUndoSkip, compactCompletionNotice, compactOutcomeNotice, INPUT_IDLE_GRACE_MS, pendingPresentation,
   sessionKey, sessionPresentation, STATUS_GRACE_MS, type Presentation } from "./session-state";
 import { compactSubmissions } from "./compact-submission";
-import { OPERATION_LOOKUP_MS, nextRenderAt, operationPollDelay, sessionFailures,
-  sessionPollDelay, STATUS_FRESH_MS } from "./cadence";
+import { OPERATION_LOOKUP_MS, nextRenderAt, onHostReconnected, operationPollDelay,
+  sessionFailures, sessionPollDelay, STATUS_FRESH_MS } from "./cadence";
 import { sharedClock } from "./clock";
 import { useClockRender, useSurfaceActive } from "./surface";
 import { Toggle } from "./toggle";
@@ -61,6 +61,13 @@ export function useConversation(hostId: string, agentId: string) {
     }
     previousActive.current = active;
   }, [active, queryClient, key]);
+  useEffect(
+    () =>
+      onHostReconnected(() => {
+        if (active) void queryClient.invalidateQueries({ queryKey: key });
+      }),
+    [active, queryClient, key]
+  );
   const now = sharedClock.now();
   useEffect(
     () =>
