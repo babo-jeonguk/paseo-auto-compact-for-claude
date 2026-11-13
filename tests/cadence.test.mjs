@@ -146,3 +146,27 @@ test("a conversation's status read that recovers after failures reports that the
   sessionFailures("host:conversation-recovery").record("success");
   assert.deepEqual(recovered, ["recovered"], "an unsubscribed listener is not called");
 });
+
+test("a detected reconnect resets every conversation's backoff and tells mounted status controls to refresh", async () => {
+  const { hostReconnected, onHostReconnected, onSessionRecovered, sessionFailures } = await import("../client/cadence.ts");
+  const a = sessionFailures("host:reconnect-a"), b = sessionFailures("host:reconnect-b");
+  for (let i = 0; i < 3; i++) { a.record("failure"); b.record("failure"); }
+  assert.equal(sessionPollDelay({ active: true, failures: a.count() }), 30_000);
+  const refreshed = [], recovered = [];
+  const stopBroken = onHostReconnected(() => { throw new Error("broken control"); });
+  const stop = onHostReconnected(() => refreshed.push("refresh"));
+  const stopRecovered = onSessionRecovered(() => recovered.push("recovered"));
+  try {
+    hostReconnected();
+    assert.deepEqual(refreshed, ["refresh"], "a broken listener does not stop the others");
+    assert.equal(a.count(), 0);
+    assert.equal(b.count(), 0);
+    assert.equal(sessionPollDelay({ active: true, failures: b.count() }), 10_000, "back to the ten-second poll");
+    a.record("success");
+    assert.deepEqual(recovered, [], "a read after a reported reconnect is not another recovery");
+  } finally {
+    stop(); stopBroken(); stopRecovered();
+  }
+  hostReconnected();
+  assert.deepEqual(refreshed, ["refresh"], "an unsubscribed listener is not called");
+});
