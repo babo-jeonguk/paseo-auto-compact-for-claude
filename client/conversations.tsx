@@ -4,17 +4,21 @@ import type {
   PluginClientContext,
 } from "@getpaseo/plugin/client";
 import { Icon } from "@getpaseo/plugin/client/react-native";
-import { ActivityIndicator } from "react-native";
+import { ActivityIndicator, AppState } from "react-native";
 import { useEffect } from "react";
 import { claudeProvider } from "../shared/providers";
+import { directoryRefreshDelay, hostReconnected, onSessionRecovered, surfaceActive,
+  type DirectoryTrigger } from "./cadence";
 import { ConversationControls, useConversation } from "./conversation";
+import { onSurfaceChange } from "./surface";
 
 type Agent = NonNullable<ReturnType<ReturnType<
   PluginClientContext["paseo"]["agents"]["ref"]
 >["current"]>>;
 
-// Only mounted composer icons poll session state. The directory refresh
-// discovers conversations without polling the full scheduling list per session.
+// Only mounted composer icons poll session state. Directory discovery refreshes
+// on mount, reconnect (a failed directory refresh or a recovered status poll),
+// visibility and directory events, with a 5-minute safety refresh.
 export function installConversationControls(client: PluginClientContext) {
   const registrations = new Map<
     string,
@@ -25,6 +29,11 @@ export function installConversationControls(client: PluginClientContext) {
   let version = 0;
   let stopped = false;
   let loading = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let active = surfaceActive(AppState.currentState);
+  let failed = false; // last refresh failed: the next host event means the host is reachable again
+  let announced = false; // this outage already refreshed mounted status controls
+  let again = false; // a trigger arrived while a refresh was running
 
   function reconcile(agent: Agent) {
     if (stopped || !providers) return;
@@ -82,18 +91,41 @@ export function installConversationControls(client: PluginClientContext) {
     });
   }
 
+  function schedule(trigger: DirectoryTrigger) {
+    if (stopped) return;
+    clearTimeout(timer);
+    timer = undefined;
+    const delay = directoryRefreshDelay({ trigger, active });
+    if (delay === false) return;
+    if (delay === 0) void refreshDirectory();
+    else timer = setTimeout(() => void refreshDirectory(), delay);
+  }
+
+  // Upserts arrive repeatedly during a turn, so broadcast once per outage.
+  function reconnected(force = false) {
+    schedule("reconnect");
+    if (announced && !force) return;
+    announced = true;
+    hostReconnected();
+  }
+
   const unsubscribe = client.paseo.agents.subscribe((update) => {
     if (update.kind !== "upsert") {
-      void refreshDirectory();
+      schedule("agents-changed");
       return;
     }
     const { agent } = update;
     observed.set(agent.id, { agent, version: ++version });
     reconcile(agent);
+    if (failed) reconnected();
   });
 
   async function refreshDirectory() {
-    if (loading || stopped) return;
+    if (loading) {
+      again = true;
+      return;
+    }
+    if (stopped) return;
     loading = true;
     const started = version;
     try {
@@ -124,18 +156,36 @@ export function installConversationControls(client: PluginClientContext) {
           observed.delete(id);
         } else reconcile(entry.agent);
       }
+      failed = false;
     } catch {
       // Visible badges report their own RPC errors. Retry directory discovery
       // after reconnect without destroying an already open conversation control.
+      failed = true;
+      announced = false;
     } finally {
       loading = false;
+      if (again) {
+        again = false;
+        schedule("agents-changed");
+      } else schedule("interval");
     }
   }
-  void refreshDirectory();
-  const timer = setInterval(() => void refreshDirectory(), 30_000);
+  schedule("mount");
+  const stopRecovered = onSessionRecovered(() => reconnected(true));
+  const stopSurface = onSurfaceChange(next => {
+    const was = active;
+    active = next;
+    if (next && !was) schedule("visible");
+    else if (!next) {
+      clearTimeout(timer);
+      timer = undefined;
+    }
+  });
   return () => {
     stopped = true;
-    clearInterval(timer);
+    clearTimeout(timer);
+    stopRecovered();
+    stopSurface();
     unsubscribe();
     for (const { registration } of registrations.values()) registration.remove();
     registrations.clear();

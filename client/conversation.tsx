@@ -16,9 +16,13 @@ import {
 import { operationRowStatus, operationPending, compactRpc, operationRpc, sessionRpc, skipRpc, toggleRpc, undoSkipRpc } from "../shared/rpc";
 import { compactSettings } from "../shared/settings";
 import { canSkip, errorLabel, tokenLabel } from "./format";
-import { canUndoSkip, compactCompletionNotice, compactOutcomeNotice, pendingPresentation, sessionKey,
-  sessionPresentation, type Presentation } from "./session-state";
+import { canUndoSkip, compactCompletionNotice, compactOutcomeNotice, INPUT_IDLE_GRACE_MS, pendingPresentation,
+  sessionKey, sessionPresentation, STATUS_GRACE_MS, type Presentation } from "./session-state";
 import { compactSubmissions } from "./compact-submission";
+import { OPERATION_LOOKUP_MS, nextRenderAt, onHostReconnected, operationPollDelay,
+  sessionFailures, sessionPollDelay, STATUS_FRESH_MS } from "./cadence";
+import { sharedClock } from "./clock";
+import { useClockRender, useSurfaceActive } from "./surface";
 import { Toggle } from "./toggle";
 
 export function useConversation(hostId: string, agentId: string) {
@@ -27,18 +31,44 @@ export function useConversation(hostId: string, agentId: string) {
   const queryClient = useQueryClient();
   const paseo = usePaseo();
   const key = sessionKey(hostId, agentId);
+  const active = useSurfaceActive();
+  const failures = sessionFailures(key.join(":"));
   const query = useQuery({
     queryKey: key,
-    queryFn: () => read({ agentId }),
-    refetchInterval: 2_000,
+    queryFn: async () => {
+      try {
+        const result = await read({ agentId });
+        failures.record("success");
+        return result;
+      } catch (error) {
+        failures.record("failure");
+        throw error;
+      }
+    },
+    refetchInterval: () => sessionPollDelay({ active, failures: failures.count() }),
     retry: false,
   });
   const mutations = useIsMutating({ mutationKey: key });
-  const [now, setNow] = useState(Date.now);
+  const previousActive = useRef(active);
+  const pendingSince = useRef<number | null>(null);
   useEffect(() => {
-    const timer = setInterval(() => setNow(Date.now()), 1_000);
-    return () => clearInterval(timer);
-  }, []);
+    if (active && !previousActive.current) {
+      failures.record("focus");
+      // Time spent hidden is not a failed refresh: restart the grace window.
+      pendingSince.current = null;
+      void queryClient.invalidateQueries({ queryKey: key });
+      sharedClock.notify();
+    }
+    previousActive.current = active;
+  }, [active, queryClient, key]);
+  useEffect(
+    () =>
+      onHostReconnected(() => {
+        if (active) void queryClient.invalidateQueries({ queryKey: key });
+      }),
+    [active, queryClient, key]
+  );
+  const now = sharedClock.now();
   useEffect(
     () =>
       paseo.agents.ref(agentId).subscribe(() => {
@@ -47,10 +77,9 @@ export function useConversation(hostId: string, agentId: string) {
     [paseo, agentId, hostId, queryClient]
   );
   const row = query.data?.row ?? null;
-  const fresh = !query.isError && query.dataUpdatedAt > 0 && now - query.dataUpdatedAt < 6_000;
+  const fresh = !query.isError && query.dataUpdatedAt > 0 && now - query.dataUpdatedAt < STATUS_FRESH_MS;
   const ready = fresh && !!row && settings.status === "ready";
   const previous = useRef<Presentation | null>(null);
-  const pendingSince = useRef<number | null>(null);
   const current = ready ? sessionPresentation(row!, settings.values, now) : null;
   if (current) {
     previous.current = current;
@@ -58,6 +87,16 @@ export function useConversation(hostId: string, agentId: string) {
   } else {
     pendingSince.current ??= now;
   }
+  useClockRender(at => nextRenderAt({
+    now: at,
+    dueAt: current?.label.startsWith("Compact in ") ? row?.dueAt ?? null : null,
+    deadlines: [
+      fresh ? query.dataUpdatedAt + STATUS_FRESH_MS : null,
+      pendingSince.current !== null ? pendingSince.current + STATUS_GRACE_MS : null,
+      row?.undoSkip?.dueAt,
+      row?.inputIdleSince != null ? row.inputIdleSince + INPUT_IDLE_GRACE_MS : null,
+    ],
+  }));
   const display = current?.label === "Compacting…"
     ? { presentation: current, loading: false }
     : mutations
@@ -71,7 +110,7 @@ export function useConversation(hostId: string, agentId: string) {
     : pendingPresentation(previous.current, now - (pendingSince.current ?? now));
   return { row, query, settings, ready, status: display.presentation?.label ?? null,
     description: display.presentation?.description ?? "Loading compact status…",
-    loading: display.loading, mutations, now };
+    loading: display.loading, mutations, now, active };
 }
 
 export function ConversationControls({
@@ -93,19 +132,36 @@ export function ConversationControls({
   const [compactOperationId, setCompactOperationId] = useState<string | null>(
     () => compactSubmissions.get(host.id, agentId)?.operationId ?? null);
   const trackedId = compactOperationId ?? row?.activeOperation?.id ?? null;
+  const trackedSince = useRef<{ id: string | null; at: number }>({ id: trackedId, at: Date.now() });
+  if (trackedSince.current.id !== trackedId) trackedSince.current = { id: trackedId, at: Date.now() };
   const operationQuery = useQuery({
     queryKey: ["auto-compact", host.id, "operation", trackedId],
     queryFn: () => readOperation({ operationId: trackedId! }),
     enabled: !!trackedId,
-    refetchInterval: query => query.state.data?.operation &&
-      !operationPending(query.state.data.operation) ? false : 2_000,
+    refetchInterval: query => operationPollDelay({
+      active: state.active,
+      found: !!query.state.data?.operation,
+      pending: query.state.data?.operation ? operationPending(query.state.data.operation) : true,
+      elapsed: Date.now() - trackedSince.current.at,
+    }),
     retry: false,
   });
   const operation = operationQuery.data?.operation ?? row?.activeOperation ?? row?.latestOperation;
+  const lookupExpired = !!trackedId && !operationQuery.data?.operation && !row?.activeOperation &&
+    Date.now() - trackedSince.current.at >= OPERATION_LOOKUP_MS;
+  useClockRender(at => {
+    const deadline = trackedSince.current.at + OPERATION_LOOKUP_MS;
+    return trackedId && !operationQuery.data?.operation && deadline > at ? Math.max(at, deadline) : null;
+  });
   useEffect(() => {
     setCompactOperationId(compactSubmissions.get(host.id, agentId)?.operationId ?? null);
   }, [host.id, agentId]);
   useEffect(() => setConfirmRevision(null), [row?.revision]);
+  useEffect(() => {
+    const tracked = operationQuery.data?.operation;
+    if (tracked && !operationPending(tracked))
+      void queryClient.invalidateQueries({ queryKey: key });
+  }, [operationQuery.data?.operation?.id, operationQuery.data?.operation?.state]);
 
   const action = useMutation({
     mutationKey: key,
@@ -257,6 +313,10 @@ export function ConversationControls({
           ? "Request status unconfirmed. Refresh status or retry the same request."
           : "This action failed. Refresh the status and try again."}
       </Text> : null}
+      {lookupExpired && !(action.isError && action.variables?.kind === "compact")
+        ? <Text accessibilityRole="alert" style={{ ...mutedStyle, color: colors.statusDanger }}>
+          Request status unconfirmed. Refresh status or retry the same request.
+        </Text> : null}
       {operation ? <Text style={mutedStyle}>
         {operationPending(operation) ? "Compaction requested"
           : `Last compaction: ${operation.result?.message ?? operation.state}`}
@@ -283,10 +343,13 @@ export function ConversationControls({
       </View> : button("Compact now", () => setConfirmRevision(row!.revision!),
         disabled || !row?.revision || row.status === "busy", "Minimize2")}
       </View>
-      {status === "Check compact" || query.isError || !ready && !query.isPending ? button("Refresh status", () => {
-        void query.refetch();
-        void settings.reload();
-      }, query.isFetching, "RefreshCw") : null}
+      {status === "Check compact" || query.isError || !ready && !query.isPending || lookupExpired
+        ? button("Refresh status", () => {
+          trackedSince.current = { id: trackedId, at: Date.now() };
+          void operationQuery.refetch();
+          void query.refetch();
+          void settings.reload();
+        }, query.isFetching, "RefreshCw") : null}
       {button("Settings", onSettings, false, "Settings2")}
     </View>
   );

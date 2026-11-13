@@ -27,6 +27,61 @@ type ReservationOutcome = { kind: "expired" | "skipped" | "blocked"; detail: str
   { kind: "reserve"; agent: Observation; config: Settings };
 type Decision = { candidate: Candidate; outcome: ReservationOutcome };
 
+export const FULL_SCAN_INTERVAL_MS = 60_000;
+export type ObservationScope =
+  | { kind: "agent"; agentId: string }
+  | { kind: "periodic" }
+  | { kind: "full" };
+
+// Native activity keys are `${launchId}:${generation}:${revision}`.
+function splitActivityKey(key: string) {
+  const at = key.lastIndexOf(":");
+  return at < 0
+    ? { epoch: key, revision: Number.NaN }
+    : { epoch: key.slice(0, at), revision: Number(key.slice(at + 1)) };
+}
+
+// Observations are read outside the state transaction, so they can commit out of order.
+function staleActivity(prior: string | undefined, next: string | undefined) {
+  if (!prior || !next) return false;
+  const before = splitActivityKey(prior), after = splitActivityKey(next);
+  return before.epoch === after.epoch &&
+    Number.isFinite(before.revision) && Number.isFinite(after.revision) &&
+    after.revision < before.revision;
+}
+
+// Apply one finished native turn to the state in memory. Returns whether the
+// state changed; the caller decides when to persist it.
+function applyObservation(state: State, agent: Observation, endedAt: number, stopped: boolean) {
+  const prior = state.jobs.find((job) => job.agentId === agent.agentId);
+  if (
+    !agent.eligible ||
+    !agent.idle ||
+    !agent.revision ||
+    Date.parse(agent.revision) > endedAt ||
+    // Background notifications start native turns without a new host
+    // message, so native activity identifies work when it is available.
+    (agent.activityKey
+      ? prior?.activityKey === agent.activityKey ||
+        staleActivity(prior?.activityKey, agent.activityKey)
+      : prior?.revision === agent.revision) ||
+    stopped
+  )
+    return false;
+  state.jobs = state.jobs.filter((job) => job.agentId !== agent.agentId);
+  state.jobs.push({
+    agentId: agent.agentId,
+    revision: agent.revision,
+    endedAt,
+    ...(agent.activityKey ? { activityKey: agent.activityKey } : {}),
+    ...(agent.sessionId ? { sessionId: agent.sessionId } : {}),
+    status: "scheduled",
+    detail:
+      "Idle delay measured from observed Claude turn end",
+  });
+  return true;
+}
+
 export function createScheduler(options: {
   store: StateStore;
   gateway: Gateway;
@@ -54,6 +109,144 @@ export function createScheduler(options: {
     const result = tail.then(fn);
     tail = result.catch(() => {});
     return result;
+  };
+  let nextFullScanAt = -Infinity;
+  let observing = false;
+  // Reads run outside the state transaction, so order observations by when they
+  // were read: the newest read wins per conversation. A restart clears this
+  // because no read survives one.
+  let reads = 0;
+  const latestRead = new Map<string, number>();
+  const freshRead = (agentId: string, seq?: number) => {
+    if (seq === undefined) return true;
+    if (seq < (latestRead.get(agentId) ?? 0)) return false;
+    latestRead.set(agentId, seq);
+    return true;
+  };
+  // A successful read fences older reads of the same conversation even when it
+  // saw no finished reply.
+  const fence = (agentId: string, seq: number) => {
+    if (seq > (latestRead.get(agentId) ?? 0)) latestRead.set(agentId, seq);
+  };
+  let planStartedAt = 0;
+  let hostWork: Promise<unknown> = Promise.resolve();
+  let hostTimer: ReturnType<typeof setTimeout> | undefined;
+  type Plan = { full: boolean; attention: boolean; agentIds: Set<string> };
+  const newPlan = (): Plan => ({ full: false, attention: false, agentIds: new Set() });
+  let pending: { plan: Plan; promise: Promise<void>; resolve(): void; reject(error: unknown): void } | null = null;
+  const observedTurns = (entries: ReadonlyArray<{ agent: Observation; endedAt: number; seq?: number }>) =>
+    serialize(async () => {
+      const state = await store.read();
+      let changed = false;
+      for (const { agent, endedAt, seq } of entries) {
+        if (!freshRead(agent.agentId, seq)) continue;
+        if (applyObservation(state, agent, endedAt, stopped)) changed = true;
+      }
+      if (changed) await store.write(state);
+    });
+  function planFor(scope: ObservationScope): Plan {
+    const plan = newPlan();
+    if (scope.kind === "agent") plan.agentIds.add(scope.agentId);
+    else if (scope.kind === "full" || now() >= nextFullScanAt) {
+      plan.full = true;
+      nextFullScanAt = now() + FULL_SCAN_INTERVAL_MS;
+    } else plan.attention = true;
+    return plan;
+  }
+  const mergePlan = (target: Plan, source: Plan) => {
+    target.full ||= source.full;
+    target.attention ||= source.attention;
+    for (const id of source.agentIds) target.agentIds.add(id);
+  };
+  async function runPlan(plan: Plan) {
+    const seq = ++reads;
+    let agents: Observation[];
+    let failure: PromiseRejectedResult | undefined;
+    if (plan.full) {
+      const listing = gateway.list();
+      hostWork = listing.then(() => {}, () => {});
+      agents = await bounded(listing, INSPECT_TIMEOUT_MS);
+    } else {
+      const ids = new Set(plan.agentIds);
+      if (plan.attention) {
+        // Read-only, outside serialize: a slow listing must not delay a tick.
+        const state = await store.read();
+        for (const job of state.jobs)
+          if (!terminal(job)) ids.add(job.agentId);
+        for (const operation of state.operations)
+          if (operationPending(operation)) ids.add(operation.agentId);
+      }
+      if (ids.size === 0) return;
+      if (plan.attention) {
+        const listing = gateway.list({ agentIds: [...ids] });
+        hostWork = listing.then(() => {}, () => {});
+        agents = await bounded(listing, INSPECT_TIMEOUT_MS);
+      } else {
+        // Each read is bounded on its own, so one conversation's timeout does
+        // not hide another's result. Single-flight is still held on the raw
+        // reads until every host read ends.
+        const refreshes = [...ids].map((id) => gateway.refresh(id));
+        hostWork = Promise.allSettled(refreshes);
+        const failures: PromiseRejectedResult[] = [];
+        const waits = refreshes.map((refresh) => {
+          const wait = bounded(refresh, INSPECT_TIMEOUT_MS);
+          wait.catch((reason) => { failures.push({ status: "rejected", reason }); });
+          return wait;
+        });
+        const results = await Promise.allSettled(waits);
+        failure = failures[0];
+        agents = results
+          .filter((result): result is PromiseFulfilledResult<Observation | null> =>
+            result.status === "fulfilled")
+          .map((result) => result.value)
+          .filter((agent): agent is Observation => agent !== null);
+      }
+    }
+    for (const agent of agents) fence(agent.agentId, seq);
+    const entries = agents
+      .filter((agent) => agent.activityKey && agent.observedEndedAt != null)
+      .map((agent) => ({ agent, endedAt: agent.observedEndedAt!, seq }));
+    if (entries.length) await observedTurns(entries);
+    // Record every successful observation before reporting the first failure or
+    // timeout.
+    if (failure) throw failure.reason;
+  }
+  function release() {
+    if (hostTimer) { clearTimeout(hostTimer); hostTimer = undefined; }
+    observing = false;
+    const next = pending;
+    pending = null;
+    if (!next) return;
+    if (stopped) { next.resolve(); return; }
+    start(next.plan).then(next.resolve, next.reject);
+  }
+  function finish() {
+    // A timed-out host read is not cancelled: keep single-flight until it ends,
+    // but never longer than a full scan interval.
+    if (stopped) return release();
+    let released = false;
+    const once = () => { if (released) return; released = true; release(); };
+    hostWork.then(once, once);
+    hostTimer = setTimeout(once,
+      Math.max(0, planStartedAt + FULL_SCAN_INTERVAL_MS - now()));
+  }
+  function start(plan: Plan) {
+    observing = true;
+    planStartedAt = now();
+    hostWork = Promise.resolve();
+    const run = runPlan(plan);
+    run.then(finish, finish);
+    return run;
+  }
+  const observe = (scope: ObservationScope): Promise<void> => {
+    if (stopped) return Promise.resolve();
+    const plan = planFor(scope);
+    if (!observing) return start(plan);
+    if (pending) { mergePlan(pending.plan, plan); return pending.promise; }
+    let resolve!: () => void, reject!: (error: unknown) => void;
+    const promise = new Promise<void>((ok, fail) => { resolve = ok; reject = fail; });
+    pending = { plan, promise, resolve, reject };
+    return promise;
   };
   const due = (job: Job, config: Settings) => dueAt(job.endedAt, config);
   function reversibleSkip(
@@ -377,39 +570,14 @@ export function createScheduler(options: {
     reconcile: worker.reconcile,
     stop() {
       stopped = true;
+      if (hostTimer) { clearTimeout(hostTimer); hostTimer = undefined; }
+      release();
       worker.stop();
     },
     // Hooks are queued, but the gateway marks own turns synchronously before calling this.
-    observedTurn: (agent: Observation, endedAt = now()) =>
-      serialize(async () => {
-        const state = await store.read();
-        const prior = state.jobs.find((job) => job.agentId === agent.agentId);
-        if (
-          !agent.eligible ||
-          !agent.idle ||
-          !agent.revision ||
-          Date.parse(agent.revision) > endedAt ||
-          // Background notifications start native turns without a new host
-          // message, so native activity identifies work when it is available.
-          (agent.activityKey
-            ? prior?.activityKey === agent.activityKey
-            : prior?.revision === agent.revision) ||
-          stopped
-        )
-          return;
-        state.jobs = state.jobs.filter((job) => job.agentId !== agent.agentId);
-        state.jobs.push({
-          agentId: agent.agentId,
-          revision: agent.revision,
-          endedAt,
-          ...(agent.activityKey ? { activityKey: agent.activityKey } : {}),
-          ...(agent.sessionId ? { sessionId: agent.sessionId } : {}),
-          status: "scheduled",
-          detail:
-            "Idle delay measured from observed Claude turn end",
-        });
-        await store.write(state);
-      }),
+    observedTurns,
+    observedTurn: (agent: Observation, endedAt = now()) => observedTurns([{ agent, endedAt }]),
+    observe,
     // Mark an old reservation unusable as soon as unrelated work starts or permission changes.
     invalidate: (agentId: string) =>
       serialize(async () => {
@@ -426,13 +594,22 @@ export function createScheduler(options: {
     // Conversation controls remain available below the automatic token threshold.
     // Only the state read is queued: host reads and readiness checks run outside
     // the queue so one slow conversation cannot delay another's state changes.
+    // A status read also records the reply it sees, in its own transaction.
     session: async (agentId: string) => {
+      const seq = ++reads;
       const [state, config, agent] = await Promise.all([
         serialize(() => store.read()),
         settings(),
         refresh(agentId),
       ]);
-      return agent?.eligible ? view(agent, state, config) : null;
+      if (agent) fence(agentId, seq);
+      let recorded = false;
+      if (agent?.activityKey && agent.observedEndedAt != null) {
+        await observedTurns([{ agent, endedAt: agent.observedEndedAt, seq }]);
+        recorded = true;
+      }
+      const current = recorded ? await serialize(() => store.read()) : state;
+      return agent?.eligible ? view(agent, current, config) : null;
     },
     list: async () => {
       const [state, config, agents] = await Promise.all([
