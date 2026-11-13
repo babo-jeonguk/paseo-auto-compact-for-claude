@@ -120,3 +120,29 @@ test("every control of one conversation shares its failure count, so backoff is 
   other.record("focus");
   assert.equal(popover.count(), 1);
 });
+
+test("a conversation's status read that recovers after failures reports that the host is reachable again", async () => {
+  const { onSessionRecovered, sessionFailures } = await import("../client/cadence.ts");
+  const recovered = [];
+  const stop = onSessionRecovered(() => recovered.push("recovered"));
+  try {
+    const status = sessionFailures("host:conversation-recovery");
+    status.record("success");
+    assert.deepEqual(recovered, [], "a read that never failed is not a recovery");
+    status.record("failure");
+    status.record("failure");
+    status.record("success");
+    assert.deepEqual(recovered, ["recovered"], "the first success after failures is a recovery");
+    status.record("success");
+    assert.deepEqual(recovered, ["recovered"], "only once per recovery");
+    status.record("failure");
+    status.record("focus");
+    status.record("success");
+    assert.deepEqual(recovered, ["recovered"], "regaining focus refreshes discovery on its own, so it is not a recovery");
+  } finally {
+    stop();
+  }
+  sessionFailures("host:conversation-recovery").record("failure");
+  sessionFailures("host:conversation-recovery").record("success");
+  assert.deepEqual(recovered, ["recovered"], "an unsubscribed listener is not called");
+});

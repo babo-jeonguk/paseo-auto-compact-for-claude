@@ -2031,3 +2031,47 @@ test("a refresh that hangs past the deadline does not drop another conversation'
     mock.timers.reset();
   }
 });
+
+const busyAgent = (f: ReturnType<typeof fixture>, agentId: string, activityKey: string): Observation =>
+  ({ ...nativeAgent(f, agentId), activityKey, observedEndedAt: null, idle: false });
+
+test("a status read that sees a busy new session fences an older scan's finished reply", async () => {
+  const f = fixture();
+  f.agents.splice(0, 1, { ...nativeAgent(f, "a"), activityKey: "launch:old-generation:9" });
+  const s = f.make();
+  await s.ready;
+  const release = f.holdList();
+  // A scan reads the old session's finished reply...
+  const scan = s.observe({ kind: "full" });
+  await settle();
+  // ...then a newer status read sees a reopened session that is still working.
+  f.advance(1_000);
+  f.agents[0] = busyAgent(f, "a", "launch:new-generation:1");
+  await s.session("a");
+  release();
+  await scan;
+  assert.deepEqual(reserved(f), [], "the newer read wins: no reservation for the old reply");
+});
+
+test("a scan that sees a busy conversation fences an older status read's finished reply", async () => {
+  const f = fixture();
+  f.agents.splice(0, 1, { ...nativeAgent(f, "a"), activityKey: "launch:old-generation:9" });
+  const s = f.make();
+  await s.ready;
+  const old = structuredClone(f.agents[0]);
+  let releaseRead!: () => void;
+  f.gateway.refresh = async () => {
+    await new Promise<void>(resolve => { releaseRead = resolve; });
+    return structuredClone(old);
+  };
+  // A status read starts, but its host read ends late...
+  const status = s.session("a");
+  await settle();
+  // ...after a newer scan saw the reopened session still working.
+  f.advance(1_000);
+  f.agents[0] = busyAgent(f, "a", "launch:new-generation:1");
+  await s.observe({ kind: "full" });
+  releaseRead();
+  await status;
+  assert.deepEqual(reserved(f), [], "the newer read wins: no reservation for the old reply");
+});
