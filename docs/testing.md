@@ -18,7 +18,7 @@ The update command runs observer consistency, type checks and the fast regressio
 
 ## What is real and what is simulated
 
-Each simulation starts stock **Paseo 0.12.0, 0.13.0, 0.14.0 or 0.15.0**, native **Claude Code 2.1.306**, and this checkout's actual plugin. The client handshake uses the selected toolchain's real version. Only model responses come from a synthetic loopback HTTP server. Native transcript creation, Mod loading, public RPC, settings persistence, process restart and automatic timers run normally. The fixture reports a 500k context to a 1M model so the real 400k threshold can be exercised without sending a huge prompt.
+Each simulation starts stock **Paseo 0.12.0, 0.13.0, 0.14.0, 0.15.0 or 0.16.0**, native **Claude Code 2.1.306**, and this checkout's actual plugin. The client handshake uses the selected toolchain's real version. Only model responses come from a synthetic loopback HTTP server. Native transcript creation, Mod loading, public RPC, settings persistence, process restart and automatic timers run normally. The fixture reports a 500k context to a 1M model so the real 400k threshold can be exercised without sending a huge prompt.
 
 Each run uses temporary HOME/USERPROFILE, Claude settings, Paseo configuration, agents and ports. The native process receives a synthetic API key and a local model URL. Existing Paseo and Claude sessions/settings are not used. Successful runs stop their process trees and delete the temporary home. Failed runs retain the temporary path in `report.json` for diagnosis.
 
@@ -99,7 +99,7 @@ node --no-maglev tests/simulation/browser.mjs --paseo 0.12.0 \
   --report-dir /absolute/path/to/results
 ```
 
-Repeat with `--paseo 0.13.0` or `--paseo 0.14.0`. Each run writes a browser report and completed-state screenshot under `browser-<version>/`. An unavailable Windows runtime or browser is an untested environment, not a passing result; WSL execution reports Linux.
+Repeat with `--paseo 0.13.0`, `--paseo 0.14.0` or `--paseo 0.16.0`. Each run writes a browser report and completed-state screenshot under `browser-<version>/`. An unavailable Windows runtime or browser is an untested environment, not a passing result; WSL execution reports Linux.
 
 ## Paseo 0.14 lifecycle regression
 
@@ -136,13 +136,13 @@ npm run test:simulation:0.13 -- --expect-platform win32
 npm run test:simulation:0.14 -- --expect-platform linux
 ```
 
-The first command runs all three versions. The version-specific commands accept `--claude /absolute/native/claude`, `--tools /npm/prefix`, or `--report-dir /results`. A custom tools prefix may contain the matching ordinary `@getpaseo/cli` package or the versioned aliases used by this repository. Overrides still use an isolated home and the local model server. `npm run test:simulation:0.12 -- --help` lists the options.
+The first command runs every version in the matrix, 0.12.0 through 0.16.0. The version-specific commands accept `--claude /absolute/native/claude`, `--tools /npm/prefix`, or `--report-dir /results`. A custom tools prefix may contain the matching ordinary `@getpaseo/cli` package or the versioned aliases used by this repository. Overrides still use an isolated home and the local model server. `npm run test:simulation:0.12 -- --help` lists the options.
 
 To change a tested Claude/Paseo version, edit its exact alias in `tests/simulation/package.json`, regenerate the lockfile with `npm install --prefix tests/simulation --ignore-scripts`, and run the full suite on both OSes. Commit both package and lockfile. Keep 0.12 in the matrix while it remains the declared minimum. Do not infer native compatibility from the unit suite alone.
 
 ## CI
 
-[Check workflow](https://github.com/babo-jeonguk/paseo-auto-compact-for-claude/blob/main/.github/workflows/check.yml) has Paseo 0.12/0.13/0.14 native simulation jobs on **ubuntu-latest** and **windows-latest**, in addition to fast SDK 0.12/0.13/0.14 checks on Linux, macOS and Windows. Pull requests, main-branch pushes and manual workflow dispatch run them and upload their reports/logs even when a test fails. No API secret is needed. [View workflow runs](https://github.com/babo-jeonguk/paseo-auto-compact-for-claude/actions/workflows/check.yml). Native macOS execution is not covered by the fast macOS checks.
+[Check workflow](https://github.com/babo-jeonguk/paseo-auto-compact-for-claude/blob/main/.github/workflows/check.yml) has Paseo 0.12 through 0.16 native simulation jobs on **ubuntu-latest** and **windows-latest**, in addition to fast SDK 0.12 through 0.16 checks on Linux, macOS and Windows. Pull requests, main-branch pushes and manual workflow dispatch run them and upload their reports/logs even when a test fails. No API secret is needed. [View workflow runs](https://github.com/babo-jeonguk/paseo-auto-compact-for-claude/actions/workflows/check.yml). Native macOS execution is not covered by the fast macOS checks.
 
 ## Fast feedback and isolated runs
 
@@ -261,15 +261,17 @@ The per-conversation change passed the native suite **19/19** on Linux/WSL x64 (
 
 A rollback probe running the **v1.1.1** source (`bafdfde`) seeded one `observing` operation with its dispatch marker, one requested manual operation and one requested automatic operation from different conversations, with their jobs. v1.1.1's store accepted the state. Its serial worker never sent the observing operation, sent each requested conversation at most once, and sent nothing again after the deadlines passed.
 
-## Paseo 0.16 beta validation
+## Paseo 0.16 validation
 
-Validated on 2026-11-11 on Linux/WSL2 with Node 24.21.0, native Claude Code 2.1.306, Paseo **0.16.0-beta.1**, and Paseo **0.15.0** as the control. Only model replies were synthetic. Each run used its own temporary home, Claude configuration, workspace and ports; no real Paseo or Claude data was touched.
+Validated on 2026-11-16 on Linux/WSL2 with Node 24.21.0, native Claude Code 2.1.306 and stock Paseo **0.16.0**, with Paseo **0.12.0** as the control, on top of the per-conversation compaction change. Only model replies were synthetic. Each run used its own temporary home, Claude configuration, workspace and ports; no real Paseo or Claude data was touched. An earlier pass on 2026-11-11 used 0.16.0-beta.1 with 0.15.0 as the control.
 
-The development SDK remains 0.12.0. The four test fixtures gained `metadata: {}`, which is required by the 0.16 SDK types and is accepted by 0.12.0 and 0.15.0; no product code depends on it. `npm run check` passed **178 tests** on SDK 0.12.0 and on copied lanes pinned to `@getpaseo/client`, `@getpaseo/plugin` and `@getpaseo/protocol` 0.15.0 and 0.16.0-beta.1.
+The development SDK remains 0.12.0. The 0.16 SDK types make `metadata` and `background` required on hook agents and session-open requests, so the four test fixtures gained `metadata: {}` and `background: false`; 0.12–0.15 accept both, and no product code depends on them. `npm run check` passed **267 tests** on SDK 0.12.0 and on copied lanes pinned to `@getpaseo/client`, `@getpaseo/plugin` and `@getpaseo/protocol` 0.15.0 and 0.16.0. Paseo 0.16.0 also removes the always-empty `agent.turn.after.timeline` field; the plugin never read it.
 
-The native suite has **19 scenarios**. All 19 passed on stock Paseo 0.16.0-beta.1, on the 0.15.0 control and on 0.12.0. The new scenario starts a 20-second background shell, compacts explicitly while it runs, waits for the native completion notification, and checks the observer ledger, the new reservation and the absence of a second `/compact`. On 0.16 the interrupted-compaction suite passed **2/2** (graceful and forced). The lifecycle `reload`, `automatic` and `cleanup` scenarios passed on 0.16.0-beta.1, and `reload` also passed with its default 0.14.0. The Chromium web UI checks passed **4/4** on 0.16.0-beta.1. `npm pack --dry-run` contains no tests, probes or results.
+The native suite has **20 scenarios**. All 20 passed on stock Paseo 0.16.0 and on 0.12.0. The background-shell scenario starts a 20-second background shell, compacts explicitly while it runs, waits for the native completion notification, and checks the observer ledger, the new reservation and the absence of a second `/compact`. On 0.16.0 the interrupted-compaction suite passed **2/2** (graceful and forced), the lifecycle `reload`, `automatic` and `cleanup` scenarios passed, and the Chromium web UI checks passed **4/4**. Like 0.14 and 0.15, Paseo 0.16 defers reopening a session after a plugin reload, and the plugin blocks compaction until a message resumes it.
 
-Paseo 0.16 is available only in the local harness: `npm run test:simulation:0.16-beta` uses the `@getpaseo/cli-0-16-beta` alias. It is not part of the default `matrix.mjs` matrix or CI until 0.16 is stable.
+Paseo 0.16.0 is part of the default `matrix.mjs` matrix and CI (`npm run test:simulation:0.16`, alias `@getpaseo/cli-0-16-stable`). `npm run test:simulation:0.16-beta` still runs 0.16.0-beta.1 locally.
+
+Paseo 0.16.0 replaces Settings → Plugins with a plugin gallery. A Chromium probe on 0.16.0 found no per-row **Settings** button: selecting the plugin row opens its detail page, which renders this plugin's settings directly. The composer pill's **Settings** action still opens that page. Installing from a Git source moved to **More plugin actions → Install from source**, whose field is still named **Plugin source**, and the global switch moved to **Turn off plugins** in the same menu.
 
 Two policy points are specific to 0.16. First, an agent created with `background: true` is hidden from normal conversation lists, and it is not an Auto Compact target. The server gateway and the composer-pill reconciliation both treat `background === true` as ineligible, alongside the existing `internal` and `paseo.parent-agent-id` exclusions; a missing or false value behaves as before, so 0.12–0.15 hosts are unchanged. A reservation made before such an agent becomes hidden is skipped by the existing ineligible handling and never dispatched. Unit tests cover both the eligibility rule and the scheduled-then-ineligible path; the client reconciliation has no separate unit harness. A daemon probe found the hidden agent absent from `auto-compact.list`, `auto-compact.session` and the stored jobs, with no `/compact` and no model request after waiting past the one-minute idle delay, while a visible agent in the same daemon was still scheduled.
 

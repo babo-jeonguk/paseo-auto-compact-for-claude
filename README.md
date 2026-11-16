@@ -14,7 +14,7 @@ Codex subscription sessions do not need this plugin: [caches are retained indefi
 
 ## Requirements
 
-- **Paseo 0.12 or later**, including Paseo 0.15.
+- **Paseo 0.12 or later**, including Paseo 0.16.
 - A Claude provider using a native Claude Code CLI that supports Mods. Claude profiles are supported too.
 - The Paseo web, desktop or Android app. The iOS app is unverified.
 
@@ -28,7 +28,7 @@ On the machine running the Paseo daemon, install directly from the public GitHub
 paseo plugin install github:babo-jeonguk/paseo-auto-compact-for-claude
 ```
 
-Or paste `github:babo-jeonguk/paseo-auto-compact-for-claude` into **Settings → Plugins → Plugin source** and select **Install plugin**. Turn on **Enable plugins** and enable **Auto Compact for Claude**, then start or reopen a Claude conversation. After a reply finishes, open the pill beside the message composer to see its schedule or why it is waiting.
+Or install it from the app. On Paseo 0.16, open **Settings → Plugins → More plugin actions → Install from source**, paste `github:babo-jeonguk/paseo-auto-compact-for-claude` into **Plugin source** and select **Install**. On Paseo 0.15 and earlier, paste it into **Settings → Plugins → Plugin source**, select **Install plugin**, turn on **Enable plugins** and enable **Auto Compact for Claude**. Then start or reopen a Claude conversation. After a reply finishes, open the pill beside the message composer to see its schedule or why it is waiting.
 
 This direct GitHub installation works before registry approval. Start or reopen a Claude conversation after installation. [Setup and compatibility](docs/runtime.md).
 
@@ -69,7 +69,7 @@ paseo plugin update auto-compact-for-claude
 
 Review the proposed commit before confirming. Direct GitHub updates follow the repository's default branch. Reopen Claude sessions after an update so they use the new version.
 
-On Paseo 0.14 and 0.15, Paseo reopens a session itself before its next message. Until then, the plugin does not compact that conversation: send a message and wait for the reply first. A countdown from before the update does not run; that reply schedules a new one.
+On Paseo 0.14 and later, Paseo reopens a session itself before its next message. Until then, the plugin does not compact that conversation: send a message and wait for the reply first. A countdown from before the update does not run; that reply schedules a new one.
 
 ## Remove
 
