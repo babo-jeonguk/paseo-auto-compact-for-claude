@@ -33,7 +33,7 @@ npm run test:e2e -- --paseo 0.13.0 --to <branch, tag or commit>
 | Flag | Meaning |
 |---|---|
 | `--paseo` | `0.12.0`, `0.13.0`, `0.14.0`, `0.15.0` or `0.16.0` (default `0.13.0`) |
-| `--from` | Release installed first and rolled back to (default `v1.0.2`) |
+| `--from` | Release installed first and rolled back to (default `v1.1.1`, the latest release; `v1.0.2` checks the migration from state without operation history) |
 | `--to` | Ref under test (default `main`) |
 | `--source` | Plugin Git source (default `git:babo-jeonguk/paseo-auto-compact-for-claude`) |
 | `--min 1` | Skips the two scenarios that wait for real one-minute deadlines |
@@ -49,14 +49,14 @@ Each run writes `report.json` and the daemon logs to `<report-dir>/<platform>-pa
 | # | Item |
 |---|---|
 | 1 | `--from` installs from GitHub at the expected revision and answers its RPCs |
-| 2 | `--from` records a real reservation, a conversation OFF and a completed Compact now in state v1 |
-| 3 | Update to `--to` at the expected revision: the state stays version 1 with operation history added, keeps OFF and the reservation time, turns the earlier compaction into a queryable `legacy` operation, and a new Compact now of the same activity sends nothing; then Compact now of a fresh activity on `--to` compacts once. On Paseo 0.14 the reservation is instead held as `blocked` until an ordinary message resumes the session, which then earns a new reservation |
+| 2 | `--from` records a real reservation, a conversation OFF and a completed Compact now in state v1. v1.1.0 and later accept Compact now as a durable operation and record it |
+| 3 | Update to `--to` at the expected revision: the state stays version 1, keeps OFF and the reservation time, and keeps the earlier compaction as a queryable operation: the recorded `manual` operation from v1.1.0 and later, or a migrated `legacy` operation from v1.0.2. A new Compact now of the same activity sends nothing; then Compact now of a fresh activity on `--to` compacts once. On Paseo 0.14 and later the reservation is instead held as `blocked` until an ordinary message resumes the session, which then earns a new reservation |
 | 4 | All native simulation scenarios (`tests/simulation/scenarios.mjs`) against the updated install |
 | 5 | Rollback to `--from` reads the state, keeps OFF, shows both compacted activities as completed, so its timer will not repeat them, and sends nothing |
-| 6 | Update to `--to` again keeps OFF and turns the history `--from` dropped back into `legacy` operations that still guard their activities, without replay |
+| 6 | Update to `--to` again keeps OFF and the compaction history without replay: v1.1.0 and later keep their operations; history v1.0.2 dropped comes back as `legacy` operations that still guard their activities |
 | 7 | No plugin errors in the daemon log |
 
-Items 5 and 6 check that the update is reversible: the added fields are ones v1.0.2 ignores. Automation is off during the rollback so that a scenario reservation falling due there cannot be mistaken for a replay.
+Items 5 and 6 check that the update is reversible: the earlier release reads the state this version writes. Automation is off during the rollback so that a scenario reservation falling due there cannot be mistaken for a replay.
 
 ## Desktop app
 
