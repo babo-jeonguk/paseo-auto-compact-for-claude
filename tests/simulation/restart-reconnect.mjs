@@ -32,6 +32,7 @@ const cliPackage = (() => {
   try { return tools.resolve('@getpaseo/cli/package.json'); }
   catch {
     const alias = version === '0.15.0' ? '@getpaseo/cli-0-15-stable'
+      : version === '0.16.0' ? '@getpaseo/cli-0-16-stable'
       : version === '0.16.0-beta.1' ? '@getpaseo/cli-0-16-beta' : '@getpaseo/cli-0-15';
     return tools.resolve(`${alias}/package.json`);
   }
