@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { canUndoSkip, compactCompletionNotice, compactOutcomeNotice, sessionPresentation, pendingPresentation, sessionKey,
+import { canUndoSkip, compactCompletionNotice, compactOutcomeNotice, pillLabel, sessionPresentation, pendingPresentation, sessionKey,
   STATUS_GRACE_MS, INPUT_IDLE_GRACE_MS } from "../client/session-state.ts";
 import { DEFAULT_SETTINGS } from "../shared/settings.ts";
 
@@ -147,4 +147,18 @@ test("the row tells a failure that sent nothing, and a session awaiting resume, 
   for (const status of ["blocked", "completed", "failed", "expired"])
     assert.match(sessionPresentation({ ...row, status, resumeRequired: true }, settings, 0).description,
       /Send a message to resume/, status);
+});
+
+test("the composer pill shortens labels that do not fit a 0.16 pill", () => {
+  // Paseo 0.16 caps a composer pill at 160px, leaving about 90px for the label at 12px.
+  assert.equal(pillLabel("Compact in 55m"), "Compact 55m");
+  assert.equal(pillLabel("Compact in 59s"), "Compact 59s");
+  assert.equal(pillLabel("Compact in 60m"), "Compact 60m");
+  assert.equal(pillLabel("Compact in 61m"), "Compact 1h");
+  assert.equal(pillLabel("Compact in 119m"), "Compact 1h");
+  assert.equal(pillLabel("Compact in 120m"), "Compact 2h");
+  assert.equal(pillLabel("Compact in 1440m"), "Compact 24h");
+  assert.equal(pillLabel("Check compact"), "Needs check");
+  for (const label of ["Compact on", "Compact off", "Compacting…"]) assert.equal(pillLabel(label), label);
+  assert.equal(pillLabel(null), undefined);
 });

@@ -20,7 +20,7 @@ import { cliPackagePath, installedPlugin, parseOptions, pluginStderr, PLUGIN, re
 
 const here = dirname(fileURLToPath(import.meta.url));
 const simulation = resolve(here, '../simulation');
-const arg = parseOptions('run.mjs', [['--paseo', '0.13.0'], ['--from', 'v1.0.2'], ['--to', 'main'],
+const arg = parseOptions('run.mjs', [['--paseo', '0.13.0'], ['--from', 'v1.1.1'], ['--to', 'main'],
   ['--source', DEFAULT_SOURCE], ['--expect-platform', process.platform],
   ['--claude', process.env.SIMULATION_CLAUDE_BINARY ?? ''], ['--tools', simulation],
   ['--report-dir', join(resolve(here, '../..'), 'test-results', 'e2e')], ['--min', '0']]);
@@ -96,16 +96,23 @@ check(`${FROM} records a reservation, a conversation OFF and a completed Compact
     return row.status === 'scheduled' ? row : null; }, `${FROM} compactable row`);
   const requests = model.count;
   const result = await fixture.rpc('now', { agentId: legacy.compacted, revision: ready.revision });
-  assert.equal(result.status, 'completed', JSON.stringify(result));
+  // v1.0.2 answers Compact now when it finishes; v1.1.0 and later accept a durable operation first.
+  if (result.status !== 'completed') {
+    assert.equal(result.code, 'accepted', JSON.stringify(result));
+    await waitFor(async () => (await fixture.row(legacy.compacted)).latestOperation?.state === 'succeeded', `${FROM} Compact now`);
+  }
   assert.equal(model.count, requests + 1);
   const state = await readState();
   assert.equal(state.version, 1);
   assert(state.disabled.includes(legacy.off));
+  // A release with durable operations already records them; the update keeps them instead of migrating.
+  legacy.durable = Array.isArray(state.operations);
+  legacy.operations = state.operations?.length ?? 0;
   legacy.requests = model.count;
 });
 
 // ---- 3. update to the version under test -----------------------------------------------------------
-check(`update to ${TO} adds operation history to state v1 and keeps policy, reservation and history`, async () => {
+check(`update to ${TO} keeps state v1, policy, reservation and compaction history`, async () => {
   await moveTo(TO, 'to');
   const state = await waitFor(async () => { const s = await readState(); return Array.isArray(s.operations) ? s : null; }, 'operation history');
   assert.equal(state.version, 1, 'additive fields keep the version the release reads');
@@ -122,12 +129,19 @@ check(`update to ${TO} adds operation history to state v1 and keeps policy, rese
   const compacted = await fixture.row(legacy.compacted);
   assert.equal(compacted.status, 'completed');
   assert.equal(compacted.latestOperation?.state, 'succeeded');
-  assert.equal(compacted.latestOperation?.result?.code, 'legacy_outcome');
-  assert.equal(compacted.latestOperation?.kind, 'legacy');
-  assert.equal(state.operations.length, 1);
+  if (legacy.durable) {
+    // The operation the earlier release recorded is kept as it was.
+    assert.equal(compacted.latestOperation?.kind, 'manual');
+    assert.equal(compacted.latestOperation?.result?.code, 'completed');
+    assert.equal(state.operations.length, legacy.operations);
+  } else {
+    assert.equal(compacted.latestOperation?.result?.code, 'legacy_outcome');
+    assert.equal(compacted.latestOperation?.kind, 'legacy');
+    assert.equal(state.operations.length, 1);
+  }
   const again = await fixture.rpc('now', { agentId: legacy.compacted, revision: compacted.revision,
     target: compacted.target, operationId: randomUUID() });
-  assert.equal(again.code, 'existing', `the migrated attempt guards the same activity: ${again.detail}`);
+  assert.equal(again.code, 'existing', `the earlier attempt guards the same activity: ${again.detail}`);
   assert.equal(model.count, legacy.requests, 'update and migration send nothing');
   if (REOPENS_STALE_SESSIONS) {
     // An ordinary message reopens the session; its activity earns a new reservation.
@@ -180,11 +194,12 @@ check(`updating to ${TO} again restores operation without replay`, async () => {
   // The daemon restart scenario left this conversation unopened; open it like a user would.
   await fixture.client.refreshAgent(legacy.off);
   assert.equal((await waitFor(() => fixture.row(legacy.off), 'reopened OFF conversation')).enabled, false);
-  // The rollback dropped operation history; it comes back from the jobs as legacy history, and
-  // the finished job keeps the timer from compacting that activity again. (A manual guard needs the
-  // native activity identity, which this unopened conversation does not report.)
+  // A release without operations dropped their history on rollback; it comes back from the jobs as
+  // legacy history. A release with operations kept it. Either way the finished job keeps the timer
+  // from compacting that activity again. (A manual guard needs the native activity identity, which
+  // this unopened conversation does not report.)
   const fresh = await fixture.row(legacy.fresh);
-  assert.equal(fresh.latestOperation?.kind, 'legacy');
+  assert.equal(fresh.latestOperation?.kind, legacy.durable ? 'manual' : 'legacy');
   assert.equal(fresh.latestOperation?.state, 'succeeded');
   assert.equal(fresh.status, 'completed');
   assert.equal(model.count, requests);

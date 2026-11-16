@@ -11,6 +11,7 @@ import { directoryRefreshDelay, hostReconnected, onSessionRecovered, surfaceActi
   type DirectoryTrigger } from "./cadence";
 import { ConversationControls, useConversation } from "./conversation";
 import { onSurfaceChange } from "./surface";
+import { pillLabel } from "./session-state";
 
 type Agent = NonNullable<ReturnType<ReturnType<
   PluginClientContext["paseo"]["agents"]["ref"]
@@ -58,7 +59,7 @@ export function installConversationControls(client: PluginClientContext) {
       const state = useConversation(props.host.id, agent.id);
       useEffect(() => {
         registration?.update({
-          label: state.status ?? undefined,
+          label: pillLabel(state.status),
         });
       }, [state.status]);
       return state.loading ? <ActivityIndicator size="small" color={props.color} />

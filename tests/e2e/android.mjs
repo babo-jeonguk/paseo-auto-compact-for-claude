@@ -179,11 +179,11 @@ check('the Android app installs and connects to the isolated daemon by direct co
   await shot('connected');
 });
 check('the plugin pill renders natively with the reservation', async () => {
-  state.pill = (await find(/^Compact in \d+m$/, 'the plugin pill with its countdown', 120_000)).text;
+  state.pill = (await find(/^Compact \d+[mh]$/, 'the plugin pill with its countdown', 120_000)).text;
   await shot('pill');
 });
 check('Skip and Undo in the native sheet update the daemon', async () => {
-  await tap(/^Compact in \d+m$/, 'the plugin pill');
+  await tap(/^Compact \d+[mh]$/, 'the plugin pill');
   await tap('Skip this time');
   await waitFor(async () => (await fixture.row(state.id)).status === 'skipped', 'skip on the daemon');
   await tap('Undo skip');

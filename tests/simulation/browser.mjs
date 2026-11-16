@@ -36,7 +36,7 @@ try {
  report.chromium=browser.version();
  const page=await browser.newPage(); await page.goto('http://'+fixture.target,{waitUntil:'domcontentloaded'});
  await page.getByText('Auto Compact simulation',{exact:true}).first().click();
- await page.getByText('Compact in 55m',{exact:true}).first().click();
+ await page.getByText('Compact 55m',{exact:true}).first().click();
  await page.getByText('Skip this time',{exact:true}).click();
  await page.getByText('Undo skip',{exact:true}).waitFor();
  assert.equal((await fixture.row(id)).status,'skipped'); report.checks.push('Skip updates UI and daemon state');

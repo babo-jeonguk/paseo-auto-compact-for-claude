@@ -11,6 +11,18 @@ export interface Presentation {
   description: string;
 }
 
+// Paseo 0.16 caps a composer pill at 160px, which leaves about 90px for the
+// label: "Compact in 55m" and "Check compact" are cut off there. The pill shows
+// a shorter form; the controls keep the full label as their title.
+export function pillLabel(label: string | null): string | undefined {
+  if (label === null) return undefined;
+  if (label === "Check compact") return "Needs check";
+  const countdown = /^Compact in (\d+)([ms])$/.exec(label);
+  if (!countdown) return label;
+  const amount = Number(countdown[1]);
+  return countdown[2] === "m" && amount > 60 ? `Compact ${Math.floor(amount / 60)}h` : `Compact ${amount}${countdown[2]}`;
+}
+
 export type CompactCompletionNotice =
   | { variant: "success"; message: "Conversation compacted" }
   | { variant: "error"; message: string };
