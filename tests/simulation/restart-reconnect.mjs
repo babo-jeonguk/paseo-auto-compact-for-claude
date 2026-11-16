@@ -287,7 +287,7 @@ try {
   await page.goto(proxy.url, { waitUntil: 'domcontentloaded' });
   await page.getByText('Auto Compact simulation', { exact: true }).first().click();
   await page.screenshot({ path: join(reportDir, 'initial-conversation.png') });
-  await page.getByText(/^Compact in \d+[ms]$/).first().click();
+  await page.getByText(/^Compact \d+[msh]$/).first().click();
   const panel = page.getByTestId(`compact-conversation-${id}`);
   await panel.waitFor();
   await page.evaluate(() => { window.__reconnectTestIdentity = 'same-document'; });

@@ -183,7 +183,7 @@ check('a conversation started by the desktop daemon loads the observer and earns
 check('Skip and Undo in the desktop window update the daemon', async () => {
   const { page } = desktop;
   await openConversation();
-  await page.getByText('Compact in 55m', { exact: true }).first().click({ timeout: 60_000 });
+  await page.getByText('Compact 55m', { exact: true }).first().click({ timeout: 60_000 });
   await page.getByText('Skip this time', { exact: true }).click();
   await page.getByText('Undo skip', { exact: true }).waitFor();
   assert.equal((await fixture.row(state.id)).status, 'skipped');
