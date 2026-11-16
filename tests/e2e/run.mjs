@@ -16,7 +16,7 @@ import { fileURLToPath } from 'node:url';
 import { startFixture, waitFor } from '../simulation/fixture.mjs';
 import { startModel } from '../simulation/model.mjs';
 import { scenarios } from '../simulation/scenarios.mjs';
-import { installedPlugin, parseOptions, pluginStderr, PLUGIN, remoteRevision, revisionOf, SOURCE as DEFAULT_SOURCE } from './common.mjs';
+import { cliPackagePath, installedPlugin, parseOptions, pluginStderr, PLUGIN, remoteRevision, revisionOf, SOURCE as DEFAULT_SOURCE } from './common.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const simulation = resolve(here, '../simulation');
@@ -204,7 +204,7 @@ try {
   assert(Number(process.versions.node.split('.')[0]) >= 24, 'Use Node 24 or later');
   assert.equal(process.platform, arg('--expect-platform'), 'Native OS mismatch: run this using that OS\'s Node executable');
   const tools = createRequire(join(resolve(arg('--tools')), 'package.json'));
-  const cliPackage = tools.resolve(`@getpaseo/cli-${PASEO.split('.').slice(0, 2).join('-')}/package.json`);
+  const cliPackage = cliPackagePath(tools, PASEO);
   report.paseo = JSON.parse(await readFile(cliPackage, 'utf8')).version;
   assert.equal(report.paseo, PASEO);
   let binary = arg('--claude');
