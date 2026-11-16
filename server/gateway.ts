@@ -47,6 +47,7 @@ export function createGateway(options: {
     providers ??= (await requireApi().config.get()).config.providers;
     const tokens = agent.lastUsage?.contextWindowUsedTokens;
     const eligible = claudeProvider(providers, agent.provider) && !agent.archivedAt && !agent.internal &&
+      (agent as { readonly background?: boolean }).background !== true &&
       !agent.providerUnavailable && !agent.labels["paseo.parent-agent-id"] && agent.status !== "closed";
     let observerUnreadable = false;
     const native = (eligible

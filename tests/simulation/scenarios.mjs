@@ -78,6 +78,71 @@ export const scenarios = [
     },
   },
   {
+    name: 'a background shell outlives compaction and its completion notification is delivered without a resend',
+    async run({ fixture: f, model }) {
+      await f.settings({ idleMinutes: 50 });
+      const id = await f.agent();
+      model.backgroundShellNext();
+      await f.turn(id, 'BACKGROUND_SHELL_COMPACT: start the synthetic background shell, then reply without further tools.');
+      const agent = await f.refresh(id);
+      const nativeBackground = typeof f.client.listAgentBackgroundWork === 'function';
+      let shellId = null;
+      if (nativeBackground) {
+        const work = await waitFor(async () => {
+          const rows = await f.client.listAgentBackgroundWork(id);
+          return rows.length ? rows : null;
+        }, 'background shell still running', 30_000);
+        shellId = work[0].id;
+      }
+      const row = await scheduled(f, id);
+      const sessionId = agent.persistence.sessionId;
+      const completedBefore = boundaries(await f.timeline(id)).length;
+      const requestsBefore = model.count;
+      // Paseo 0.16 reports hidden background work; older hosts do not expose it.
+      if (typeof agent.backgroundWork?.count === 'number')
+        assert(agent.backgroundWork.count >= 1, 'the shell must still be running at Compact now');
+      const accepted = await f.rpc('now', { agentId: id, revision: row.revision, target: row.target });
+      assert.equal(accepted.status, 'running'); assert(accepted.operationId);
+      await waitFor(async () => {
+        const current = (await f.rpc('operation', { operationId: accepted.operationId })).operation;
+        return current?.state === 'succeeded' ? current : null;
+      }, 'compaction while background work runs', 120_000);
+      assert.equal((await f.refresh(id)).persistence.sessionId, sessionId);
+      const compactedTimeline = await f.timeline(id);
+      assert.equal(boundaries(compactedTimeline).length, completedBefore + 1);
+      const boundaryAt = compactedTimeline.findIndex(entry =>
+        entry.item.type === 'compaction' && entry.item.status === 'completed');
+      assert(boundaryAt >= 0, 'a native compaction boundary must be on the timeline');
+      const notification = await waitFor(() => model.requests.slice(requestsBefore).find(request =>
+        request.texts?.some(text => /task-notification|SYSTEM NOTIFICATION/i.test(text) &&
+          /completed/i.test(text) && (!shellId || text.includes(shellId)))),
+        'background completion notification request', 90_000);
+      if (shellId)
+        assert(notification.texts.some(text => text.includes(shellId)),
+          'the completion notification must name the background shell');
+      await waitFor(async () => {
+        const rows = await f.timeline(id);
+        return rows.length > boundaryAt && rows.slice(boundaryAt + 1)
+          .some(entry => entry.item.type === 'assistant_message') ? rows : null;
+      }, 'assistant reply after the completion notification', 90_000);
+      const state = await waitFor(async () => {
+        const ledger = await f.ledger(id);
+        return ledger.pendingInputs === 0 && ledger.activeTurns.length === 0 &&
+          ledger.compact?.status === 'completed' ? ledger : null;
+      }, 'ledger settled after the notification turn', 30_000);
+      assert.equal(state.pendingInputs, 0, 'a delivered completion notification must not remain queued');
+      const fresh = await scheduled(f, id);
+      assert.notEqual(fresh.revision, row.revision, 'the notification turn is new activity');
+      if (nativeBackground)
+        await waitFor(async () => (await f.client.listAgentBackgroundWork(id)).length === 0,
+          'background shell end', 90_000);
+      const commands = (await f.timeline(id)).filter(entry =>
+        entry.item.type === 'user_message' && entry.item.text === '/compact');
+      assert.equal(commands.length, 1, 'compaction must not be resent');
+      await f.rpc('toggle', { agentId: id, enabled: false });
+    },
+  },
+  {
     name: '50-minute automatic delay is preserved; manual compaction works below the token threshold',
     async run({ fixture: f, id, baseline }) {
       await f.settings({ idleMinutes: 50 });

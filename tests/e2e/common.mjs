@@ -29,6 +29,19 @@ export function parseOptions(script, defaults, required = []) {
   return name => options.get(name);
 }
 
+// The pinned simulation tools install each Paseo release under an alias; stable releases that
+// followed a tested beta have a -stable suffix. Same mapping as tests/simulation/run.mjs.
+const CLI_ALIASES = new Map([
+  ['0.15.0-beta.1', '@getpaseo/cli-0-15'],
+  ['0.15.0', '@getpaseo/cli-0-15-stable'],
+  ['0.16.0-beta.1', '@getpaseo/cli-0-16-beta'],
+  ['0.16.0', '@getpaseo/cli-0-16-stable'],
+]);
+export function cliPackagePath(tools, version) {
+  const alias = CLI_ALIASES.get(version) ?? `@getpaseo/cli-${version.split('.').slice(0, 2).join('-')}`;
+  return tools.resolve(`${alias}/package.json`);
+}
+
 export async function installedPlugin(fixture) {
   const listed = JSON.parse(await fixture.paseo('plugin', 'ls', PLUGIN, '--json'));
   return Array.isArray(listed) ? listed.find(p => p.id === PLUGIN) ?? listed[0] : listed;

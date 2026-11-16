@@ -18,7 +18,7 @@ The update command runs observer consistency, type checks and the fast regressio
 
 ## What is real and what is simulated
 
-Each simulation starts stock **Paseo 0.12.0, 0.13.0, 0.14.0 or 0.15.0**, native **Claude Code 2.1.306**, and this checkout's actual plugin. The client handshake uses the selected toolchain's real version. Only model responses come from a synthetic loopback HTTP server. Native transcript creation, Mod loading, public RPC, settings persistence, process restart and automatic timers run normally. The fixture reports a 500k context to a 1M model so the real 400k threshold can be exercised without sending a huge prompt.
+Each simulation starts stock **Paseo 0.12.0, 0.13.0, 0.14.0, 0.15.0 or 0.16.0**, native **Claude Code 2.1.306**, and this checkout's actual plugin. The client handshake uses the selected toolchain's real version. Only model responses come from a synthetic loopback HTTP server. Native transcript creation, Mod loading, public RPC, settings persistence, process restart and automatic timers run normally. The fixture reports a 500k context to a 1M model so the real 400k threshold can be exercised without sending a huge prompt.
 
 Each run uses temporary HOME/USERPROFILE, Claude settings, Paseo configuration, agents and ports. The native process receives a synthetic API key and a local model URL. Existing Paseo and Claude sessions/settings are not used. Successful runs stop their process trees and delete the temporary home. Failed runs retain the temporary path in `report.json` for diagnosis.
 
@@ -56,6 +56,7 @@ On a heavily loaded machine, `--minimal-builtins` omits the released server's li
 | New input | Busy state suppresses old work; completed input earns a new reservation |
 | Background agents | Two completion notifications can share one main turn without leaving phantom pending input; that turn earns a new reservation without a new user message |
 | In-turn delivery | A background command completes during the main turn; the native transcript confirms absorption and automatic scheduling remains available |
+| Background shell | A background shell outlives an explicit compaction; its completion notification arrives as a new turn, leaves no phantom input or active turn and earns a new reservation without a second `/compact` |
 | Automatic compact | Real timer, native completion and same session; no repeated idle compaction |
 | Manual compact | Explicit Compact now completes in the same session |
 | Operation identity | Same-ID retries during execution and after completion do not resend; conflicting input is rejected; history remains queryable after new activity |
@@ -98,7 +99,7 @@ node --no-maglev tests/simulation/browser.mjs --paseo 0.12.0 \
   --report-dir /absolute/path/to/results
 ```
 
-Repeat with `--paseo 0.13.0` or `--paseo 0.14.0`. Each run writes a browser report and completed-state screenshot under `browser-<version>/`. An unavailable Windows runtime or browser is an untested environment, not a passing result; WSL execution reports Linux.
+Repeat with `--paseo 0.13.0`, `--paseo 0.14.0` or `--paseo 0.16.0`. Each run writes a browser report and completed-state screenshot under `browser-<version>/`. An unavailable Windows runtime or browser is an untested environment, not a passing result; WSL execution reports Linux.
 
 ## Paseo 0.14 lifecycle regression
 
@@ -135,13 +136,13 @@ npm run test:simulation:0.13 -- --expect-platform win32
 npm run test:simulation:0.14 -- --expect-platform linux
 ```
 
-The first command runs all three versions. The version-specific commands accept `--claude /absolute/native/claude`, `--tools /npm/prefix`, or `--report-dir /results`. A custom tools prefix may contain the matching ordinary `@getpaseo/cli` package or the versioned aliases used by this repository. Overrides still use an isolated home and the local model server. `npm run test:simulation:0.12 -- --help` lists the options.
+The first command runs every version in the matrix, 0.12.0 through 0.16.0. The version-specific commands accept `--claude /absolute/native/claude`, `--tools /npm/prefix`, or `--report-dir /results`. A custom tools prefix may contain the matching ordinary `@getpaseo/cli` package or the versioned aliases used by this repository. Overrides still use an isolated home and the local model server. `npm run test:simulation:0.12 -- --help` lists the options.
 
 To change a tested Claude/Paseo version, edit its exact alias in `tests/simulation/package.json`, regenerate the lockfile with `npm install --prefix tests/simulation --ignore-scripts`, and run the full suite on both OSes. Commit both package and lockfile. Keep 0.12 in the matrix while it remains the declared minimum. Do not infer native compatibility from the unit suite alone.
 
 ## CI
 
-[Check workflow](https://github.com/babo-jeonguk/paseo-auto-compact-for-claude/blob/main/.github/workflows/check.yml) has Paseo 0.12/0.13/0.14 native simulation jobs on **ubuntu-latest** and **windows-latest**, in addition to fast SDK 0.12/0.13/0.14 checks on Linux, macOS and Windows. Pull requests, main-branch pushes and manual workflow dispatch run them and upload their reports/logs even when a test fails. No API secret is needed. [View workflow runs](https://github.com/babo-jeonguk/paseo-auto-compact-for-claude/actions/workflows/check.yml). Native macOS execution is not covered by the fast macOS checks.
+[Check workflow](https://github.com/babo-jeonguk/paseo-auto-compact-for-claude/blob/main/.github/workflows/check.yml) has Paseo 0.12 through 0.16 native simulation jobs on **ubuntu-latest** and **windows-latest**, in addition to fast SDK 0.12 through 0.16 checks on Linux, macOS and Windows. Pull requests, main-branch pushes and manual workflow dispatch run them and upload their reports/logs even when a test fails. No API secret is needed. [View workflow runs](https://github.com/babo-jeonguk/paseo-auto-compact-for-claude/actions/workflows/check.yml). Native macOS execution is not covered by the fast macOS checks.
 
 ## Fast feedback and isolated runs
 
@@ -259,3 +260,21 @@ Only model replies are synthetic. [CI at f7b3a8c](https://github.com/babo-jeongu
 The per-conversation change passed the native suite **19/19** on Linux/WSL x64 (WSL2 kernel 6.18.58.1) with Node 24.21.0 and native Claude Code 2.1.306 for stock Paseo **0.15.0, 0.12.0, 0.13.0 and 0.14.0**. Every version passed on its first attempt; no scenario was rerun. The new *Concurrent conversations* scenario held one conversation's `/compact` model request and completed a second conversation's compaction while the first was still observing, then checked that a further request for the first conversation returned its existing operation without another model request. Each conversation produced exactly one completed boundary and receipt under its own operation ID and kept its native session.
 
 A rollback probe running the **v1.1.1** source (`bafdfde`) seeded one `observing` operation with its dispatch marker, one requested manual operation and one requested automatic operation from different conversations, with their jobs. v1.1.1's store accepted the state. Its serial worker never sent the observing operation, sent each requested conversation at most once, and sent nothing again after the deadlines passed.
+
+## Paseo 0.16 validation
+
+Validated on 2026-11-16 on Linux/WSL2 with Node 24.21.0, native Claude Code 2.1.306 and stock Paseo **0.16.0**, with Paseo **0.12.0** as the control, on top of the per-conversation compaction change. Only model replies were synthetic. Each run used its own temporary home, Claude configuration, workspace and ports; no real Paseo or Claude data was touched. An earlier pass on 2026-11-11 used 0.16.0-beta.1 with 0.15.0 as the control.
+
+The development SDK remains 0.12.0. The 0.16 SDK types make `metadata` and `background` required on hook agents and session-open requests, so the four test fixtures gained `metadata: {}` and `background: false`; 0.12–0.15 accept both, and no product code depends on them. `npm run check` passed **267 tests** on SDK 0.12.0 and on copied lanes pinned to `@getpaseo/client`, `@getpaseo/plugin` and `@getpaseo/protocol` 0.15.0 and 0.16.0. Paseo 0.16.0 also removes the always-empty `agent.turn.after.timeline` field; the plugin never read it.
+
+The native suite has **20 scenarios**. All 20 passed on stock Paseo 0.16.0 and on 0.12.0. The background-shell scenario starts a 20-second background shell, compacts explicitly while it runs, waits for the native completion notification, and checks the observer ledger, the new reservation and the absence of a second `/compact`. On 0.16.0 the interrupted-compaction suite passed **2/2** (graceful and forced), the lifecycle `reload`, `automatic` and `cleanup` scenarios passed, and the Chromium web UI checks passed **4/4**. Like 0.14 and 0.15, Paseo 0.16 defers reopening a session after a plugin reload, and the plugin blocks compaction until a message resumes it.
+
+`npm run test:e2e -- --paseo 0.16.0` passed **26/26**: v1.0.2 installed from GitHub ran on 0.16.0, the update to this branch, the native scenarios against that install, rollback and update again all passed. `npm run test:e2e:desktop -- --paseo 0.16.0` passed **9/9** on the 0.16.0 Linux desktop app (Electron 44.2.0, Node 24.20.0) under Xvfb. That app opens a first-run setup dialog over a fresh profile and shows no UI from a plugin installed through the CLI until its window reloads, so the desktop check skips the setup and reloads the window after installing. The E2E checks still start from v1.0.2; an upgrade starting from v1.1.1 is not covered.
+
+Paseo 0.16.0 is part of the default `matrix.mjs` matrix and CI (`npm run test:simulation:0.16`, alias `@getpaseo/cli-0-16-stable`). `npm run test:simulation:0.16-beta` still runs 0.16.0-beta.1 locally.
+
+Paseo 0.16.0 replaces Settings → Plugins with a plugin gallery. A Chromium probe on 0.16.0 found no per-row **Settings** button: selecting the plugin row opens its detail page, which renders this plugin's settings directly. The composer pill's **Settings** action still opens that page. Installing from a Git source moved to **More plugin actions → Install from source**, whose field is still named **Plugin source**, and the global switch moved to **Turn off plugins** in the same menu.
+
+Two policy points are specific to 0.16. First, an agent created with `background: true` is hidden from normal conversation lists, and it is not an Auto Compact target. The server gateway and the composer-pill reconciliation both treat `background === true` as ineligible, alongside the existing `internal` and `paseo.parent-agent-id` exclusions; a missing or false value behaves as before, so 0.12–0.15 hosts are unchanged. A reservation made before such an agent becomes hidden is skipped by the existing ineligible handling and never dispatched. Unit tests cover both the eligibility rule and the scheduled-then-ineligible path; the client reconciliation has no separate unit harness. A daemon probe found the hidden agent absent from `auto-compact.list`, `auto-compact.session` and the stored jobs, with no `/compact` and no model request after waiting past the one-minute idle delay, while a visible agent in the same daemon was still scheduled.
+
+Second, compaction may proceed while background work runs. The new native scenario confirms that the shell is not stopped, that Claude Code delivers its completion as a new turn after the compaction boundary, that the reply appears on the timeline, that no pending input or active turn remains in the observer ledger, and that the new activity earns a reservation without resending compaction. Paseo 0.16 also restores automatic recovery after a graceful daemon shutdown: the stored agent keeps `resumeOnStartup: true`. An interrupted compaction still settles `unknown`, does not treat the recovery reply as compact success and does not resend `/compact`.

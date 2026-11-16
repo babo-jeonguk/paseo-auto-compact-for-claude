@@ -16,7 +16,7 @@ import { tmpdir, release } from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { startFixture, waitFor } from '../simulation/fixture.mjs';
 import { startModel } from '../simulation/model.mjs';
-import { installedPlugin, parseOptions, pluginStderr as stderrOf, remoteRevision, revisionOf, SOURCE as DEFAULT_SOURCE } from './common.mjs';
+import { cliPackagePath, installedPlugin, parseOptions, pluginStderr as stderrOf, remoteRevision, revisionOf, SOURCE as DEFAULT_SOURCE } from './common.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const simulation = resolve(here, '../simulation');
@@ -143,6 +143,9 @@ function createDesktop() {
 }
 const shot = name => desktop.page.screenshot({ path: join(reportDir, `${name}.png`) });
 const openConversation = async () => {
+  // Paseo 0.16 opens a first-run setup dialog over a fresh profile; it intercepts every click.
+  const skip = desktop.page.getByText('Skip setup', { exact: true });
+  if (await skip.isVisible()) await skip.click();
   await desktop.page.getByText('Auto Compact simulation', { exact: true }).first().click({ timeout: 60_000 });
 };
 const pluginStderr = () => stderrOf([join(fixture.home, 'daemon.log')]);
@@ -165,6 +168,9 @@ check(`the plugin installs from GitHub at ${TO} into the desktop daemon`, async 
   report.revision = revisionOf(info);
   const expected = await remoteRevision(SOURCE, TO);
   if (expected) assert.equal(report.revision, expected);
+  // Paseo 0.16's app loads plugin client bundles when the window loads, so a plugin installed
+  // through the CLI while the window is open shows no UI until it reloads. Earlier apps load it live.
+  await desktop.page.reload();
 });
 check('a conversation started by the desktop daemon loads the observer and earns a 55-minute reservation', async () => {
   state.id = await fixture.agent();
@@ -244,7 +250,7 @@ try {
   const tools = createRequire(join(resolve(arg('--tools')), 'package.json'));
   const loaded = await import(pathToFileURL(tools.resolve('playwright-core')));
   playwright = loaded.chromium ? loaded : loaded.default;
-  const cliPackage = tools.resolve(`@getpaseo/cli-${PASEO.split('.').slice(0, 2).join('-')}/package.json`);
+  const cliPackage = cliPackagePath(tools, PASEO);
   report.paseo = JSON.parse(await readFile(cliPackage, 'utf8')).version;
   assert.equal(report.paseo, PASEO);
   const runtime = JSON.parse((await run(join(appDir, isWin ? 'Paseo.exe' : 'Paseo.bin'), ['-e',
