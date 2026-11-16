@@ -4,7 +4,8 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { z } from "zod";
-import { createStore } from "./store";
+import { createCachedStore, createStore } from "./store";
+import type { State, StateStore } from "./model";
 import { claudeProvider } from "./gateway";
 import { syncJobs } from "./operations";
 import { StatusSchema } from "../shared/rpc";
@@ -162,4 +163,151 @@ test("a rollback to v1.0.2 reads our state, keeps attempted activities guarded a
     assert.deepEqual(forward.operations.map(op => [op.agentId, op.kind, op.state]),
       [["succeeded", "legacy", "succeeded"], ["requested", "legacy", "unknown"]]);
   } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+// A store that counts what reaches the file, standing in for the file store.
+function countingStore(initial: State = { version: 1, disabled: ["a"], jobs: [], operations: [] }) {
+  let saved = structuredClone(initial);
+  const counts = { reads: 0, writes: 0 };
+  let failRead: Error | null = null, failWrite: Error | null = null;
+  let gate: Promise<void> | null = null;
+  const inner: StateStore = {
+    async read() {
+      counts.reads++;
+      const snapshot = structuredClone(saved);
+      if (gate) await gate;
+      if (failRead) throw failRead;
+      return snapshot;
+    },
+    async write(state) {
+      counts.writes++;
+      if (failWrite) throw failWrite;
+      saved = structuredClone(state);
+    },
+  };
+  return {
+    inner, counts,
+    get saved() { return saved; },
+    failRead(error: Error | null) { failRead = error; },
+    failWrite(error: Error | null) { failWrite = error; },
+    hold() { let release!: () => void; gate = new Promise(resolve => { release = resolve; }); return () => { gate = null; release(); }; },
+  };
+}
+
+test("repeated state reads are served from memory after the first read", async () => {
+  const file = countingStore();
+  const store = createCachedStore(file.inner);
+  for (let i = 0; i < 5; i++) assert.deepEqual((await store.read()).disabled, ["a"]);
+  assert.equal(file.counts.reads, 1);
+});
+
+test("a successful write is what later reads return, without reading the file again", async () => {
+  const file = countingStore();
+  const store = createCachedStore(file.inner);
+  const state = await store.read();
+  state.disabled.push("b");
+  await store.write(state);
+  assert.deepEqual((await store.read()).disabled, ["a", "b"]);
+  assert.deepEqual(file.saved.disabled, ["a", "b"]);
+  assert.equal(file.counts.reads, 1);
+  assert.equal(file.counts.writes, 1);
+});
+
+test("a write before any read is cached too", async () => {
+  const file = countingStore();
+  const store = createCachedStore(file.inner);
+  await store.write({ version: 1, disabled: ["z"], jobs: [], operations: [] });
+  assert.deepEqual((await store.read()).disabled, ["z"]);
+  assert.equal(file.counts.reads, 0);
+});
+
+test("a failed write leaves the last persisted snapshot readable", async () => {
+  const file = countingStore();
+  const store = createCachedStore(file.inner);
+  const state = await store.read();
+  state.disabled = ["never-persisted"];
+  file.failWrite(new Error("disk full"));
+  await assert.rejects(store.write(state), /disk full/);
+  assert.deepEqual((await store.read()).disabled, ["a"]);
+  assert.deepEqual(file.saved.disabled, ["a"]);
+});
+
+test("callers cannot change the cached snapshot through a read or a written object", async () => {
+  const file = countingStore();
+  const store = createCachedStore(file.inner);
+  const first = await store.read();
+  first.disabled.push("mutated-after-read");
+  assert.deepEqual((await store.read()).disabled, ["a"]);
+  const next = await store.read();
+  next.disabled = ["written"];
+  await store.write(next);
+  next.disabled.push("mutated-after-write");
+  assert.deepEqual((await store.read()).disabled, ["written"]);
+  const a = await store.read(), b = await store.read();
+  assert.notEqual(a, b);
+  assert.notEqual(a.disabled, b.disabled);
+});
+
+test("a read error is not cached: the next read asks the file again", async () => {
+  const file = countingStore();
+  const cold = createCachedStore(file.inner);
+  file.failRead(new Error("Auto Compact state is unreadable; automation stopped"));
+  await assert.rejects(cold.read(), /unreadable/);
+  await assert.rejects(cold.read(), /unreadable/);
+  file.failRead(null);
+  assert.deepEqual((await cold.read()).disabled, ["a"]);
+  assert.equal(file.counts.reads, 3);
+});
+
+test("a write that lands while the first read is in flight is not replaced by that older read", async () => {
+  const file = countingStore();
+  const store = createCachedStore(file.inner);
+  const release = file.hold();
+  const stale = store.read();
+  await store.write({ version: 1, disabled: ["newer"], jobs: [], operations: [] });
+  release();
+  assert.deepEqual((await stale).disabled, ["a"], "the in-flight read still answers with what it read");
+  assert.deepEqual((await store.read()).disabled, ["newer"]);
+});
+
+test("the cached file store keeps today's unreadable-state failure and missing-file default", async () => {
+  const root = await mkdtemp(join(tmpdir(), "compact-cached-store-"));
+  try {
+    const path = join(root, "state.json");
+    const missing = createCachedStore(createStore(path));
+    assert.deepEqual(await missing.read(), { version: 1, disabled: [], jobs: [], operations: [] });
+    await writeFile(join(root, "corrupt.json"), "{not json");
+    const corrupt = createCachedStore(createStore(join(root, "corrupt.json")));
+    await assert.rejects(corrupt.read(), /unreadable; automation stopped/);
+    await assert.rejects(corrupt.read(), /unreadable; automation stopped/);
+    await writeFile(join(root, "corrupt.json"), JSON.stringify({ version: 1, disabled: ["x"], jobs: [], operations: [] }));
+    assert.deepEqual((await corrupt.read()).disabled, ["x"]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a read error clears a snapshot that a concurrent read cached, so the next read asks the file", async () => {
+  const replies: Array<{ settle(): void }> = [];
+  let reads = 0;
+  const inner: StateStore = {
+    read: () => {
+      reads++;
+      const call = reads;
+      return new Promise<State>((resolve, reject) => replies.push({ settle: () => call === 1
+        ? resolve({ version: 1, disabled: ["cached"], jobs: [], operations: [] })
+        : reject(new Error("Auto Compact state is unreadable; automation stopped")) }));
+    },
+    write: async () => {},
+  };
+  const store = createCachedStore(inner);
+  const first = store.read(), second = store.read();
+  replies[0].settle();
+  assert.deepEqual((await first).disabled, ["cached"]);
+  replies[1].settle();
+  await assert.rejects(second, /unreadable/);
+  const third = store.read();
+  assert.equal(reads, 3, "the read after an error goes to the file again");
+  replies[2].settle();
+  await assert.rejects(third, /unreadable/);
 });

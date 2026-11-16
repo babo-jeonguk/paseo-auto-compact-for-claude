@@ -2,28 +2,50 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createOperationWorker, recoverOperations } from "./operations";
 import { DEFAULT_SETTINGS, type Settings } from "../shared/settings";
-import { Refusal, type CompactOutcome, type Gateway, type Observation, type State } from "./model";
+import { Refusal, type CompactOutcome, type ExecutionContext, type Gateway, type Observation,
+  type State, type StoredOperation } from "./model";
 
-function fixture() {
+type Evidence = CompactOutcome | null | ((operation: StoredOperation) => CompactOutcome | null);
+type Hook = (execution: ExecutionContext | undefined) => Promise<CompactOutcome>;
+
+function fixture(options: { agents?: string[] } = {}) {
   let time = 1000;
-  let state: State = { version: 1, disabled: [], jobs: [], operations: [{
-    id: "operation-a", agentId: "a", revision: "rev", target: { sessionId: "native", activityKey: "activity" },
+  const observations: Record<string, Observation> = {};
+  for (const id of options.agents ?? ["a"]) {
+    observations[id] = { agentId: id, revision: "rev", sessionId: id === "a" ? "native" : `native-${id}`,
+      activityKey: id === "a" ? "activity" : `activity-${id}`,
+      title: null, workspace: "/work", provider: "claude", tokens: 100, eligible: true, idle: true };
+  }
+  const sessionOf = (id: string) => observations[id].sessionId;
+  const operation = (id: string, agentId: string): StoredOperation => ({
+    id, agentId, revision: "rev",
+    target: { sessionId: sessionOf(agentId), activityKey: observations[agentId].activityKey ?? null },
     kind: "manual", state: "requested", createdAt: time, updatedAt: time, result: null,
-    inputFingerprint: "fingerprint", sendBy: time + 180_000, attempt: 0,
-  }] };
+    inputFingerprint: `fingerprint-${id}`, sendBy: time + 180_000, attempt: 0,
+  });
+  let state: State = { version: 1, disabled: [], jobs: [],
+    operations: (options.agents ?? ["a"]).map(id => operation(`operation-${id}`, id)) };
   let sends = 0, writesFail = false, readsFail = 0;
-  const errors: unknown[] = [];
-  const agent: Observation = { agentId: "a", revision: "rev", sessionId: "native", activityKey: "activity",
-    title: null, workspace: "/work", provider: "claude", tokens: 100, eligible: true, idle: true };
-  let evidence: CompactOutcome | null = null;
+  let stale: State | null = null;
+  const errors: unknown[] = [], calls: string[] = [], events: string[] = [];
+  const hooks = new Map<string, Hook>();
+  let evidence: Evidence = null;
   const gateway: Gateway = {
-    list: async () => [agent], refresh: async () => agent,
-    compact: async (_id, _expected, execution) => {
+    list: async () => Object.values(observations), refresh: async id => observations[id] ?? null,
+    compact: async (id, _expected, execution) => {
+      calls.push(id);
+      events.push(`${id}:send`);
+      const hook = hooks.get(id);
+      if (hook) {
+        const outcome = await hook(execution);
+        sends++;
+        return outcome;
+      }
       await execution!.checkpoint({ dispatchStartedAt: time });
       sends++;
       return { status: "completed", detail: "matching evidence" };
     },
-    inspect: async () => evidence,
+    inspect: async operation => typeof evidence === "function" ? evidence(operation) : evidence,
   };
   let tail: Promise<unknown> = Promise.resolve();
   const update = <T>(change: (state: State) => T): Promise<T> => {
@@ -38,18 +60,36 @@ function fixture() {
     return result;
   };
   const make = (settings = async (): Promise<Settings | null> => ({ ...DEFAULT_SETTINGS })) => createOperationWorker({ gateway,
-    store: { read: async () => { if (readsFail > 0) { readsFail--; throw new Error("EBUSY"); } return structuredClone(state); },
-      write: async next => { state = next; } },
+    store: { read: async () => {
+        if (readsFail > 0) { readsFail--; throw new Error("EBUSY"); }
+        if (stale) { const value = stale; stale = null; return structuredClone(value); }
+        return structuredClone(state);
+      }, write: async next => { state = next; } },
     update, settings, now: () => time, onError: error => errors.push(error) });
-  return { make, gateway, agent, errors,
+  return { make, gateway, errors, calls, events,
+    get agent() { return observations.a; },
     get operation() { return state.operations[0]; },
+    operationById(id: string) {
+      const found = state.operations.find(entry => entry.id === id);
+      assert.ok(found, `missing ${id}`);
+      return found;
+    },
+    get snapshot() { return structuredClone(state); },
+    readStaleOnce(value: State) { stale = structuredClone(value); },
     get sends() { return sends; },
-    set evidence(value: CompactOutcome | null) { evidence = value; },
+    set evidence(value: Evidence) { evidence = value; },
+    hook(id: string, work: Hook | null) { if (work) hooks.set(id, work); else hooks.delete(id); },
     set failTerminal(value: boolean) { writesFail = value; },
     set failReads(count: number) { readsFail = count; },
     advance(ms: number) { time += ms; },
     recover() { recoverOperations(state, time); },
   };
+}
+
+async function until(condition: () => boolean) {
+  for (let i = 0; i < 500 && !condition(); i++)
+    await new Promise<void>(resolve => setImmediate(resolve));
+  assert.ok(condition(), "expected the condition within the test's bounded wait");
 }
 
 test("durable requested work is dispatched after restart with the original identity", async () => {
@@ -175,6 +215,30 @@ test("a gateway fault before the dispatch marker is retried; nothing is sent unt
   f.advance(2000); await worker.reconcile();
   assert.equal(f.operation.state, "succeeded");
   assert.equal(f.sends, 1);
+});
+
+test("a stale read cannot skip a faulted operation's retry wait", async () => {
+  const f = fixture(), worker = f.make();
+  const stale = f.snapshot;
+  const compact = f.gateway.compact;
+  f.gateway.compact = async () => { throw new Error("observer preparation timed out"); };
+  await worker.reconcile();
+  assert.equal(f.operation.state, "requested");
+  const attempt = f.operation.attempt;
+  assert.ok(f.operation.nextAttemptAt! > 1000, "the fault scheduled a retry");
+  const calls = f.calls.length;
+  f.gateway.compact = compact;
+  // This reconcile's snapshot predates the fault, so only the claim can see the wait.
+  f.readStaleOnce(stale);
+  await worker.reconcile();
+  assert.equal(f.calls.length, calls, "the stale snapshot cannot start the retry early");
+  assert.equal(f.operation.attempt, attempt, "the faulted attempt is not claimed twice");
+  assert.equal(f.operation.state, "requested");
+  f.advance(2000);
+  await worker.reconcile();
+  assert.equal(f.operation.state, "succeeded");
+  assert.equal(f.operation.attempt, attempt! + 1);
+  worker.stop();
 });
 
 test("a refusal ends the attempt without retry and records that nothing was sent", async () => {
@@ -318,4 +382,180 @@ test("a fault after the dispatch marker never expires the work as unsent, even p
   assert.equal(f.operation.state, "observing", "marked work is observed, not expired");
   assert.equal(f.operation.result, null);
   assert.deepEqual(f.errors.map(String), ["Error: EBUSY"]);
+});
+
+test("conversations run independently: a held send does not delay another conversation", async () => {
+  const f = fixture({ agents: ["a", "b"] });
+  let releaseA!: () => void;
+  const heldA = new Promise<void>(resolve => { releaseA = resolve; });
+  f.hook("a", async execution => {
+    await execution!.checkpoint({ dispatchStartedAt: 1000 });
+    f.events.push("a:marker");
+    await heldA;
+    f.events.push("a:release");
+    return { status: "completed", detail: "A completed" };
+  });
+  const running = f.make().reconcile();
+  try {
+    await until(() => f.operationById("operation-b").state === "succeeded");
+    assert.equal(f.operationById("operation-a").state, "observing");
+    assert.equal(f.sends, 1, "only B has completed its send while A is held");
+    assert.ok(f.events.includes("b:send"), "B is sent while A is still held");
+    assert.ok(!f.events.includes("a:release"), "A has not been released yet");
+  } finally {
+    releaseA();
+    await running;
+  }
+  assert.equal(f.operationById("operation-a").state, "succeeded");
+  assert.equal(f.sends, 2, "exactly one send per operation");
+  assert.deepEqual(f.calls.toSorted(), ["a", "b"]);
+});
+
+test("a fault in one conversation is retried without delaying another conversation", async () => {
+  const f = fixture({ agents: ["a", "b"] });
+  f.hook("a", async () => { throw new Error("observer preparation timed out"); });
+  const worker = f.make();
+  await worker.reconcile();
+  assert.equal(f.operationById("operation-b").state, "succeeded");
+  assert.equal(f.operationById("operation-a").state, "requested");
+  assert.ok(f.operationById("operation-a").nextAttemptAt! > 1000, "A's retry is scheduled in the future");
+  assert.equal(f.operationById("operation-a").evidence?.dispatchStartedAt, undefined, "A sent nothing before its marker");
+  assert.equal(f.sends, 1, "only B was sent");
+  f.hook("a", null);
+  f.advance(2000);
+  await worker.reconcile();
+  assert.equal(f.operationById("operation-a").state, "succeeded");
+  assert.equal(f.operationById("operation-a").evidence?.dispatchStartedAt, 3000);
+  assert.equal(f.sends, 2, "A is sent once on its retry");
+});
+
+test("an ambiguous send stays observable without delaying another conversation", async () => {
+  const f = fixture({ agents: ["a", "b"] });
+  f.hook("a", async execution => {
+    await execution!.checkpoint({ dispatchStartedAt: 1000 });
+    return { status: "unknown", detail: "send timed out" };
+  });
+  const worker = f.make();
+  await worker.reconcile();
+  assert.equal(f.operationById("operation-a").state, "observing");
+  assert.equal(f.operationById("operation-b").state, "succeeded");
+  assert.equal(f.operationById("operation-a").attempt, 1);
+  f.advance(60_000);
+  await worker.reconcile();
+  assert.equal(f.operationById("operation-a").state, "observing");
+  assert.equal(f.calls.filter(id => id === "a").length, 1, "ambiguous work is never resent");
+});
+
+test("overlapping checkpoints and completions of two conversations keep both evidences and results", async () => {
+  const f = fixture({ agents: ["a", "b"] });
+  let releaseA!: () => void, releaseB!: () => void;
+  const gateA = new Promise<void>(resolve => { releaseA = resolve; });
+  const gateB = new Promise<void>(resolve => { releaseB = resolve; });
+  f.hook("a", async execution => {
+    await execution!.checkpoint({ dispatchStartedAt: 2000, turnId: "turn-a" });
+    f.events.push("a:checkpointed");
+    await gateA;
+    return { status: "completed", detail: "A completed" };
+  });
+  f.hook("b", async execution => {
+    await execution!.checkpoint({ dispatchStartedAt: 3000, boundary: true });
+    f.events.push("b:checkpointed");
+    await gateB;
+    return { status: "completed", detail: "B completed" };
+  });
+  const running = f.make().reconcile();
+  try {
+    await until(() => f.events.includes("a:checkpointed") && f.events.includes("b:checkpointed"));
+    assert.equal(f.operationById("operation-a").state, "observing");
+    assert.equal(f.operationById("operation-b").state, "observing");
+    releaseA();
+    await until(() => f.operationById("operation-a").state === "succeeded");
+    assert.equal(f.operationById("operation-b").state, "observing", "B is still held");
+  } finally {
+    releaseA(); releaseB();
+    await running;
+  }
+  assert.equal(f.operationById("operation-a").state, "succeeded");
+  assert.equal(f.operationById("operation-b").state, "succeeded");
+  assert.deepEqual(f.operationById("operation-a").evidence,
+    { dispatchStartedAt: 2000, turnId: "turn-a", invalidated: false });
+  assert.deepEqual(f.operationById("operation-b").evidence,
+    { dispatchStartedAt: 3000, boundary: true, invalidated: false });
+  assert.equal(f.operationById("operation-a").result?.code, "completed");
+  assert.equal(f.operationById("operation-b").result?.code, "completed");
+});
+
+test("concurrent reconciles start each operation only once", async () => {
+  const f = fixture();
+  let release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  f.hook("a", async execution => {
+    await execution!.checkpoint({ dispatchStartedAt: 1000 });
+    await held;
+    return { status: "completed", detail: "completed" };
+  });
+  const worker = f.make();
+  const first = worker.reconcile(), second = worker.reconcile();
+  try {
+    // Both reconciles have passed the claim point by the time the run observes.
+    await until(() => f.operation.state === "observing");
+    assert.equal(f.calls.filter(id => id === "a").length, 1);
+  } finally {
+    release();
+    await Promise.all([first, second]);
+  }
+  assert.equal(f.operation.state, "succeeded");
+  assert.equal(f.calls.filter(id => id === "a").length, 1);
+});
+
+test("restart recovers operations in different phases independently", async () => {
+  const f = fixture({ agents: ["a", "b", "c"] });
+  const b = f.operationById("operation-b"), c = f.operationById("operation-c");
+  b.state = "dispatching";
+  b.evidence = { dispatchStartedAt: 1000 };
+  c.state = "observing";
+  c.evidence = { dispatchStartedAt: 1000 - 180_001 };
+  f.evidence = operation => operation.id === "operation-b"
+    ? { status: "completed", detail: "matching persisted evidence" } : null;
+  f.recover();
+  assert.equal(f.operationById("operation-b").state, "observing");
+  assert.equal(f.operationById("operation-c").state, "observing");
+  await f.make().reconcile();
+  assert.equal(f.operationById("operation-a").state, "succeeded");
+  assert.equal(f.operationById("operation-b").state, "succeeded");
+  assert.equal(f.operationById("operation-c").state, "unknown");
+  assert.equal(f.operationById("operation-c").result?.code, "unknown");
+  assert.deepEqual(f.calls, ["a"], "only the requested operation was sent");
+  assert.equal(f.sends, 1);
+});
+
+test("a stopped worker cannot publish late results for any of several operations", async () => {
+  const f = fixture({ agents: ["a", "b"] });
+  let releaseA!: (outcome: CompactOutcome) => void, releaseB!: (outcome: CompactOutcome) => void;
+  f.hook("a", async execution => {
+    await execution!.checkpoint({ dispatchStartedAt: 1000 });
+    f.events.push("a:checkpointed");
+    return new Promise(resolve => { releaseA = resolve; });
+  });
+  f.hook("b", async execution => {
+    await execution!.checkpoint({ dispatchStartedAt: 1000 });
+    f.events.push("b:checkpointed");
+    return new Promise(resolve => { releaseB = resolve; });
+  });
+  const first = f.make();
+  const running = first.reconcile();
+  await until(() => f.events.includes("a:checkpointed") && f.events.includes("b:checkpointed"));
+  first.stop();
+  f.recover();
+  f.evidence = () => ({ status: "failed", detail: "native rejection" });
+  await f.make().reconcile();
+  assert.equal(f.operationById("operation-a").state, "failed");
+  assert.equal(f.operationById("operation-b").state, "failed");
+  releaseA({ status: "completed", detail: "stale worker" });
+  releaseB({ status: "completed", detail: "stale worker" });
+  await running;
+  assert.equal(f.operationById("operation-a").state, "failed");
+  assert.equal(f.operationById("operation-b").state, "failed");
+  assert.equal(f.operationById("operation-a").result?.message, "native rejection");
+  assert.equal(f.operationById("operation-b").result?.message, "native rejection");
 });

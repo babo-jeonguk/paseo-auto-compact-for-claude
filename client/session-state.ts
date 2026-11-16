@@ -1,5 +1,6 @@
 import { sentNothing, type Row } from "../shared/rpc";
 import type { Settings } from "../shared/settings";
+import { POLL_JITTER_MS, SESSION_POLL_MS } from "./cadence";
 import { formatTokenThreshold } from "./format";
 
 export const sessionKey = (hostId: string, agentId: string) =>
@@ -45,7 +46,7 @@ export function compactCompletionNotice(
   return compactOutcomeNotice(tracked);
 }
 
-export const STATUS_GRACE_MS = 10_000;
+export const STATUS_GRACE_MS = 2 * SESSION_POLL_MS + POLL_JITTER_MS;
 export const INPUT_IDLE_GRACE_MS = 60_000;
 
 export function canUndoSkip(row: Row, now: number): boolean {

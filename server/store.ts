@@ -49,6 +49,36 @@ function decode(value: unknown): State {
   return StateSchema.parse({ ...legacy, operations });
 }
 
+export function createCachedStore(inner: StateStore): StateStore {
+  let cached: State | null = null;
+  // Advances on every write and failed read, so an older read cannot refill the cache.
+  let epoch = 0;
+  // The plugin is the only writer; an external edit to the file is not detected.
+  return {
+    async read() {
+      if (cached) return structuredClone(cached);
+      const started = epoch;
+      let state: State;
+      try {
+        state = await inner.read();
+      } catch (error) {
+        // The failed read invalidates whatever another read cached meanwhile.
+        cached = null;
+        epoch++;
+        throw error;
+      }
+      // A write that completed meanwhile already stored the newer snapshot.
+      if (started === epoch && !cached) cached = structuredClone(state);
+      return state;
+    },
+    async write(state) {
+      await inner.write(state);
+      epoch++;
+      cached = structuredClone(state);
+    },
+  };
+}
+
 export function createStore(
   path = join(
     process.env.PASEO_HOME || join(homedir(), ".paseo"),
