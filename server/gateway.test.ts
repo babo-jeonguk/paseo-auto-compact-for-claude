@@ -39,6 +39,7 @@ function fixture(
     title: null,
     parentAgentId: null,
     workspaceId: null,
+    background: false,
     metadata: {},
   };
   let liveListener: ((message: unknown) => void) | undefined;
