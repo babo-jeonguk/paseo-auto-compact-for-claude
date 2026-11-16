@@ -20,7 +20,7 @@ export function pillLabel(label: string | null): string | undefined {
   const countdown = /^Compact in (\d+)([ms])$/.exec(label);
   if (!countdown) return label;
   const amount = Number(countdown[1]);
-  return countdown[2] === "m" && amount >= 100 ? `Compact ${Math.ceil(amount / 60)}h` : `Compact ${amount}${countdown[2]}`;
+  return countdown[2] === "m" && amount > 60 ? `Compact ${Math.floor(amount / 60)}h` : `Compact ${amount}${countdown[2]}`;
 }
 
 export type CompactCompletionNotice =

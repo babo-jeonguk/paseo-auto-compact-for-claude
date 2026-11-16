@@ -42,7 +42,7 @@ The pill uses five states:
 | --- | --- |
 | **Compact off** | Automatic compaction is disabled. Open the pill to see which setting controls it. |
 | **Compact on** | Automation is enabled and waiting for scheduling conditions. A previous cancellation, expiry, skip or success does not turn it off. |
-| **Compact 55m** | A current reservation has a countdown: minutes, seconds in the last minute, or hours beyond 99 minutes. The open pill reads **Compact in 55m**. New messages cancel that reservation. |
+| **Compact 55m** | A current reservation has a countdown: minutes, seconds in the last minute, or whole hours beyond 60 minutes. The open pill reads **Compact in 55m**. New messages cancel that reservation. |
 | **Compacting…** | Compaction is running; wait before sending a message. |
 | **Needs check** | Open the pill (titled **Check compact**) for the problem and next action, such as checking the conversation, reopening the session or correcting settings. |
 

@@ -16,7 +16,7 @@ Paseo's public `send('/compact')` starts compaction. The observer records native
 
 ## Conversation status
 
-The pill uses **Compact off**, **Compact on**, a countdown such as **Compact 55m**, **Compacting…**, and **Needs check**. The countdown shows minutes, seconds in the last minute, or whole hours (rounded up) beyond 99 minutes. Open the pill for the current reason and next action; the open controls are titled with the full label, such as **Compact in 55m** or **Check compact**. The shorter pill labels fit Paseo 0.16's 160-pixel pill. It does not display cache TTL or exact scheduled times.
+The pill uses **Compact off**, **Compact on**, a countdown such as **Compact 55m**, **Compacting…**, and **Needs check**. The countdown shows minutes, seconds in the last minute, or whole hours beyond 60 minutes. Open the pill for the current reason and next action; the open controls are titled with the full label, such as **Compact in 55m** or **Check compact**. The shorter pill labels fit Paseo 0.16's 160-pixel pill. It does not display cache TTL or exact scheduled times.
 
 **Compact on** means automation is enabled, including while context is below the threshold, a reply/input/permission request is pending, or a previous reservation ended. A cancelled, expired, skipped or completed reservation does not turn automation off or imply a new reservation exists. A countdown requires known context at or above the threshold and a future usable reservation.
 
