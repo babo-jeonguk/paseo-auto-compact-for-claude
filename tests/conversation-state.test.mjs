@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { canUndoSkip, compactCompletionNotice, compactOutcomeNotice, pillLabel, sessionPresentation, pendingPresentation, sessionKey,
-  STATUS_GRACE_MS, INPUT_IDLE_GRACE_MS } from "../client/session-state.ts";
+  INPUT_IDLE_GRACE_MS } from "../client/session-state.ts";
+import { STATUS_FRESH_MS } from "../client/cadence.ts";
 import { DEFAULT_SETTINGS } from "../shared/settings.ts";
 
 const now = 1_000_000;
@@ -76,13 +77,13 @@ test("normal waiting remains on and a persistent pending-input mismatch needs at
 
 test("brief reads and mutations use loading, never an old countdown or a sixth label", () => {
   assert.deepEqual(pendingPresentation(null, 0), { presentation: null, loading: true });
-  const refreshing = pendingPresentation(present(), STATUS_GRACE_MS - 1);
+  const refreshing = pendingPresentation(present(), STATUS_FRESH_MS - 1);
   assert.equal(refreshing.presentation.label, "Compact on");
   assert.equal(refreshing.loading, true);
-  const unavailable = pendingPresentation(present(), STATUS_GRACE_MS);
+  const unavailable = pendingPresentation(present(), STATUS_FRESH_MS);
   assert.equal(unavailable.presentation.label, "Check compact");
   assert.equal(unavailable.loading, false);
-  const updating = pendingPresentation(present(), STATUS_GRACE_MS, true);
+  const updating = pendingPresentation(present(), STATUS_FRESH_MS, true);
   assert.equal(updating.presentation.label, "Compact on");
   assert.equal(updating.loading, true);
   const disabled = present({ enabled: false });

@@ -1,6 +1,6 @@
 import { sentNothing, type Row } from "../shared/rpc";
 import type { Settings } from "../shared/settings";
-import { POLL_JITTER_MS, SESSION_POLL_MS } from "./cadence";
+import { STATUS_FRESH_MS } from "./cadence";
 import { formatTokenThreshold } from "./format";
 
 export const sessionKey = (hostId: string, agentId: string) =>
@@ -58,7 +58,6 @@ export function compactCompletionNotice(
   return compactOutcomeNotice(tracked);
 }
 
-export const STATUS_GRACE_MS = 2 * SESSION_POLL_MS + POLL_JITTER_MS;
 export const INPUT_IDLE_GRACE_MS = 60_000;
 
 export function canUndoSkip(row: Row, now: number): boolean {
@@ -136,7 +135,7 @@ export function sessionPresentation(row: Row, settings: Settings, now: number): 
 // Short reads and mutations use a spinner. Never retain a stale countdown.
 export function pendingPresentation(previous: Presentation | null, elapsed: number,
   changing = false): { presentation: Presentation | null; loading: boolean } {
-  if (!changing && elapsed >= STATUS_GRACE_MS) return {
+  if (!changing && elapsed >= STATUS_FRESH_MS) return {
     presentation: check("Compact status could not be refreshed. Refresh the status and check the connection."),
     loading: false,
   };

@@ -5,7 +5,8 @@ export const OPERATION_POLL_MS = 2_000; // operation lookup while the popover is
 export const OPERATION_LOOKUP_MS = 30_000; // bound for an operation that is never found
 export const DIRECTORY_REFRESH_MS = 5 * 60_000; // directory safety refresh
 export const POLL_JITTER_MS = 5_000;
-// Fresh across one missed poll plus network jitter.
+// Status tolerates one missed poll plus network jitter: a read stays fresh this long,
+// and a refresh still pending this long is reported as not refreshed.
 export const STATUS_FRESH_MS = 2 * SESSION_POLL_MS + POLL_JITTER_MS;
 
 export type PollEvent = "success" | "failure" | "focus" | "reconnect";
