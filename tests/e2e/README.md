@@ -33,7 +33,7 @@ npm run test:e2e -- --paseo 0.13.0 --to <branch, tag or commit>
 | Flag | Meaning |
 |---|---|
 | `--paseo` | `0.12.0`, `0.13.0`, `0.14.0`, `0.15.0` or `0.16.0` (default `0.13.0`) |
-| `--from` | Release installed first and rolled back to (default `v1.1.1`, the latest release; `v1.0.2` checks the migration from state without operation history) |
+| `--from` | Release installed first and rolled back to (default `v1.2.1`, the latest release; `v1.0.2` checks the migration from state without operation history) |
 | `--to` | Ref under test (default `main`) |
 | `--source` | Plugin Git source (default `git:babo-jeonguk/paseo-auto-compact-for-claude`) |
 | `--min 1` | Skips the two scenarios that wait for real one-minute deadlines |

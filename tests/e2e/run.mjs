@@ -20,7 +20,7 @@ import { cliPackagePath, installedPlugin, parseOptions, pluginStderr, PLUGIN, re
 
 const here = dirname(fileURLToPath(import.meta.url));
 const simulation = resolve(here, '../simulation');
-const arg = parseOptions('run.mjs', [['--paseo', '0.13.0'], ['--from', 'v1.1.1'], ['--to', 'main'],
+const arg = parseOptions('run.mjs', [['--paseo', '0.13.0'], ['--from', 'v1.2.1'], ['--to', 'main'],
   ['--source', DEFAULT_SOURCE], ['--expect-platform', process.platform],
   ['--claude', process.env.SIMULATION_CLAUDE_BINARY ?? ''], ['--tools', simulation],
   ['--report-dir', join(resolve(here, '../..'), 'test-results', 'e2e')], ['--min', '0']]);

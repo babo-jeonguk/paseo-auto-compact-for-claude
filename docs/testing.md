@@ -14,7 +14,7 @@ npm run test:update
 
 In Windows PowerShell, `npm.cmd run test:update` also works when execution policy blocks `npm.ps1`. Run with **Windows Node** to test Windows; WSL Node tests Linux. The runner records `process.platform`, architecture, OS release, Node/Claude/Paseo versions and product source hashes.
 
-The update command runs observer consistency, type checks and the fast regression suite. After committing, run `npm run test:release` for those checks and the full native matrix on an isolated snapshot with Paseo **0.12.0**, **0.13.0**, **0.14.0** and **0.15.0**. Install the pinned native tools once with `npm ci --prefix tests/simulation --ignore-scripts`. This needs network access and can take several minutes; later runs reuse them. Nothing is installed globally and no Claude login is required.
+The update command runs observer consistency, type checks and the fast regression suite. After committing, run `npm run test:release` for those checks and the full native matrix on an isolated snapshot with Paseo **0.12.0**, **0.13.0**, **0.14.0**, **0.15.0** and **0.16.0**. Install the pinned native tools once with `npm ci --prefix tests/simulation --ignore-scripts`. This needs network access and can take several minutes; later runs reuse them. Nothing is installed globally and no Claude login is required.
 
 ## What is real and what is simulated
 
@@ -26,7 +26,7 @@ The automatic timer test first verifies real **55- and 50-minute reservation val
 
 ## Paseo 0.15 restart and browser reconnect checks
 
-The preview keeps the default development SDK at 0.12.0 and tests all four pinned versions in the SDK and native matrices. The focused restart/reconnect suite can use the beta alias installed by the native tools above, or a separate CLI directory:
+The default development SDK stays at 0.12.0, and the SDK and native matrices test every pinned version. The focused restart/reconnect suite uses the 0.15.0 alias installed by the native tools above by default (`--paseo 0.16.0` selects 0.16.0), or a separate CLI directory:
 
 ```sh
 npm install --prefix /tmp/auto-compact-paseo-015 --ignore-scripts --no-audit --no-fund @getpaseo/cli@0.15.0
