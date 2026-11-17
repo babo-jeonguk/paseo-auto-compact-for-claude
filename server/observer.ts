@@ -112,12 +112,16 @@ export function createObserver(options: { home?: string; now?: () => number } = 
     const path = join(directory, 'ledger.json');
     const info = await load(() => lstat(path));
     if (!info || !info.isFile() || info.isSymbolicLink() || info.size > MAX_FILE_BYTES) return null;
-    const raw: unknown = await load(async () => JSON.parse(await readFile(path, 'utf8')));
+    // A missing file is absence; its contents are read and parsed separately so
+    // a ledger holding JSON null stays a malformed ledger rather than absence.
+    const text = await load(async () => readFile(path, 'utf8'));
+    if (text === null) return null;
+    const raw: unknown = await load(async () => JSON.parse(text));
     if (raw && typeof raw === 'object' && !Array.isArray(raw) && Object.keys(raw).length === 0)
       // Launches from earlier releases recorded no preparation time; the
       // placeholder is written then and never touched until the observer writes.
       return { ledger: null, directory, preparedAt: manifest.preparedAt ?? info.mtimeMs };
-    const ledger = raw === null ? null : await load(async () => LedgerSchema.parse(raw));
+    const ledger = await load(async () => LedgerSchema.parse(raw));
     if (!ledger || ledger.launchId !== manifest.launchId || ledger.closed ||
         now() < ledger.updatedAt - CLOCK_STEP_TOLERANCE_MS || now() - ledger.updatedAt > 60_000) return null;
     const cache = await cacheWindow(ledger.cacheRequest, ledger.transcriptPath,
