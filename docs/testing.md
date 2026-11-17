@@ -43,8 +43,6 @@ Use `--suite interrupted|recovery|hooks|browser|restart` to narrow a run and `--
 
 On a heavily loaded machine, `--minimal-builtins` omits the released server's list of unrelated bundled provider/usage plugins through a test-only module loader. It does not replace the server, plugin runtime, native Claude, or web UI. The report explicitly records this mode and the loader hash. Results in this mode do not establish coexistence with the complete default bundled-plugin set; keep stock-default results separate.
 
-2026-11-03 targeted results on Linux/WSL, Paseo 0.15.0-beta.1 and native Claude 2.1.306: the final stock-default interrupted-compaction suite passed 2/2, and the stock-default Chromium reconnect suite passed 2/2. A separately installed probe received the new lifecycle hooks, and a completed request survived restart without another model request. The forced-interruption case waited out the real 180-second observation deadline and ended unknown, with no extra compact delivery. Reconnect was tested without a page reload. These are targeted checks, not a complete beta release matrix; the separately failing graceful ordinary automatic-recovery diagnostic remains documented above.
-
 ## Covered behavior
 
 | Area | Check |
@@ -80,9 +78,7 @@ This does not measure Anthropic's real cache lifetime, billing savings or summar
 
 `npm run test:e2e` installs the released plugin from GitHub with the real `paseo` CLI, updates it to the ref under test, runs every scenario above against that install, then rolls back and forward again. It runs unchanged on Linux and Windows. See [tests/e2e/README.md](https://github.com/babo-jeonguk/paseo-auto-compact-for-claude/blob/main/tests/e2e/README.md).
 
-On 2026-10-29, at `1a6ceb4` (product code as `6927f9d`), it passed **24/24 on each of four runs**: Linux x64 (WSL2, Node 24.21.0) and Windows 11 build 26100 (Node 24.22.1, MinGit 2.56.0), each with Paseo 0.12.0 and 0.13.0 and Claude Code 2.1.306. Each run installed v1.0.2 (`6dfdb98`) and then this branch from GitHub, sent 39 synthetic model requests and no other connection, and had no plugin stderr. After the rollback, v1.0.2 read the state, kept the conversation OFF and showed both compacted activities as completed; updating again restored their history as `legacy` operations, without a model request. Two earlier rounds of these runs failed only on expectations in the new rollback checks, which were then corrected. The first round, at `48a354f` before the state stayed at version 1, also passed 24/24 on all four, with v1.0.2 refusing the state after rollback. On a heavily loaded Linux host, Paseo's own plugin start limit (about 40 seconds) was hit twice in earlier runs, by v1.0.2 and by this version alike; normal starts took 8–22 seconds there and 8–18 seconds on Windows.
-
-`npm run test:e2e:desktop` installs the ref under test from GitHub into the released Paseo desktop app, whose daemon runs the plugin on the app's Electron 44.2.0 runtime (Node 24.20.0); see [tests/e2e/README.md](https://github.com/babo-jeonguk/paseo-auto-compact-for-claude/blob/main/tests/e2e/README.md#desktop-app). It passed **9/9 on each of four runs** (Linux under Xvfb at `1a6ceb4`, Windows 11 at `6927f9d`, the same product code; desktop apps 0.12.0 and 0.13.0), with no plugin stderr and no app update downloaded, as it had at `48a354f`. Earlier runs on the loaded host showed the app's own "local server failed to start" screen once or twice per run, and one Retry each time recovered it; the final runs showed none. Those runs also found that closing the window stops the desktop daemon by default, which the plugin then recovers from, and that a tick in flight at plugin cleanup logged "Daemon client closed"; the plugin no longer reports errors after its cleanup starts.
+`npm run test:e2e:desktop` installs the ref under test from GitHub into the released Paseo desktop app, whose daemon runs the plugin on the app's Electron 44.2.0 runtime (Node 24.20.0); see [tests/e2e/README.md](https://github.com/babo-jeonguk/paseo-auto-compact-for-claude/blob/main/tests/e2e/README.md#desktop-app). Closing the window stops the desktop daemon by default; the plugin recovers when it starts again.
 
 `npm run test:e2e:android` runs the released Paseo **Android** app in a fresh Android 14 emulator, connected by direct connection to an isolated daemon with this branch installed from GitHub; see [tests/e2e/README.md](https://github.com/babo-jeonguk/paseo-auto-compact-for-claude/blob/main/tests/e2e/README.md#android-app). Paseo sends the plugin's client bundle to the app, so its pill, sheet, confirmation and polling run natively on Hermes, including the operation-ID fallback browsers never take. With the 0.12.0 and 0.13.0 APKs it passed **8/8 each** at `1a6ceb4`, as it had at `0d0ab31`: Skip and Undo, a confirmed Compact now whose operation ID the device generated (one model request), the last result in the sheet, and the same result after force-stopping and reopening the app, with no plugin stderr. Building it found two app behaviors the harness now handles: a selected conversation takes about ten seconds to show its pill on the emulator, and Paseo 0.12 briefly restores the last conversation after a restart before moving to a new chat. On a heavily loaded host the emulator's own watchdog stopped it twice ("detected a hanging thread"); those runs did not reach the plugin. At `1a6ceb4`, one 0.12.0 run at load average 12–16 timed out waiting for the pill, which its final screenshot shows rendered; the rerun at lower load passed.
 
@@ -112,8 +108,6 @@ node --no-maglev tests/simulation/lifecycle.mjs cleanup
 ```
 
 `reload` verifies that Compact now sends nothing after a plugin reload until an ordinary message reopens the observer, and then succeeds once. `automatic` applies the same assertion to a real one-minute reservation and normal scheduler tick. `cleanup` runs Paseo 0.14's installed idle collector with only its clock and sweep interval accelerated, then verifies closure, reservation invalidation and ordinary-message resume. It does not establish the real one-hour wait, successful compaction before cleanup, input/background-work vetoes, or a cleanup/dispatch race. These diagnostics use native Claude and the loopback model, need localhost binding, and are not part of the cross-platform CI matrix.
-
-See the pinned [upstream change review](research/paseo-0.14.0-upstream-changes-2026-10-29.md), [project impact and patch rationale](research/paseo-0.14.0-project-impact-2026-10-29.md), and [lifecycle reproduction evidence](research/paseo-0.14.0-lifecycle-reproduction-2026-10-29.md).
 
 ## Reports and failure handling
 
@@ -151,130 +145,3 @@ To change a tested Claude/Paseo version, edit its exact alias in `tests/simulati
 For one native version, run `npm run test:snapshot -- --suite simulation --paseo 0.13.0`. Reports include the full commit SHA in `snapshot.json` and native `report.json`, under `test-results/snapshots/<sha>-<timestamp>/`. Source edits and later pushes do not change that run. Root and simulation dependencies must be installed for the chosen lockfiles. See [development workflow](development.md#packaging-and-releases) for prerequisites and cleanup.
 
 CI separates native versions into independent Linux/Windows jobs and artifacts. An open PR no longer also starts a feature-branch push workflow; a new PR commit cancels its superseded PR run. Manual dispatch can select a feature branch if it needs validation before a PR exists. Actual automatic-timer and downtime waits remain in each native lane. No retry turns an assertion failure into a pass.
-
-## Validation checkpoint — 2026-10-28
-
-The seven-day retention implementation passed `npm run check` (127 tests, TypeScript and embedded-observer consistency). GPT-6.1 Terra ran the expanded native suite on Linux x64 with Node 24.21.0 and Claude Code 2.1.306: Paseo 0.12.0 and 0.13.0 each passed all 18 scenarios. Both versions also passed four web UI checks in Chromium 149: Skip, Undo, confirmed manual compact, and completed-result display after conversation reload. The reports' product and harness fingerprints match the validated checkout.
-
-The expanded retention check exposed loss of native activity identity after compaction. The gateway now preserves the matching compaction revision without recreating an ordinary scheduling window; a fresh request after history cleanup returns the existing-activity guard and sends nothing.
-
-Windows native execution was not available in this environment: WSL interop failed with `UtilBindVsockAnyPort:317: socket failed 1`. Windows CI execution, Electron/mobile rendering and live Anthropic behavior are not established by these results.
-
-## Validation checkpoint — 2026-10-29
-
-After a review, `6927f9d` removed the root causes it found. Outcomes now separate faults from refusals and record whether anything was sent. Job attempt fields are derived from operations. The automatic policy is shared. Client IDs follow input. Migration is tested against a state file generated by v1.0.2's own code. The state stays at version 1, so rollback works. `npm run check` passed 135 tests. The native suite passed 18/18 on Linux with Paseo 0.12.0 and 0.13.0. The Chromium web UI checks passed 4/4 on both versions. The install/upgrade/rollback, desktop and Android E2E results are recorded above. CI passed on Linux, macOS and Windows. Sonnet 5.5 subagents ran every suite.
-
-## Paseo 0.14 validation checkpoint — 2026-10-29
-
-The initial SDK 0.12.0, 0.13.0 and 0.14.0 lanes each passed `npm run check` with 136 tests. At compatibility checkpoint `abdbb2f`, 146 tests passed on all three SDKs across Linux, macOS and Windows CI; workflow runs `40934131828` and `40934141757` also passed the 18/18 native matrix on Linux and Windows for every version with Claude Code 2.1.306. The Linux native matrix had passed 18/18 locally as well. GPT-6.1 Terra (High) reproduced the 0.14 reload evidence split before the fix, then passed the focused manual reload, automatic due-dispatch and accelerated idle-cleanup scenarios after the fix. The reload guards sent no `/compact` until an ordinary message installed the new observer; cleanup invalidated the old reservation and resumed with a fresh one. macOS native execution remains unverified. Subsequent commits must rely on their own PR checks rather than this pinned checkpoint.
-
-## Validation checkpoint — 2026-10-30
-
-A second review led to `6d45a44`:
-- Deadlines now follow the phase: send-by, then observation from the dispatch marker.
-- Unreadable observers or settings are faults, not readings.
-- Every pre-send read is bounded.
-- Identity, schemas, translations, notices and E2E helpers each live in one place.
-
-`996f8c6` fixed how the desktop E2E counted startup retries.
-
-Results:
-- `npm run check`: 144 tests passed. The gateway tests passed five runs in a row at load average 19–23, where they had failed intermittently before.
-- Linux, Paseo 0.12.0 and 0.13.0:
-  - native suite 18/18;
-  - Chromium web UI 4/4;
-  - install/upgrade/rollback E2E 24/24;
-  - desktop E2E 9/9.
-- Windows 11, both versions:
-  - install/upgrade/rollback E2E 24/24;
-  - desktop E2E 9/9.
-- Android 14 with the 0.12.0 and 0.13.0 APKs: 8/8.
-
-Reruns, none of them plugin assertions:
-- Under load average about 25, three earlier runs timed out on daemon readiness and one on plugin init. The first native run and the first Windows install/upgrade runs were among them.
-- The Windows desktop runs failed until the retry fix. They passed at `996f8c6` with no startup retries.
-- One Android 0.12.0 attempt stalled during an emulator cold boot that dismissed 18 ANR dialogs.
-
-Sonnet 5.5 subagents ran every suite.
-
-## Validation checkpoint — 2026-10-30, after the third and fourth reviews
-
-The third review led to `343cfa5`. It classifies an error before the dispatch marker in one place, bounds retries by the send deadline alone, and admits a compaction natively until its observation can end. It also stops a stopped scheduler from writing, and makes unreadable settings keep a reservation. `9c74f9f` gave Compact now a 10-second send deadline. `e7b8d70` logs the host being unavailable only if the plugin is still running 30 seconds later. The Paseo 0.14 support from PR #3 was merged in between. The fourth review then led to `70cb123` and `2c27f50`:
-- Whether a session must resume after a plugin reload is part of the observed conversation, read everywhere from there.
-- When nothing was sent, the reason is shown.
-- Only the fault that ends a request is logged.
-- Finished operations retire their native request.
-- Compact now answers an activity's history before its live checks.
-
-Results at `2c27f50` unless noted:
-- `npm run check`: 161 tests passed.
-- Linux, Paseo 0.14.0, 0.13.0 and 0.12.0:
-  - native suite 18/18;
-  - Chromium web UI 4/4;
-  - install/upgrade/rollback E2E 24/24;
-  - desktop E2E 9/9.
-- Linux, Paseo 0.14 lifecycle: `reload`, `automatic` and `cleanup` passed. Right after a plugin reload, Compact now was refused with the resume reason and sent nothing. After an ordinary message, it compacted once.
-- Windows 11, all three versions:
-  - install/upgrade/rollback E2E 24/24;
-  - desktop E2E 9/9 at `70cb123`.
-- Android 14 with the 0.14.0, 0.13.0 and 0.12.0 APKs: 8/8 at `70cb123`.
-
-`2c27f50` only reorders Compact now's checks, which the desktop and Android flows do not reach.
-
-On Paseo 0.14 the install E2E updates the plugin, which reloads it. The reservation made before the update is then held as `blocked` until an ordinary message resumes the session, and that message earns a new reservation. At `70cb123` the Windows 0.14 install E2E failed there: a second Compact now of an already compacted activity returned the resume refusal instead of the existing outcome. `2c27f50` fixed it.
-
-At `e7b8d70` the 0.12.0 desktop E2E no longer logged an error on app quit, which it had done twice in a row at `343cfa5`.
-
-Reruns, none of them plugin assertions: one Android 0.12.0 run, after host load from other projects reached 89 while it ran.
-
-Sonnet 5.5 subagents ran every suite.
-
-A fifth review found that an error after the dispatch marker, written in the same pass, was classified from the copy taken at claim. Past the send deadline, that could settle possibly sent work as `expired_before_dispatch`. `bd30a13` classifies it on the stored record. The same commit lets the session row carry `resumeRequired`, so the controls no longer match a server string. At `bd30a13`:
-- `npm run check`: 162 tests passed.
-- Linux:
-  - native suite 18/18 on 0.14.0, 0.13.0 and 0.12.0;
-  - the 0.14 lifecycle `reload`, `automatic` and `cleanup` scenarios passed;
-  - 0.14.0 web UI 4/4, install/upgrade/rollback E2E 24/24 and desktop E2E 9/9.
-- Windows 11: 0.14.0 install/upgrade/rollback E2E 24/24.
-- Android 14: 0.14.0 APK 8/8.
-
-Every first failure before a rerun was a readiness or reply timeout, not a plugin assertion. Load from other projects and a concurrent emulator reached 25–50 during three install E2E attempts, which timed out waiting for native replies in different scenarios. The run passed once load fell. Two Android attempts ran next to the desktop suite and lost the emulator to its watchdog or a boot timeout. One more attempt timed out behind a System UI ANR dialog. Run alone, the Android test passed.
-
-
-## Compatibility validation — Paseo 0.15.0 stable
-
-The Paseo 0.15 compatibility change keeps the manifest minimum at Paseo 0.12.0 and the development SDK at 0.12.0. The shared lifecycle handlers use addHook when the host exposes it and the legacy registration otherwise; each handler is registered once. No scheduler, compaction receipt, retry policy, or observer changes are required by this migration.
-
-Linux/WSL validation on 2026-11-03:
-- SDK 0.12.0, 0.13.0, 0.14.0, 0.15.0-beta.1 and 0.15.0: 171 checks passed per SDK.
-- Native Claude 2.1.306 with stock Paseo 0.12.0, 0.13.0, 0.14.0, 0.15.0-beta.1 and 0.15.0: 18/18 scenarios passed per version.
-- Stable 0.15.0 interruption checks: 2/2 passed, including the real 180-second observation deadline after forced termination.
-- Stable 0.15.0 Chromium reconnect checks: 2/2 passed without reloading the page.
-
-Stable 0.15.0 makes agent restart recovery opt-in. The focused interruption tests explicitly enable it; the normal native suite uses the stock default. Normal native shutdown still cleared the recovery candidate in the tested case, so that branch resumed with a new user message. Both paths preserved honest unknown results and did not replay compaction. This host behavior is separate from the registration migration.
-
-Only model replies are synthetic. [CI at f7b3a8c](https://github.com/babo-jeonguk/paseo-auto-compact-for-claude/actions/runs/41645166534) passed all 20 jobs: SDK checks on Linux/macOS/Windows and 18/18 native scenarios on Linux/Windows for each stable Paseo version from 0.12.0 through 0.15.0. Windows fixtures preserve PowerShell's module search path so terminal-worker identity inspection can finish within Paseo's readiness limit. macOS native execution and the iOS app remain unverified.
-
-## Concurrent-conversation validation — 2026-11-12
-
-The per-conversation change passed the native suite **19/19** on Linux/WSL x64 (WSL2 kernel 6.18.58.1) with Node 24.21.0 and native Claude Code 2.1.306 for stock Paseo **0.15.0, 0.12.0, 0.13.0 and 0.14.0**. Every version passed on its first attempt; no scenario was rerun. The new *Concurrent conversations* scenario held one conversation's `/compact` model request and completed a second conversation's compaction while the first was still observing, then checked that a further request for the first conversation returned its existing operation without another model request. Each conversation produced exactly one completed boundary and receipt under its own operation ID and kept its native session.
-
-A rollback probe running the **v1.1.1** source (`bafdfde`) seeded one `observing` operation with its dispatch marker, one requested manual operation and one requested automatic operation from different conversations, with their jobs. v1.1.1's store accepted the state. Its serial worker never sent the observing operation, sent each requested conversation at most once, and sent nothing again after the deadlines passed.
-
-## Paseo 0.16 validation
-
-Validated on 2026-11-16 on Linux/WSL2 with Node 24.21.0, native Claude Code 2.1.306 and stock Paseo **0.16.0**, with Paseo **0.12.0** as the control, on top of the per-conversation compaction change. Only model replies were synthetic. Each run used its own temporary home, Claude configuration, workspace and ports; no real Paseo or Claude data was touched. An earlier pass on 2026-11-11 used 0.16.0-beta.1 with 0.15.0 as the control.
-
-The development SDK remains 0.12.0. The 0.16 SDK types make `metadata` and `background` required on hook agents and session-open requests, so the four test fixtures gained `metadata: {}` and `background: false`; 0.12–0.15 accept both, and no product code depends on them. `npm run check` passed **267 tests** on SDK 0.12.0 and on copied lanes pinned to `@getpaseo/client`, `@getpaseo/plugin` and `@getpaseo/protocol` 0.15.0 and 0.16.0. Paseo 0.16.0 also removes the always-empty `agent.turn.after.timeline` field; the plugin never read it.
-
-The native suite has **20 scenarios**. All 20 passed on stock Paseo 0.16.0 and on 0.12.0. The background-shell scenario starts a 20-second background shell, compacts explicitly while it runs, waits for the native completion notification, and checks the observer ledger, the new reservation and the absence of a second `/compact`. On 0.16.0 the interrupted-compaction suite passed **2/2** (graceful and forced), the lifecycle `reload`, `automatic` and `cleanup` scenarios passed, and the Chromium web UI checks passed **4/4**. Like 0.14 and 0.15, Paseo 0.16 defers reopening a session after a plugin reload, and the plugin blocks compaction until a message resumes it.
-
-`npm run test:e2e -- --paseo 0.16.0` passed **26/26**: v1.0.2 installed from GitHub ran on 0.16.0, the update to this branch, the native scenarios against that install, rollback and update again all passed. `npm run test:e2e:desktop -- --paseo 0.16.0` passed **9/9** on the 0.16.0 Linux desktop app (Electron 44.2.0, Node 24.20.0) under Xvfb. That app opens a first-run setup dialog over a fresh profile and shows no UI from a plugin installed through the CLI until its window reloads, so the desktop check skips the setup and reloads the window after installing. The E2E check now starts from the latest release by default: from v1.1.1 it passed **26/26** on Paseo 0.16.0 and on 0.12.0, keeping the operations v1.1.1 recorded through update, rollback and update again; from v1.0.2 it still passed 26/26 on 0.16.0.
-
-Paseo 0.16.0 is part of the default `matrix.mjs` matrix and CI (`npm run test:simulation:0.16`, alias `@getpaseo/cli-0-16-stable`). `npm run test:simulation:0.16-beta` still runs 0.16.0-beta.1 locally.
-
-Paseo 0.16.0 replaces Settings → Plugins with a plugin gallery. A Chromium probe on 0.16.0 found no per-row **Settings** button: selecting the plugin row opens its detail page, which renders this plugin's settings directly. The composer pill's **Settings** action still opens that page. Installing from a Git source moved to **More plugin actions → Install from source**, whose field is still named **Plugin source**, and the global switch moved to **Turn off plugins** in the same menu.
-
-Two policy points are specific to 0.16. First, an agent created with `background: true` is hidden from normal conversation lists, and it is not an Auto Compact target. The server gateway and the composer-pill reconciliation both treat `background === true` as ineligible, alongside the existing `internal` and `paseo.parent-agent-id` exclusions; a missing or false value behaves as before, so 0.12–0.15 hosts are unchanged. A reservation made before such an agent becomes hidden is skipped by the existing ineligible handling and never dispatched. Unit tests cover both the eligibility rule and the scheduled-then-ineligible path; the client reconciliation has no separate unit harness. A daemon probe found the hidden agent absent from `auto-compact.list`, `auto-compact.session` and the stored jobs, with no `/compact` and no model request after waiting past the one-minute idle delay, while a visible agent in the same daemon was still scheduled.
-
-Second, compaction may proceed while background work runs. The new native scenario confirms that the shell is not stopped, that Claude Code delivers its completion as a new turn after the compaction boundary, that the reply appears on the timeline, that no pending input or active turn remains in the observer ledger, and that the new activity earns a reservation without resending compaction. Paseo 0.16 also restores automatic recovery after a graceful daemon shutdown: the stored agent keeps `resumeOnStartup: true`. An interrupted compaction still settles `unknown`, does not treat the recovery reply as compact success and does not resend `/compact`.
