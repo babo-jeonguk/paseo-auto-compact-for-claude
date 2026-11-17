@@ -14,7 +14,7 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test --test-isolation=none server/*.test.ts tests/*.test.mjs",
+    "test": "node --import tsx --test --test-isolation=none server/*.test.ts scripts/*.test.ts tests/*.test.mjs",
     "check": "npm run check:observer && npm run typecheck && npm test",
     "prepack": "npm run build:observer && npm run check",
     "build:observer": "node scripts/build-observer.mjs",
@@ -62,6 +62,7 @@
     "docs",
     "THIRD_PARTY_NOTICES.md",
     "!**/*.test.ts",
+    "!scripts/*paseo-release.ts",
     "!tests"
   ]
 }

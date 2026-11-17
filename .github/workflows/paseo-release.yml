@@ -1,0 +1,33 @@
+name: Paseo release
+
+# Daily check for a new Paseo line on npm: its first beta or release opens one issue, later betas
+# and its release comment on it. Patch releases are ignored. See scripts/paseo-release.ts.
+on:
+  schedule:
+    # Every day at 18:00 KST; GitHub may start it late.
+    - cron: '0 9 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+# A manual run and a scheduled one never post at the same time.
+concurrency:
+  group: paseo-release
+
+jobs:
+  watch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - name: Announce new Paseo releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node --import tsx scripts/watch-paseo-release.ts
