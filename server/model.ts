@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { CompactOperationSchema, StatusSchema, type CompactTarget, type Row } from "../shared/rpc";
+import { CompactOperationSchema, StatusSchema, type Blocked, type CompactTarget, type Row } from "../shared/rpc";
 import type { CacheWindow } from './cache';
 
 export type Status = Row["status"];
@@ -33,6 +33,9 @@ export const JobSchema = z.object({
   endedAt: z.number().finite(),
   status: StatusSchema,
   detail: z.string(),
+  // The BlockedReason of a blocked reservation, read as a plain string so a
+  // code from a newer release still reads after a rollback (knownBlockedReason).
+  blockedReason: z.string().optional(),
   attemptedAt: z.number().finite().optional(),
   operationId: z.string().optional(),
   skip: z.object({ id: z.string().min(1), dueAt: z.number().finite(), sessionId: z.string().min(1) }).optional(),
@@ -126,7 +129,7 @@ export interface Gateway {
     execution?: ExecutionContext
   ): Promise<CompactOutcome>;
   /** Automatic dispatch observes native activity; TTL may use the disclosed default. */
-  readiness?: (expected: Observation, dueAt?: number) => Promise<string | null>;
+  readiness?: (expected: Observation, dueAt?: number) => Promise<Blocked | null>;
   automatic?: (
     expected: Observation,
     guard?: DispatchGuard,

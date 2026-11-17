@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { bounded, INSPECT_TIMEOUT_MS, SEND_DEADLINE_MS } from "./deadline";
 import type { Settings } from "../shared/settings";
-import { operationPending, operationRowStatus, SESSION_RESUME_REQUIRED, type CompactTarget, type Row } from "../shared/rpc";
+import { knownBlockedReason, operationPending, operationRowStatus, SESSION_RESUME_REQUIRED, type Blocked, type BlockedReason,
+  type CompactTarget, type Row } from "../shared/rpc";
 import { targetOf, unchanged, type Gateway, type Job, type Observation, type State, type StateStore,
   type StoredOperation } from "./model";
 import { createOperationWorker, recoverOperations, inputFingerprint, mayHaveSent,
@@ -23,8 +24,11 @@ const pendingOf = (state: State, agentId: string) =>
 // the same one after host I/O.
 type Candidate = Pick<Job, "agentId" | "revision" | "endedAt"> & {
   activityKey: string | null; sessionId: string | null };
-type ReservationOutcome = { kind: "expired" | "skipped" | "blocked"; detail: string } |
+type ReservationOutcome = { kind: "expired" | "skipped"; detail: string } |
+  { kind: "blocked"; detail: string; reason: BlockedReason } |
   { kind: "reserve"; agent: Observation; config: Settings };
+// Readings that say nothing yet about the session: a reservation stays as it is.
+const TRANSIENT: readonly BlockedReason[] = ["observer_starting", "observer_unreadable"];
 type Decision = { candidate: Candidate; outcome: ReservationOutcome };
 
 export const FULL_SCAN_INTERVAL_MS = 60_000;
@@ -311,6 +315,8 @@ export function createScheduler(options: {
     const enabled = !state.disabled.includes(agent.agentId);
     let status: Row["status"] = "blocked";
     let detail = "Waiting for an observed ordinary turn to finish";
+    let reason: BlockedReason | undefined = "waiting_for_turn";
+    const block = (blocked: Blocked) => { status = "blocked"; detail = blocked.detail; reason = blocked.reason; };
     if (
       job &&
       (job.revision === agent.revision ||
@@ -319,6 +325,7 @@ export function createScheduler(options: {
     ) {
       status = job.status;
       detail = job.detail;
+      reason = knownBlockedReason(job.blockedReason);
     }
     if (
       status === "scheduled" ||
@@ -327,11 +334,9 @@ export function createScheduler(options: {
       status === "busy"
     ) {
       if (!config) {
-        status = "blocked";
-        detail = "Settings unreadable";
+        block({ reason: "settings_unreadable", detail: "Settings unreadable" });
       } else if (agent.tokens === null) {
-        status = "blocked";
-        detail = "Context usage unknown; no compaction will be sent";
+        block({ reason: "context_usage_unknown", detail: "Context usage unknown; no compaction will be sent" });
       } else if (
         !config.enabled ||
         !enabled ||
@@ -343,20 +348,15 @@ export function createScheduler(options: {
         status = "busy";
         detail = "Session running or waiting for permission";
       } else if (!gateway.automatic) {
-        status = "blocked";
-        detail = "A Claude observer is required for automatic compaction";
+        block({ reason: "observer_not_supported", detail: "A Claude observer is required for automatic compaction" });
       } else if (agent.resumeRequired) {
-        status = "blocked";
-        detail = SESSION_RESUME_REQUIRED;
+        block({ reason: "resume_required", detail: SESSION_RESUME_REQUIRED });
       } else if (gateway.readiness) {
         const blocked = await bounded(gateway.readiness(
           agent,
           job && config ? due(job, config) : undefined
         ), INSPECT_TIMEOUT_MS);
-        if (blocked) {
-          status = "blocked";
-          detail = blocked;
-        }
+        if (blocked) block(blocked);
       }
     }
     if (!agent.idle && status !== "running") {
@@ -389,6 +389,7 @@ export function createScheduler(options: {
           : null,
       status,
       detail,
+      ...(status === "blocked" && reason ? { blockedReason: reason } : {}),
       operationId: activeOperation?.id ?? job?.operationId ?? null,
     };
   }
@@ -468,16 +469,18 @@ export function createScheduler(options: {
             detail: "Session changed or no longer eligible" } };
         }
         if (!gateway.automatic) {
-          return { candidate, outcome: { kind: "blocked",
+          return { candidate, outcome: { kind: "blocked", reason: "observer_not_supported",
             detail: "Claude observer unavailable; nothing sent" } };
         }
         if (agent.resumeRequired) {
-          return { candidate, outcome: { kind: "blocked", detail: SESSION_RESUME_REQUIRED } };
+          return { candidate, outcome: { kind: "blocked", reason: "resume_required", detail: SESSION_RESUME_REQUIRED } };
         }
         const blocked = gateway.readiness
           ? await bounded(gateway.readiness(agent, dueAt(candidate.endedAt, phaseConfig)), INSPECT_TIMEOUT_MS)
           : null;
-        if (blocked) return { candidate, outcome: { kind: "blocked", detail: blocked } };
+        // Like an unreadable observation above: not a change, so keep the reservation.
+        if (blocked && TRANSIENT.includes(blocked.reason)) return null;
+        if (blocked) return { candidate, outcome: { kind: "blocked", ...blocked } };
         // Settings can change while native observation/host refresh awaits I/O.
         // Unreadable settings are not a change either: keep the reservation.
         const latest = await settings();
@@ -488,7 +491,7 @@ export function createScheduler(options: {
           return { candidate, outcome: { kind: "expired", detail: LATE_DURING_INSPECTION } };
         }
         if (block) {
-          return { candidate, outcome: { kind: "blocked", detail: POLICY_CHANGED } };
+          return { candidate, outcome: { kind: "blocked", reason: "policy_changed", detail: POLICY_CHANGED } };
         }
         return { candidate, outcome: { kind: "reserve", agent, config: latest } };
       } catch (error) {
@@ -514,6 +517,8 @@ export function createScheduler(options: {
         if (outcome.kind !== "reserve") {
           job.status = outcome.kind;
           job.detail = outcome.detail;
+          if (outcome.kind === "blocked") job.blockedReason = outcome.reason;
+          else delete job.blockedReason;
           changed = true;
         } else if (!pendingOf(state, job.agentId)) {
           // A toggle or a closed delivery window during inspection wins.
@@ -522,6 +527,8 @@ export function createScheduler(options: {
           if (block) {
             job.status = block === "late" ? "expired" : "blocked";
             job.detail = block === "late" ? LATE_DURING_INSPECTION : POLICY_CHANGED;
+            if (block === "late") delete job.blockedReason;
+            else job.blockedReason = "policy_changed";
             changed = true;
           } else {
             // Automatic work never repeats an activity, even one whose attempt sent nothing.

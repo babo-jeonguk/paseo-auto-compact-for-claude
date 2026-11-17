@@ -101,13 +101,21 @@ export function sessionPresentation(row: Row, settings: Settings, now: number): 
       return on("Waiting for pending input to finish before checking the schedule.");
     return on("A new schedule will be checked after the current reply finishes.");
   }
-  if (row.status === "blocked") {
-    if (/settings/i.test(row.detail))
+  // Chosen by the reason code alone: `detail` is the server's wording and may
+  // change. A row without a code, from an older server, gets the generic text.
+  if (row.status === "blocked") switch (row.blockedReason) {
+    case "settings_unreadable":
       return check("Compact settings could not be read. Open Settings to check them.");
-    if (/observer/i.test(row.detail))
+    case "observer_missing":
+      return check("Automatic compaction is unavailable in this session. Reopen the conversation session with a Claude executable and settings that can load the observer.");
+    case "observer_not_supported":
       return check("Automatic compaction is unavailable in this session. Reopen the conversation session.");
-    if (/exceeds|outside.*cache|delay.*cache/i.test(row.detail))
+    case "idle_delay_exceeds_cache":
       return check("The idle delay is too long to compact within the available time. Choose a shorter delay in Settings.");
+    case "observer_starting":
+      return on("Automatic compaction is starting in this session. Waiting for the next reply to finish before checking the schedule.");
+    case "observer_unreadable":
+      return on("Waiting to read this session’s activity before checking the schedule.");
   }
   if (row.tokens === null)
     return on("Waiting for context usage before checking the schedule.");
@@ -127,8 +135,6 @@ export function sessionPresentation(row: Row, settings: Settings, now: number): 
     return on("Checking whether the scheduled compaction can start.");
   if (row.status === "skipped" && canUndoSkip(row, now))
     return on("This schedule was skipped. Undo skip to restore it, or continue the conversation to schedule again.");
-  if (row.status === "blocked" && /connection|launch/i.test(row.detail))
-    return on("Waiting for the conversation to connect before checking the schedule.");
   return on("A new schedule will be checked after the next reply finishes.");
 }
 

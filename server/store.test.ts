@@ -311,3 +311,22 @@ test("a read error clears a snapshot that a concurrent read cached, so the next 
   replies[2].settle();
   await assert.rejects(third, /unreadable/);
 });
+
+test("a blocked reservation reads back with its reason code; records without one, or from a rollback, still load", async () => {
+  const root = await mkdtemp(join(tmpdir(), "compact-blocked-"));
+  try {
+    const path = join(root, "state.json");
+    const job = (agentId: string, blockedReason?: string) => ({ agentId, revision: "rev", endedAt: 10,
+      status: "blocked" as const, detail: "Claude observer unavailable", ...(blockedReason ? { blockedReason } : {}) });
+    // Written before codes existed, and by a later release that added a code.
+    await writeFile(path, JSON.stringify({ version: 1, disabled: [], operations: [],
+      jobs: [job("old"), job("newer", "added_later")] }));
+    const loaded = await createStore(path).read();
+    assert.deepEqual(loaded.jobs.map(entry => entry.blockedReason), [undefined, "added_later"]);
+    loaded.jobs.push(job("current", "observer_missing"));
+    await createStore(path).write(loaded);
+    assert.equal((await createStore(path).read()).jobs[2].blockedReason, "observer_missing");
+    // A rollback drops the code and keeps the reservation.
+    assert.equal(V102StateSchema.parse(JSON.parse(await readFile(path, "utf8"))).jobs.length, 3);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});

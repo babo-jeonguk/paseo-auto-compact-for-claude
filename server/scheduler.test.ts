@@ -7,6 +7,7 @@ import {
 } from "../shared/settings";
 import { createScheduler } from "./scheduler";
 import { DELIVERY_WINDOW_MS } from "./policy";
+import type { Blocked } from "../shared/rpc";
 import { Refusal, type Gateway, type Observation, type State, type StateStore } from "./model";
 
 function fixture(automatic = true) {
@@ -860,8 +861,8 @@ test("unreadable settings and stopped plugin never send", async () => {
 
 test("a known short TTL or expired cache prevents automatic dispatch", async () => {
   const f = fixture();
-  let blocked: string | null =
-    "Idle delay exceeds the 5-minute cache window (transcript)";
+  let blocked: Blocked | null = { reason: "idle_delay_exceeds_cache",
+    detail: "Idle delay exceeds the 5-minute cache window (transcript)" };
   f.gateway.readiness = async () => blocked;
   const scheduler = f.make();
   await scheduler.ready;
@@ -870,7 +871,7 @@ test("a known short TTL or expired cache prevents automatic dispatch", async () 
   await scheduler.tick();
   assert.equal(f.calls, 0);
   assert.equal(f.state.jobs[0].attemptedAt, undefined);
-  assert.equal((await scheduler.list())[0].detail, blocked);
+  assert.equal((await scheduler.list())[0].detail, blocked.detail);
   blocked = null;
   await scheduler.tick();
   assert.equal(f.calls, 1);
@@ -2194,4 +2195,72 @@ test("a scan that sees a busy conversation fences an older status read's finishe
   releaseRead();
   await status;
   assert.deepEqual(reserved(f), [], "the newer read wins: no reservation for the old reply");
+});
+
+test("every blocked row the scheduler builds carries its reason code; other rows carry none", async () => {
+  const f = fixture(), s = f.make(); await s.ready;
+  const row = async () => (await s.session("a"))!;
+  assert.deepEqual([(await row()).status, (await row()).blockedReason], ["blocked", "waiting_for_turn"]);
+  await s.observedTurn(f.agents[0]);
+  assert.deepEqual([(await row()).status, (await row()).blockedReason], ["scheduled", undefined]);
+  f.config = null;
+  assert.equal((await row()).blockedReason, "settings_unreadable");
+  f.config = { ...DEFAULT_SETTINGS };
+  f.agents[0].tokens = null;
+  assert.equal((await row()).blockedReason, "context_usage_unknown");
+  f.agents[0].tokens = 210_000;
+  f.agents[0].resumeRequired = true;
+  assert.equal((await row()).blockedReason, "resume_required");
+  delete f.agents[0].resumeRequired;
+  for (const reason of ["observer_starting", "observer_missing", "observer_unreadable", "claude_working",
+    "waiting_for_reply", "cache_window_passed", "idle_delay_exceeds_cache"] as const) {
+    f.gateway.readiness = async () => ({ reason, detail: "worded freely" });
+    assert.deepEqual([(await row()).status, (await row()).blockedReason], ["blocked", reason]);
+  }
+  f.gateway.readiness = async () => null;
+  f.agents[0].idle = false;
+  assert.deepEqual([(await row()).status, (await row()).blockedReason], ["busy", undefined]);
+
+  const stock = fixture(false), t = stock.make(); await t.ready;
+  await t.observedTurn(stock.agents[0]);
+  assert.equal((await t.session("a"))!.blockedReason, "observer_not_supported");
+});
+
+test("a starting or briefly unreadable observer keeps an automatic reservation untouched", async () => {
+  for (const reason of ["observer_starting", "observer_unreadable"] as const) {
+    const f = fixture(), s = f.make(); await s.ready;
+    await s.observedTurn(f.agents[0]);
+    f.advance(55 * 60_000);
+    f.gateway.readiness = async () => ({ reason, detail: "not yet" });
+    await s.tick();
+    assert.equal(f.state.jobs[0].status, "scheduled");
+    assert.equal(f.calls, 0);
+    f.gateway.readiness = async () => null;
+    await s.tick();
+    await waitForStatus(f, "completed");
+    assert.equal(f.calls, 1);
+  }
+});
+
+test("a blocked reservation stores its reason code with its detail and shows it from storage", async () => {
+  const f = fixture(), s = f.make(); await s.ready;
+  await s.observedTurn(f.agents[0]);
+  f.advance(55 * 60_000);
+  f.gateway.readiness = async () => ({ reason: "observer_missing", detail: "Claude observer unavailable" });
+  await s.tick();
+  assert.deepEqual([f.state.jobs[0].status, f.state.jobs[0].blockedReason], ["blocked", "observer_missing"]);
+  // A policy change found during inspection is stored with its own code.
+  f.gateway.readiness = async () => { f.config = { ...DEFAULT_SETTINGS, idleMinutes: 56 }; return null; };
+  await s.tick();
+  assert.deepEqual([f.state.jobs[0].status, f.state.jobs[0].blockedReason], ["blocked", "policy_changed"]);
+  f.config = { ...DEFAULT_SETTINGS };
+  f.gateway.readiness = async () => null;
+  const row = (await s.session("a"))!;
+  assert.deepEqual([row.status, row.detail, row.blockedReason],
+    ["blocked", "Automation policy or idle delay changed before dispatch", "policy_changed"]);
+  // A record from before codes, or with a code a later release added, shows no code.
+  for (const blockedReason of [undefined, "added_later"]) {
+    f.state.jobs[0].blockedReason = blockedReason;
+    assert.equal((await s.session("a"))!.blockedReason, undefined);
+  }
 });

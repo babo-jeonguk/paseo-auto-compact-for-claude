@@ -27,8 +27,8 @@ async function fixture() {
   const directory = join(parent, manifest.launchId);
   const ledger = { version: 1, launchId: manifest.launchId, generation: 'generation-1', sessionId: 'native-a',
     updatedAt: time, revision: 1, activeTurns: [] as string[], pendingInputs: 0,
-    ordinaryEndedAt: time, ordinaryRevision: 1, clockEpoch: 0, transcriptPath: join(home, 'native-a.jsonl'),
-    cacheRequest: { startedAt: time, model: 'claude-sonnet-4-6', policy: { ttl: null, source: 'default' } },
+    ordinaryEndedAt: time as number | null, ordinaryRevision: 1, clockEpoch: 0, transcriptPath: join(home, 'native-a.jsonl'),
+    cacheRequest: { startedAt: time, model: 'claude-sonnet-4-6', policy: { ttl: null, source: 'default' } } as object | null,
     compact: null as null | { id: string; revision: number; status: string }, closed: false };
   const save = () => writeFile(join(directory, 'ledger.json'), JSON.stringify(ledger));
   await writeFile(ledger.transcriptPath, JSON.stringify({ type: 'assistant', sessionId: 'native-a',
@@ -47,7 +47,7 @@ test('observer session preparation preserves provider environment and ignores hi
     assert.equal(f.prepared.env.OTHER, 'preserved');
     assert.equal((f.prepared as typeof f.request).title, 'Conversation');
     assert.deepEqual((f.prepared as typeof f.request).labels, { retained: 'yes' });
-    const launch = (await f.observer.read('a'))!.ledger.launchId;
+    const launch = (await f.observer.read('a'))!.ledger!.launchId;
     assert.equal(f.observer.startedHere('a', launch), true);
     assert.equal(createObserver({ home: f.home, now: () => 1_000_000 }).startedHere('a', launch), false,
       'a later plugin instance did not start this launch');
@@ -57,9 +57,9 @@ test('observer session preparation preserves provider environment and ignores hi
     const history = { ...f.request, purpose: 'history' as const };
     assert.equal(await f.observer.prepareSession(history, true), history);
     assert.equal(await f.observer.readiness(f.agent, 1_060_000), null);
-    assert.match((await f.observer.readiness(f.agent, 4_600_000))!, /exceeds/);
+    assert.match((await f.observer.readiness(f.agent, 4_600_000))!.detail, /exceeds/);
     f.advance(61_000);
-    assert.match((await f.observer.readiness(f.agent))!, /unavailable/);
+    assert.match((await f.observer.readiness(f.agent))!.detail, /unavailable/);
   } finally { await f.close(); }
 });
 
@@ -85,12 +85,12 @@ test('the compatible pre-fix observer stays readable during rollout; unknown bui
 test('observer rejects mismatched sessions, busy native work, default TTL fallback and changed generations', async () => {
   const f = await fixture();
   try {
-    assert.match((await f.observer.readiness({ ...f.agent, sessionId: 'other' }))!, /unavailable/);
+    assert.match((await f.observer.readiness({ ...f.agent, sessionId: 'other' }))!.detail, /unavailable/);
     f.ledger.activeTurns = ['background']; await f.save();
     await assert.rejects(f.observer.prepare(f.agent, true, 1_030_000), /still working/);
     f.ledger.activeTurns = []; f.ledger.transcriptPath = '/missing-transcript'; await f.save();
     assert.equal(await f.observer.readiness(f.agent, 1_000_000 + 55 * 60_000), null);
-    assert.equal((await f.observer.read('a'))?.ledger.cache?.source, 'default');
+    assert.equal((await f.observer.read('a'))?.ledger?.cache?.source, 'default');
     const manual = await f.observer.prepare(f.agent, false, 1_030_000);
     f.ledger.generation = 'reloaded'; await f.save();
     assert.equal((await f.observer.result('a', manual))?.status, 'unknown');
@@ -232,7 +232,14 @@ test('an observer that cannot be read is a fault, not an absent observer', async
     await writeFile(join(f.directory, 'ledger.json'), '{"version":1,');
     await assert.rejects(f.observer.read('a'), /could not be read/);
     await assert.rejects(f.observer.prepare(f.agent, false, Date.now() + 30_000, 'op-1'), /could not be read/);
-    assert.equal(await f.observer.readiness(f.agent), 'Claude observer status unavailable; retrying');
+    assert.deepEqual(await f.observer.readiness(f.agent),
+      { reason: 'observer_unreadable', detail: 'Claude observer status unavailable; retrying' });
+    // Content that parses but is not a ledger is malformed too, even JSON null.
+    await writeFile(join(f.directory, 'ledger.json'), 'null');
+    await assert.rejects(f.observer.read('a'), /could not be read/);
+    await assert.rejects(f.observer.prepare(f.agent, false, Date.now() + 30_000, 'op-1'),
+      (error: Error) => error.constructor.name !== 'Refusal' && /could not be read/.test(error.message));
+    assert.equal((await f.observer.readiness(f.agent))?.reason, 'observer_unreadable');
     // A genuinely missing or stale observer is absence, and a refusal at dispatch.
     await f.save();
     f.advance(60_001);
@@ -241,5 +248,74 @@ test('an observer that cannot be read is a fault, not an absent observer', async
       (error: Error) => error.constructor.name === 'Refusal');
     await rm(join(f.parent, 'current.json'));
     assert.equal(await f.observer.read('a'), null);
+  } finally { await f.close(); }
+});
+
+test('every observer readiness answer carries its blocked reason code', async () => {
+  const f = await fixture();
+  try {
+    const code = async (agent = f.agent, dueAt?: number) => (await f.observer.readiness(agent, dueAt))?.reason;
+    assert.equal(await f.observer.readiness(f.agent, 1_060_000), null);
+    assert.equal(await code(f.agent, 4_600_000), 'idle_delay_exceeds_cache');
+    assert.equal(await code({ ...f.agent, sessionId: 'other' }), 'observer_missing');
+    f.ledger.pendingInputs = 1; await f.save();
+    assert.equal(await code(), 'claude_working');
+    f.ledger.pendingInputs = 0; f.ledger.ordinaryEndedAt = null; f.ledger.cacheRequest = null; await f.save();
+    assert.equal(await code(), 'waiting_for_reply');
+    f.ledger.ordinaryEndedAt = 1_000_000;
+    f.ledger.cacheRequest = { startedAt: 1_000_000, model: 'claude-sonnet-4-6', policy: { ttl: null, source: 'default' } };
+    f.ledger.updatedAt = 1_000_000 + 60 * 60_000; await f.save();
+    f.advance(60 * 60_000);
+    assert.equal(await code(), 'cache_window_passed');
+    await writeFile(join(f.directory, 'ledger.json'), '{"version":1,');
+    assert.equal(await code(), 'observer_unreadable');
+    f.ledger.closed = true; await f.save();
+    assert.equal(await code(), 'observer_missing');
+  } finally { await f.close(); }
+});
+
+test('a placeholder ledger is a starting observer until a turn completes after the launch was prepared', async () => {
+  const f = await fixture();
+  try {
+    // A freshly opened session: the observer has not written its first ledger yet.
+    f.advance(5_000);
+    await f.observer.prepareSession(f.request, true);
+    const preparedAt = 1_005_000;
+    const before = { ...f.agent, revision: new Date(preparedAt - 1).toISOString() };
+    f.advance(30_000);
+    assert.equal((await f.observer.readiness(before))?.reason, 'observer_starting');
+    assert.equal((await f.observer.read('a'))?.ledger, null, 'a placeholder is neither a fault nor absence');
+    // Starting is a fault at dispatch, retried until the send deadline, never a refusal.
+    await assert.rejects(f.observer.prepare(before, false, 1_100_000),
+      (error: Error) => error.constructor.name !== 'Refusal');
+    // A turn that started after preparation and is still running proves nothing yet.
+    const running = { ...f.agent, idle: false, revision: new Date(preparedAt + 1).toISOString() };
+    assert.equal((await f.observer.readiness(running))?.reason, 'observer_starting');
+    // Once that turn has finished, an attached observer would have written.
+    const finished = { ...running, idle: true };
+    assert.equal((await f.observer.readiness(finished))?.reason, 'observer_missing');
+    await assert.rejects(f.observer.prepare(finished, false, 1_100_000),
+      (error: Error) => error.constructor.name === 'Refusal');
+    // The decision is read from disk, so a restarted plugin gives the same answers.
+    const restarted = createObserver({ home: f.home, now: () => 1_035_000 });
+    assert.equal((await restarted.readiness(before))?.reason, 'observer_starting');
+    assert.equal((await restarted.readiness(finished))?.reason, 'observer_missing');
+  } finally { await f.close(); }
+});
+
+test('a placeholder from a launch prepared before preparation times were recorded uses its file time', async () => {
+  const f = await fixture();
+  try {
+    await f.observer.prepareSession(f.request, true);
+    const manifestPath = join(f.parent, 'current.json');
+    const { launchId, build } = JSON.parse(await readFile(manifestPath, 'utf8'));
+    await writeFile(manifestPath, JSON.stringify({ launchId, build }));
+    const present = Date.now();
+    await utimes(join(f.parent, launchId, 'ledger.json'), new Date(present), new Date(present));
+    const reader = createObserver({ home: f.home, now: () => present + 1_000 });
+    assert.equal((await reader.readiness({ ...f.agent, revision: new Date(present - 1_000).toISOString() }))?.reason,
+      'observer_starting');
+    assert.equal((await reader.readiness({ ...f.agent, revision: new Date(present + 500).toISOString() }))?.reason,
+      'observer_missing');
   } finally { await f.close(); }
 });
