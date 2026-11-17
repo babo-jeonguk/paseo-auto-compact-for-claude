@@ -520,6 +520,39 @@ export const scenarios = [
     },
   },
   {
+    name: 'a session whose observer never loads is missing only after a reply finishes, and Compact now is refused unsent',
+    async run({ fixture: f, model }) {
+      // Claude Code does not load Mods while hooks are disabled.
+      await f.claudeSettings({ disableAllHooks: true });
+      try {
+        const id = await f.agent();
+        await f.turn(id, 'NO_OBSERVER: reply without tools.');
+        assert.deepEqual(await f.ledger(id), {}, 'the observer must not have loaded');
+        // The reply started and finished after the launch was prepared, so the
+        // placeholder is no longer a starting observer.
+        const row = await waitFor(async () => {
+          const value = await f.row(id);
+          return value.status === 'blocked' && value.blockedReason === 'observer_missing' ? value : null;
+        }, 'missing observer after a completed reply');
+        assert(row.tokens !== null);
+        const requests = model.count, operationId = randomUUID();
+        const accepted = await f.rpc('now', { agentId: id, revision: row.revision, target: row.target, operationId });
+        assert.equal(accepted.status, 'running');
+        // Refused at once: failed before dispatch, not retried until its send deadline expires.
+        const operation = await waitFor(async () => {
+          const value = (await f.rpc('operation', { operationId })).operation;
+          return value && value.state !== 'requested' && value.state !== 'dispatching' ? value : null;
+        }, 'refused Compact now');
+        assert.equal(operation.state, 'failed');
+        assert.equal(operation.result.code, 'failed_before_dispatch');
+        assert.equal(model.count, requests, 'nothing may be sent to the model');
+        assert.equal((await f.timeline(id)).filter(entry =>
+          entry.item.type === 'user_message' && entry.item.text === '/compact').length, 0);
+        await f.rpc('toggle', { agentId: id, enabled: false });
+      } finally { await f.claudeSettings({}); }
+    },
+  },
+  {
     name: 'plugin reload preserves settings, conversation OFF and existing session without replay',
     async run({ fixture: f, model, id, sessionId }) {
       await f.rpc('toggle', { agentId: id, enabled: false });
