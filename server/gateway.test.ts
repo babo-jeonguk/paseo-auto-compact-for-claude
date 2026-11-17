@@ -585,16 +585,19 @@ test("each listed agent's observation settles on its own, so a slow or failing o
   host.stop();
 });
 
-// A scheduler over the real gateway, with state kept in memory.
+// A scheduler over the real gateway, with state kept in memory. `listing()` is
+// the scheduler's latest agent listing, so a test can wait for paging to end.
 function directoryScheduler(host: ReturnType<typeof directory>["host"]) {
   let state: import("./model").State = { version: 1, disabled: [], jobs: [], operations: [] };
+  let listing: Promise<void> | undefined;
   const scheduler = createScheduler({
     store: { read: async () => structuredClone(state), write: async next => { state = structuredClone(next); } },
-    gateway: host.gateway,
+    gateway: { ...host.gateway, list: observe => (listing = host.gateway.list(observe)) },
     settings: async () => ({ ...DEFAULT_SETTINGS }),
     now: () => 1_000_000,
   });
-  return { scheduler, reserved: () => state.jobs.filter(job => job.status === "scheduled").map(job => job.agentId).sort() };
+  return { scheduler, listing: () => listing,
+    reserved: () => state.jobs.filter(job => job.status === "scheduled").map(job => job.agentId).sort() };
 }
 const turn = () => new Promise<void>(resolve => setImmediate(resolve));
 
@@ -627,11 +630,13 @@ test("a listed conversation's read is bounded from when it starts, not from when
   const page = new Promise<void>(resolve => { releasePage = resolve; });
   let releaseA!: () => void;
   const heldA = new Promise<void>(resolve => { releaseA = resolve; });
+  let startedA!: () => void;
+  const readingA = new Promise<void>(resolve => { startedA = resolve; });
   const dir = directory(1, {
-    holdRead: id => id === "a" ? heldA : undefined,
+    holdRead: id => { if (id === "a") { startedA(); return heldA; } },
     holdPage: start => start === 1 ? page : undefined,
   });
-  const { scheduler, reserved } = directoryScheduler(dir.host);
+  const { scheduler, listing, reserved } = directoryScheduler(dir.host);
   mock.timers.enable({ apis: ["setTimeout"] });
   try {
     await scheduler.ready;
@@ -640,13 +645,13 @@ test("a listed conversation's read is bounded from when it starts, not from when
     const outcome = () => settled;
     const scan = scheduler.observe({ kind: "full" });
     scan.then(() => { settled = "resolved"; }, error => { settled = error; });
-    await turn();
+    await readingA;
     assert.deepEqual(dir.reads, ["a"], "a's read starts with the first page");
     // Paging takes four of the five seconds; a's read never ends.
     mock.timers.tick(4_000);
     releasePage();
-    for (let step = 0; step < 20; step++) await turn();
-    assert.equal(outcome(), "pending");
+    await listing();
+    assert.equal(outcome(), "pending", "a's read is not timed out when paging ends");
     mock.timers.tick(1_000);
     for (let step = 0; step < 20 && outcome() === "pending"; step++) await turn();
     assert.ok(outcome() instanceof Error, "a's read timed out five seconds after it started");
