@@ -48,9 +48,11 @@ const compatibleBuilds = new Set([observerAsset.version,
   'ece7bf8ce5445aedb974f30472983b78c7358b8feea99d15c1ef2369d88a26e4']);
 
 // What a placeholder ledger means. Session open writes `{}` and the observer
-// replaces it on its first write, which it makes during any turn. So once an
-// ordinary turn has both started and finished after the launch was prepared,
-// a placeholder means the observer never loaded. Until then it is starting.
+// replaces it on its first write, which it makes at session start and during
+// any turn, `/compact` included. So once any turn (the host's last user message,
+// which `/compact` also advances) has both started and finished after the
+// launch was prepared, a placeholder means the observer never loaded. Until
+// then it is starting.
 // Waiting for the turn to finish, not just start, keeps this clear of the
 // observer's first asynchronous write; no elapsed-time guess is involved.
 export function placeholderReason(preparedAt: number, agent: Pick<Observation, 'idle' | 'revision'>): Blocked {
