@@ -234,6 +234,12 @@ test('an observer that cannot be read is a fault, not an absent observer', async
     await assert.rejects(f.observer.prepare(f.agent, false, Date.now() + 30_000, 'op-1'), /could not be read/);
     assert.deepEqual(await f.observer.readiness(f.agent),
       { reason: 'observer_unreadable', detail: 'Claude observer status unavailable; retrying' });
+    // Content that parses but is not a ledger is malformed too, even JSON null.
+    await writeFile(join(f.directory, 'ledger.json'), 'null');
+    await assert.rejects(f.observer.read('a'), /could not be read/);
+    await assert.rejects(f.observer.prepare(f.agent, false, Date.now() + 30_000, 'op-1'),
+      (error: Error) => error.constructor.name !== 'Refusal' && /could not be read/.test(error.message));
+    assert.equal((await f.observer.readiness(f.agent))?.reason, 'observer_unreadable');
     // A genuinely missing or stale observer is absence, and a refusal at dispatch.
     await f.save();
     f.advance(60_001);
