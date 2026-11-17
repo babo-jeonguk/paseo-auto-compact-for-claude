@@ -81,21 +81,22 @@ export function createGateway(options: {
     };
   }
   const gateway: Gateway = {
-    async list(filter) {
-      const selected = filter?.agentIds ? new Set(filter.agentIds) : undefined;
-      if (selected?.size === 0) return [];
+    async list(observe) {
       const { config } = await requireApi().config.get();
-      const agents: Observation[] = [];
       let cursor: string | undefined;
       do {
         const page = await requireApi().agents.list({ filter: { includeBackground: true },
           page: { limit: 200, ...(cursor ? { cursor } : {}) } });
-        // Paseo 0.12's agent list has no ID filter; page the same list and skip unselected entries.
-        const entries = selected ? page.entries.filter(({ agent }) => selected.has(agent.id)) : page.entries;
-        agents.push(...await Promise.all(entries.map(({ agent }) => observation(agent, config.providers))));
+        // Observations run while later pages are listed. The caller handles
+        // each one from the moment it starts; until then a rejection must not
+        // count as unhandled.
+        for (const { agent } of page.entries) {
+          const observed = observation(agent, config.providers);
+          observed.catch(() => {});
+          observe(observed);
+        }
         cursor = page.pageInfo.hasMore ? page.pageInfo.nextCursor ?? undefined : undefined;
       } while (cursor);
-      return agents;
     },
     async refresh(id) {
       const current = await requireApi().agents.ref(id).refresh();

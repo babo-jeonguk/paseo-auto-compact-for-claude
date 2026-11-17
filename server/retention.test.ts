@@ -56,7 +56,7 @@ async function fixture() {
   const errors: unknown[] = [], removed: string[] = [];
   const agent: Observation = { agentId: "a", title: null, workspace: "/work", provider: "claude", revision: old.revision,
     tokens: 500_000, idle: true, eligible: true, sessionId: "native-a", activityKey: "generation:1" };
-  const gateway: Gateway = { list: async () => [agent], refresh: async () => agent,
+  const gateway: Gateway = { list: async (observe) => { observe(Promise.resolve(agent)); }, refresh: async () => agent,
     compact: async () => { sends++; return { status: "completed", detail: "completed" }; } };
   const store = { read: disk.read, write: async (next: State) => {
     if (failCommit && !next.operations.some(op => op.id === "old")) throw new Error("disk full");

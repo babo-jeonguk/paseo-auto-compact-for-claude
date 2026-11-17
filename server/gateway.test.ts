@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { mock, test } from "node:test";
 import { bounded, OBSERVATION_MS } from "./deadline";
 import { Refusal, type OperationEvidence, type StoredOperation } from "./model";
 import { createGateway } from "./gateway";
@@ -489,8 +489,12 @@ test('native activity identity survives compaction without restoring its schedul
 });
 
 // A host directory of many agents, paged like Paseo's agent list, with an
-// observer that records which agents' native ledgers were read.
-function directory(pageSize = 2) {
+// observer that records which agents' native ledgers were read. A `slow`
+// agent's ledger read does not end; a `broken` agent's host reference throws.
+// `holdRead` and `holdPage` may delay or fail one ledger read or listing page.
+function directory(pageSize = 2, { slow = [] as string[], broken = [] as string[],
+  holdRead = (_id: string): Promise<void> | void => {},
+  holdPage = (_start: number): Promise<void> | void => {} } = {}) {
   const base = {
     provider: "claude", cwd: "/work", title: null, labels: {} as Record<string, string>, status: "idle",
     activeTurn: null, pendingPermissions: [], lastUserMessageAt: new Date(1000).toISOString(),
@@ -513,6 +517,8 @@ function directory(pageSize = 2) {
   const read = native.read;
   native.read = async (id: string) => {
     reads.push(id);
+    if (slow.includes(id)) await new Promise(() => {});
+    await holdRead(id);
     const current = await read(id);
     return current ? { ...current, ledger: { ...current.ledger, sessionId: `native-${id}` } } : null;
   };
@@ -523,18 +529,20 @@ function directory(pageSize = 2) {
       list: async (options: { page?: { limit?: number; cursor?: string } }) => {
         listCalls++;
         const start = Number(options.page?.cursor ?? 0);
+        await holdPage(start);
         const end = start + Math.min(pageSize, options.page?.limit ?? pageSize);
         return {
           entries: agents.slice(start, end).map(agent => ({ agent })),
           pageInfo: { hasMore: end < agents.length, nextCursor: end < agents.length ? String(end) : null },
         };
       },
-      ref: (id: string) => ({
-        refresh: async () => {
+      ref: (id: string) => {
+        if (broken.includes(id)) throw new Error(`host failed for ${id}`);
+        return { refresh: async () => {
           const agent = agents.find(entry => entry.id === id);
           return agent ? { agent } : null;
-        },
-      }),
+        } };
+      },
     },
   } as unknown as PluginHandlerContext["paseo"]);
   return { host, reads, get listCalls() { return listCalls; } };
@@ -543,7 +551,9 @@ const INELIGIBLE = ["archived", "internal", "child", "unavailable", "closed", "c
 
 test("the full list still observes every agent, but reads native ledgers only for eligible Claude agents", async () => {
   const { host, reads } = directory();
-  const observations = await host.gateway.list();
+  const listed: Promise<import("./model").Observation>[] = [];
+  await host.gateway.list((observation) => { listed.push(observation); });
+  const observations = await Promise.all(listed);
   assert.deepEqual(observations.map(agent => agent.agentId),
     ["a", "b", "c", ...INELIGIBLE], "every listed agent is still reported");
   assert.deepEqual(observations.filter(agent => agent.eligible).map(agent => agent.agentId), ["a", "b", "c"]);
@@ -560,24 +570,99 @@ test("the full list still observes every agent, but reads native ledgers only fo
   host.stop();
 });
 
-test("an agent filter reads only the selected agents' ledgers, across every page", async () => {
-  const { host, reads } = directory();
-  const observations = await host.gateway.list({ agentIds: ["c", "b"] });
-  assert.deepEqual(observations.map(agent => agent.agentId).sort(), ["b", "c"]);
-  assert.deepEqual([...reads].sort(), ["b", "c"]);
-  assert.ok(observations.every(agent => agent.eligible && agent.activityKey));
+test("each listed agent's observation settles on its own, so a slow or failing one hides no other", async () => {
+  const dir = directory(2, { slow: ["b"], broken: ["c"] }), { host } = dir;
+  const listed: Promise<import("./model").Observation>[] = [];
+  await host.gateway.list((observation) => { listed.push(observation); });
+  assert.equal(dir.listCalls, Math.ceil((3 + INELIGIBLE.length) / 2), "every page is listed without waiting for b");
+  assert.equal(listed.length, 3 + INELIGIBLE.length, "b is still listed");
+  // Everything but b settles although b's read never ends.
+  const results = await Promise.allSettled(listed.filter((_, index) => index !== 1));
+  const fulfilled = results.flatMap(result => result.status === "fulfilled" ? [result.value.agentId] : []);
+  assert.deepEqual(fulfilled, ["a", ...INELIGIBLE], "every other observation is returned");
+  const failures = results.flatMap(result => result.status === "rejected" ? [String(result.reason)] : []);
+  assert.deepEqual(failures, ["Error: host failed for c"], "c's failure is returned with them");
   host.stop();
 });
 
-test("a filter naming ineligible or unknown agents causes no ledger read", async () => {
-  const { host, reads } = directory();
-  const observations = await host.gateway.list({ agentIds: [...INELIGIBLE, "missing"] });
-  assert.equal(reads.length, 0);
-  assert.ok(observations.every(agent => !agent.eligible));
-  assert.equal(observations.some(agent => agent.agentId === "missing"), false);
-  assert.deepEqual(await host.gateway.list({ agentIds: [] }), []);
-  assert.equal(reads.length, 0);
-  host.stop();
+// A scheduler over the real gateway, with state kept in memory. `listing()` is
+// the scheduler's latest agent listing, so a test can wait for paging to end.
+function directoryScheduler(host: ReturnType<typeof directory>["host"]) {
+  let state: import("./model").State = { version: 1, disabled: [], jobs: [], operations: [] };
+  let listing: Promise<void> | undefined;
+  const scheduler = createScheduler({
+    store: { read: async () => structuredClone(state), write: async next => { state = structuredClone(next); } },
+    gateway: { ...host.gateway, list: observe => (listing = host.gateway.list(observe)) },
+    settings: async () => ({ ...DEFAULT_SETTINGS }),
+    now: () => 1_000_000,
+  });
+  return { scheduler, listing: () => listing,
+    reserved: () => state.jobs.filter(job => job.status === "scheduled").map(job => job.agentId).sort() };
+}
+const turn = () => new Promise<void>(resolve => setImmediate(resolve));
+
+test("a scan whose later listing page fails stays single-flight until reads started on earlier pages end", async () => {
+  let releaseA!: () => void;
+  const heldA = new Promise<void>(resolve => { releaseA = resolve; });
+  const dir = directory(1, {
+    holdRead: id => id === "a" ? heldA : undefined,
+    holdPage: start => { if (start === 1) throw new Error("page failed"); },
+  });
+  const { scheduler } = directoryScheduler(dir.host);
+  try {
+    await scheduler.ready;
+    await assert.rejects(scheduler.observe({ kind: "full" }), /page failed/);
+    const next = scheduler.observe({ kind: "agent", agentId: "b" });
+    await turn();
+    assert.deepEqual(dir.reads, ["a"], "b is not read while a's read from the failed scan still runs");
+    releaseA();
+    await next;
+    assert.deepEqual(dir.reads, ["a", "b"]);
+  } finally {
+    releaseA();
+    scheduler.stop();
+    dir.host.stop();
+  }
+});
+
+test("a listed conversation's read is bounded from when it starts, not from when paging ends", async () => {
+  let releasePage!: () => void;
+  const page = new Promise<void>(resolve => { releasePage = resolve; });
+  let releaseA!: () => void;
+  const heldA = new Promise<void>(resolve => { releaseA = resolve; });
+  let startedA!: () => void;
+  const readingA = new Promise<void>(resolve => { startedA = resolve; });
+  const dir = directory(1, {
+    holdRead: id => { if (id === "a") { startedA(); return heldA; } },
+    holdPage: start => start === 1 ? page : undefined,
+  });
+  const { scheduler, listing, reserved } = directoryScheduler(dir.host);
+  mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    await scheduler.ready;
+    let settled: unknown = "pending";
+    // Read through a call: an assertion must not narrow it for later checks.
+    const outcome = () => settled;
+    const scan = scheduler.observe({ kind: "full" });
+    scan.then(() => { settled = "resolved"; }, error => { settled = error; });
+    await readingA;
+    assert.deepEqual(dir.reads, ["a"], "a's read starts with the first page");
+    // Paging takes four of the five seconds; a's read never ends.
+    mock.timers.tick(4_000);
+    releasePage();
+    await listing();
+    assert.equal(outcome(), "pending", "a's read is not timed out when paging ends");
+    mock.timers.tick(1_000);
+    for (let step = 0; step < 20 && outcome() === "pending"; step++) await turn();
+    assert.ok(outcome() instanceof Error, "a's read timed out five seconds after it started");
+    assert.deepEqual(reserved(), ["b", "c"], "every other listed reply is still reserved");
+  } finally {
+    releasePage();
+    releaseA();
+    mock.timers.reset();
+    scheduler.stop();
+    dir.host.stop();
+  }
 });
 
 test("refreshing an ineligible agent does not read its ledger; an eligible one still does", async () => {

@@ -17,10 +17,11 @@ function fixture(automatic = true) {
   const sent: string[] = [];
   const compactHolds = new Map<string, () => Promise<void>>();
   const refreshHolds = new Map<string, () => Promise<void>>();
+  const listedHolds = new Map<string, () => Promise<void>>();
   // Resource use the optimization promises to bound.
   const counts = {
-    reads: 0, writes: 0, lists: [] as Array<string[] | undefined>, refreshes: [] as string[],
-    reset() { this.reads = 0; this.writes = 0; this.lists = []; this.refreshes = []; },
+    reads: 0, writes: 0, lists: 0, refreshes: [] as string[],
+    reset() { this.reads = 0; this.writes = 0; this.lists = 0; this.refreshes = []; },
   };
   let listGate: Promise<void> | null = null;
   const agents: Observation[] = [
@@ -58,12 +59,16 @@ function fixture(automatic = true) {
     return structuredClone(agents.find((a) => a.agentId === id) ?? null);
   };
   const gateway: Gateway = {
-    list: async (filter?: { agentIds?: readonly string[] }) => {
-      counts.lists.push(filter?.agentIds ? [...filter.agentIds].sort() : undefined);
-      const listed = structuredClone(filter?.agentIds
-        ? agents.filter((a) => filter.agentIds!.includes(a.agentId)) : agents);
+    list: async (observe) => {
+      counts.lists++;
+      const listed = structuredClone(agents);
       if (listGate) await listGate;
-      return listed;
+      for (const agent of listed) {
+        observe((async () => {
+          await listedHolds.get(agent.agentId)?.();
+          return agent;
+        })());
+      }
     },
     refresh,
     compact,
@@ -92,6 +97,10 @@ function fixture(automatic = true) {
     },
     holdRefresh(agentId: string, hold: () => Promise<void>) {
       refreshHolds.set(agentId, hold);
+    },
+    // Hold one listed conversation's observation, not the listing itself.
+    holdListed(agentId: string, hold: () => Promise<void>) {
+      listedHolds.set(agentId, hold);
     },
     counts,
     // Hold agent listings (not refreshes) until released.
@@ -1340,7 +1349,7 @@ test("a turn-ended event observes only that conversation, without listing every 
   f.counts.reset();
   await s.observe({ kind: "agent", agentId: "b" });
   assert.deepEqual(reserved(f), ["b"]);
-  assert.deepEqual(f.counts.lists, [], "no agent listing for a single turn end");
+  assert.equal(f.counts.lists, 0, "no agent listing for a single turn end");
   assert.deepEqual(f.counts.refreshes, ["b"]);
 });
 
@@ -1360,22 +1369,24 @@ test("periodic observation scans every agent first, then only agents holding a r
   await s.ready;
   f.counts.reset();
   await s.observe({ kind: "periodic" });
-  assert.deepEqual(f.counts.lists, [undefined], "the first periodic pass is a full safety scan");
+  assert.equal(f.counts.lists, 1, "the first periodic pass is a full safety scan");
   assert.deepEqual(reserved(f), ["a", "b", "c"]);
   await s.invalidate("c");
   f.counts.reset();
   f.advance(10_000);
   await s.observe({ kind: "periodic" });
-  assert.deepEqual(f.counts.lists, [["a", "b"]], "only conversations that hold a reservation");
+  assert.equal(f.counts.lists, 0, "no agent listing between full scans");
+  assert.deepEqual(f.counts.refreshes.sort(), ["a", "b"], "only conversations that hold a reservation");
   f.advance(10_000);
   await s.invalidate("a");
   await s.invalidate("b");
   f.counts.reset();
   await s.observe({ kind: "periodic" });
-  assert.deepEqual(f.counts.lists, [], "nothing to watch: no listing at all");
+  assert.equal(f.counts.lists, 0, "nothing to watch: no listing at all");
+  assert.deepEqual(f.counts.refreshes, [], "nothing to watch: no read at all");
   f.advance(40_000);
   await s.observe({ kind: "periodic" });
-  assert.deepEqual(f.counts.lists, [undefined], "a full safety scan every minute");
+  assert.equal(f.counts.lists, 1, "a full safety scan every minute");
 });
 
 test("the full safety scan still finds activity no event announced", async () => {
@@ -1410,10 +1421,119 @@ test("periodic observation also watches a conversation with a pending operation"
   // Inside the 10-second manual send deadline, before the next full scan.
   f.advance(1_000);
   await s.observe({ kind: "periodic" });
-  assert.deepEqual(f.counts.lists, [["b"]]);
+  assert.equal(f.counts.lists, 0);
+  // The worker may read b too; nothing else is read.
+  assert.deepEqual([...new Set(f.counts.refreshes)], ["b"]);
   release();
   for (let attempt = 0; attempt < 100 && f.state.operations[0]?.state !== "succeeded"; attempt++) await settle();
   assert.equal(f.state.operations[0]?.state, "succeeded");
+});
+
+test("over a minute of ten-second passes with one reservation held, the directory is listed once", async () => {
+  const f = fixture();
+  // b has no observed reply, so only a holds a reservation.
+  f.agents.splice(0, 1, nativeAgent(f, "a"), { ...nativeAgent(f, "b"), activityKey: null, observedEndedAt: null });
+  const s = f.make();
+  await s.ready;
+  f.counts.reset();
+  for (let pass = 0; pass < 6; pass++) {
+    await s.observe({ kind: "periodic" });
+    f.advance(10_000);
+  }
+  assert.deepEqual(reserved(f), ["a"]);
+  assert.equal(f.counts.lists, 1, "only the full scan lists the directory");
+  assert.deepEqual(f.counts.refreshes, ["a", "a", "a", "a", "a"],
+    "each attention pass reads only the conversation needing attention");
+});
+
+test("an attention pass applies one conversation's newer reply although another's read times out", async () => {
+  const f = fixture();
+  f.agents.splice(0, 1, nativeAgent(f, "a"), nativeAgent(f, "b"));
+  const s = f.make();
+  await s.ready;
+  await s.observe({ kind: "periodic" });
+  assert.deepEqual(reserved(f), ["a", "b"]);
+  let releaseA!: () => void;
+  const heldA = new Promise<void>(resolve => { releaseA = resolve; });
+  f.holdRefresh("a", () => heldA);
+  // b replied again while both still hold a reservation.
+  f.advance(10_000);
+  f.agents[1] = nativeAgent(f, "b", "2");
+  mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    const pass = s.observe({ kind: "periodic" });
+    await settle();
+    mock.timers.tick(5_000);
+    await assert.rejects(pass, "a's timeout is still reported");
+    assert.equal(f.state.jobs.find(job => job.agentId === "b")?.activityKey, "launch:b:2",
+      "b's newer reply is applied in the same pass");
+    assert.equal(f.counts.lists, 1, "the attention pass lists nothing");
+    // a's read is not cancelled: the next pass waits for it.
+    f.advance(10_000);
+    const next = s.observe({ kind: "periodic" });
+    await settle();
+    assert.deepEqual(f.counts.refreshes.filter(id => id === "b"), ["b"],
+      "observation stays single-flight while a's read is still running");
+    releaseA();
+    await next;
+    assert.deepEqual(f.counts.refreshes.filter(id => id === "b"), ["b", "b"]);
+  } finally {
+    releaseA?.();
+    mock.timers.reset();
+  }
+});
+
+test("an attention read that never ends stops blocking observation after a minute", async () => {
+  const f = fixture();
+  f.agents.splice(0, 1, nativeAgent(f, "a"));
+  const s = f.make();
+  await s.ready;
+  await s.observe({ kind: "periodic" });
+  f.holdRefresh("a", () => new Promise<void>(() => {}));
+  f.advance(10_000);
+  mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    const pass = s.observe({ kind: "periodic" });
+    await settle();
+    mock.timers.tick(5_000);
+    await assert.rejects(pass);
+    f.addAgent("b");
+    const next = s.observe({ kind: "agent", agentId: "b" });
+    await settle();
+    assert.deepEqual(f.counts.refreshes.filter(id => id === "b"), [], "held while a's read runs");
+    mock.timers.tick(60_000);
+    await next;
+    assert.deepEqual(f.counts.refreshes.filter(id => id === "b"), ["b"], "observation resumes instead of stalling for good");
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test("a full scan reserves one listed conversation's finished reply although another's observation times out", async () => {
+  const f = fixture();
+  f.agents.splice(0, 1, nativeAgent(f, "a"), nativeAgent(f, "b"));
+  let releaseA!: () => void;
+  f.holdListed("a", () => new Promise<void>(resolve => { releaseA = resolve; }));
+  const s = f.make();
+  await s.ready;
+  mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    const scan = s.observe({ kind: "full" });
+    await settle();
+    mock.timers.tick(5_000);
+    await assert.rejects(scan, "a's timeout is still reported");
+    assert.deepEqual(reserved(f), ["b"], "b's reservation is created by the scan");
+    // a's observation is not cancelled: the next observation waits for it.
+    const next = s.observe({ kind: "agent", agentId: "b" });
+    await settle();
+    assert.deepEqual(f.counts.refreshes, [], "observation stays single-flight while a's read is still running");
+    releaseA();
+    await next;
+    assert.deepEqual(f.counts.refreshes, ["b"]);
+  } finally {
+    releaseA?.();
+    mock.timers.reset();
+  }
 });
 
 test("a batch of observations reads the state once and writes it once", async () => {
@@ -1490,10 +1610,10 @@ test("overlapping observations never run duplicate scans, and a turn end during 
   scans.push(s.observe({ kind: "periodic" }), s.observe({ kind: "full" }),
     s.observe({ kind: "agent", agentId: "b" }), s.observe({ kind: "agent", agentId: "b" }));
   await settle();
-  assert.equal(f.counts.lists.length, 1, "one listing at a time");
+  assert.equal(f.counts.lists, 1, "one listing at a time");
   release();
   await Promise.all(scans);
-  assert.ok(f.counts.lists.length + f.counts.refreshes.length <= 3,
+  assert.ok(f.counts.lists + f.counts.refreshes.length <= 3,
     `queued requests were merged: ${JSON.stringify(f.counts)}`);
   assert.equal(f.state.jobs.find(job => job.agentId === "b")?.activityKey, "launch:b:2");
 });
@@ -1585,10 +1705,10 @@ test("a scan that times out keeps observation single-flight until its listing ac
     await assert.rejects(first);
     const second = s.observe({ kind: "full" });
     await settle();
-    assert.equal(f.counts.lists.length, 1, "no second listing while the first is still running");
+    assert.equal(f.counts.lists, 1, "no second listing while the first is still running");
     release();
     await second;
-    assert.equal(f.counts.lists.length, 2, "the queued scan runs once the listing ends");
+    assert.equal(f.counts.lists, 2, "the queued scan runs once the listing ends");
   } finally {
     mock.timers.reset();
   }
