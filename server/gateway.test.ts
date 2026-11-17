@@ -489,8 +489,9 @@ test('native activity identity survives compaction without restoring its schedul
 });
 
 // A host directory of many agents, paged like Paseo's agent list, with an
-// observer that records which agents' native ledgers were read.
-function directory(pageSize = 2) {
+// observer that records which agents' native ledgers were read. A `slow`
+// agent's ledger read does not end; a `broken` agent's host reference throws.
+function directory(pageSize = 2, { slow = [] as string[], broken = [] as string[] } = {}) {
   const base = {
     provider: "claude", cwd: "/work", title: null, labels: {} as Record<string, string>, status: "idle",
     activeTurn: null, pendingPermissions: [], lastUserMessageAt: new Date(1000).toISOString(),
@@ -513,6 +514,7 @@ function directory(pageSize = 2) {
   const read = native.read;
   native.read = async (id: string) => {
     reads.push(id);
+    if (slow.includes(id)) await new Promise(() => {});
     const current = await read(id);
     return current ? { ...current, ledger: { ...current.ledger, sessionId: `native-${id}` } } : null;
   };
@@ -529,12 +531,13 @@ function directory(pageSize = 2) {
           pageInfo: { hasMore: end < agents.length, nextCursor: end < agents.length ? String(end) : null },
         };
       },
-      ref: (id: string) => ({
-        refresh: async () => {
+      ref: (id: string) => {
+        if (broken.includes(id)) throw new Error(`host failed for ${id}`);
+        return { refresh: async () => {
           const agent = agents.find(entry => entry.id === id);
           return agent ? { agent } : null;
-        },
-      }),
+        } };
+      },
     },
   } as unknown as PluginHandlerContext["paseo"]);
   return { host, reads, get listCalls() { return listCalls; } };
@@ -543,7 +546,7 @@ const INELIGIBLE = ["archived", "internal", "child", "unavailable", "closed", "c
 
 test("the full list still observes every agent, but reads native ledgers only for eligible Claude agents", async () => {
   const { host, reads } = directory();
-  const observations = await host.gateway.list();
+  const observations = await Promise.all(await host.gateway.list());
   assert.deepEqual(observations.map(agent => agent.agentId),
     ["a", "b", "c", ...INELIGIBLE], "every listed agent is still reported");
   assert.deepEqual(observations.filter(agent => agent.eligible).map(agent => agent.agentId), ["a", "b", "c"]);
@@ -560,23 +563,17 @@ test("the full list still observes every agent, but reads native ledgers only fo
   host.stop();
 });
 
-test("an agent filter reads only the selected agents' ledgers, across every page", async () => {
-  const { host, reads } = directory();
-  const observations = await host.gateway.list({ agentIds: ["c", "b"] });
-  assert.deepEqual(observations.map(agent => agent.agentId).sort(), ["b", "c"]);
-  assert.deepEqual([...reads].sort(), ["b", "c"]);
-  assert.ok(observations.every(agent => agent.eligible && agent.activityKey));
-  host.stop();
-});
-
-test("a filter naming ineligible or unknown agents causes no ledger read", async () => {
-  const { host, reads } = directory();
-  const observations = await host.gateway.list({ agentIds: [...INELIGIBLE, "missing"] });
-  assert.equal(reads.length, 0);
-  assert.ok(observations.every(agent => !agent.eligible));
-  assert.equal(observations.some(agent => agent.agentId === "missing"), false);
-  assert.deepEqual(await host.gateway.list({ agentIds: [] }), []);
-  assert.equal(reads.length, 0);
+test("each listed agent's observation settles on its own, so a slow or failing one hides no other", async () => {
+  const dir = directory(2, { slow: ["b"], broken: ["c"] }), { host } = dir;
+  const listed = await host.gateway.list();
+  assert.equal(dir.listCalls, Math.ceil((3 + INELIGIBLE.length) / 2), "every page is listed without waiting for b");
+  assert.equal(listed.length, 3 + INELIGIBLE.length, "b is still listed");
+  // Everything but b settles although b's read never ends.
+  const results = await Promise.allSettled(listed.filter((_, index) => index !== 1));
+  const fulfilled = results.flatMap(result => result.status === "fulfilled" ? [result.value.agentId] : []);
+  assert.deepEqual(fulfilled, ["a", ...INELIGIBLE], "every other observation is returned");
+  const failures = results.flatMap(result => result.status === "rejected" ? [String(result.reason)] : []);
+  assert.deepEqual(failures, ["Error: host failed for c"], "c's failure is returned with them");
   host.stop();
 });
 

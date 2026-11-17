@@ -113,8 +113,10 @@ export interface DispatchGuard {
 // written. Before it they throw: a Refusal when a reading shows sending would be
 // wrong, anything else when it could not be checked.
 export interface Gateway {
-  // With `agentIds`, only those agents are observed.
-  list(filter?: { agentIds?: readonly string[] }): Promise<Observation[]>;
+  // Resolves once every page of the host's agent listing is read. Each listed
+  // agent's observation settles on its own, so one slow or failing read does
+  // not hide the others.
+  list(): Promise<Promise<Observation>[]>;
   refresh(agentId: string): Promise<Observation | null>;
   compact(
     agentId: string,

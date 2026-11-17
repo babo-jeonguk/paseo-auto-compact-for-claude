@@ -160,16 +160,16 @@ export function createScheduler(options: {
   };
   async function runPlan(plan: Plan) {
     const seq = ++reads;
-    let agents: Observation[];
-    let failure: PromiseRejectedResult | undefined;
+    let observations: Promise<Observation | null>[];
     if (plan.full) {
       const listing = gateway.list();
-      hostWork = listing.then(() => {}, () => {});
-      agents = await bounded(listing, INSPECT_TIMEOUT_MS);
+      hostWork = listing.then((listed) => Promise.allSettled(listed), () => {});
+      // A listing page that fails or times out fails the whole scan.
+      observations = await bounded(listing, INSPECT_TIMEOUT_MS);
     } else {
       const ids = new Set(plan.agentIds);
       if (plan.attention) {
-        // Read-only, outside serialize: a slow listing must not delay a tick.
+        // Read-only, outside serialize: a slow read must not delay a tick.
         const state = await store.read();
         for (const job of state.jobs)
           if (!terminal(job)) ids.add(job.agentId);
@@ -177,31 +177,22 @@ export function createScheduler(options: {
           if (operationPending(operation)) ids.add(operation.agentId);
       }
       if (ids.size === 0) return;
-      if (plan.attention) {
-        const listing = gateway.list({ agentIds: [...ids] });
-        hostWork = listing.then(() => {}, () => {});
-        agents = await bounded(listing, INSPECT_TIMEOUT_MS);
-      } else {
-        // Each read is bounded on its own, so one conversation's timeout does
-        // not hide another's result. Single-flight is still held on the raw
-        // reads until every host read ends.
-        const refreshes = [...ids].map((id) => gateway.refresh(id));
-        hostWork = Promise.allSettled(refreshes);
-        const failures: PromiseRejectedResult[] = [];
-        const waits = refreshes.map((refresh) => {
-          const wait = bounded(refresh, INSPECT_TIMEOUT_MS);
-          wait.catch((reason) => { failures.push({ status: "rejected", reason }); });
-          return wait;
-        });
-        const results = await Promise.allSettled(waits);
-        failure = failures[0];
-        agents = results
-          .filter((result): result is PromiseFulfilledResult<Observation | null> =>
-            result.status === "fulfilled")
-          .map((result) => result.value)
-          .filter((agent): agent is Observation => agent !== null);
-      }
+      // Paseo cannot list agents by ID, so conversations that need attention
+      // are read one by one instead of paging the whole directory.
+      observations = [...ids].map((id) => gateway.refresh(id));
+      hostWork = Promise.allSettled(observations);
     }
+    // Each observation is bounded on its own, so one conversation's timeout
+    // does not hide another's result. Single-flight is still held on the raw
+    // reads until every host read ends.
+    const failures: unknown[] = [];
+    const results = await Promise.allSettled(observations.map((observation) => {
+      const wait = bounded(observation, INSPECT_TIMEOUT_MS);
+      wait.catch((reason) => { failures.push(reason); });
+      return wait;
+    }));
+    const agents = results
+      .flatMap((result) => result.status === "fulfilled" && result.value ? [result.value] : []);
     for (const agent of agents) fence(agent.agentId, seq);
     const entries = agents
       .filter((agent) => agent.activityKey && agent.observedEndedAt != null)
@@ -209,7 +200,7 @@ export function createScheduler(options: {
     if (entries.length) await observedTurns(entries);
     // Record every successful observation before reporting the first failure or
     // timeout.
-    if (failure) throw failure.reason;
+    if (failures.length) throw failures[0];
   }
   function release() {
     if (hostTimer) { clearTimeout(hostTimer); hostTimer = undefined; }
@@ -615,7 +606,7 @@ export function createScheduler(options: {
       const [state, config, agents] = await Promise.all([
         serialize(() => store.read()),
         settings(),
-        bounded(gateway.list(), INSPECT_TIMEOUT_MS),
+        bounded(gateway.list().then((listed) => Promise.all(listed)), INSPECT_TIMEOUT_MS),
       ]);
       return Promise.all(
         agents
