@@ -3,6 +3,7 @@ import { mock, test } from "node:test";
 import { bounded, OBSERVATION_MS } from "./deadline";
 import { Refusal, type OperationEvidence, type StoredOperation } from "./model";
 import { createGateway } from "./gateway";
+import { createOperationWorker } from "./operations";
 import { createScheduler } from "./scheduler";
 import { DEFAULT_SETTINGS } from "../shared/settings";
 import type {
@@ -675,4 +676,130 @@ test("refreshing an ineligible agent does not read its ledger; an eligible one s
   assert.ok((await host.gateway.refresh("a"))?.activityKey);
   assert.deepEqual(reads, ["a"]);
   host.stop();
+});
+
+// A /compact whose live timeline view is lost right after the send: the host
+// emits `lost`, then `live` items. `history` is what a timeline refetch returns,
+// the command's own entry first unless the test says otherwise.
+const LOST_VIEW = ["subscription_restored", "replacement", "error"] as const;
+const BOUNDARY = { type: "compaction", status: "completed", trigger: "manual" };
+async function lostView(lost: typeof LOST_VIEW[number], { live = [] as readonly unknown[], before = [] as readonly unknown[],
+  history = (id: string) => [command(id), { turnId: "compact-1", item: BOUNDARY }] as Array<{ turnId: string | null; item: unknown }>,
+  receipt = { status: "completed", detail: "Native PostCompact" } as { status: "completed" | "unknown"; detail: string } | null,
+  timeoutMs = 1_000 } = {}) {
+  const host = fixture([], undefined, false, [...before], { observer: observer(receipt), timeoutMs });
+  const send = host.ref.send;
+  let emit!: (message: unknown) => void;
+  const subscribe = host.ref.timeline.subscribe;
+  host.ref.timeline.subscribe = listener => { emit = listener; return subscribe(listener); };
+  host.ref.send = async (text, options) => {
+    await send(text, options);
+    emit({ agentId: "a", event: lost === "replacement" ? { type: lost, epoch: "epoch-2" }
+      : lost === "error" ? { type: lost, error: "transport closed" } : { type: lost }, subscriptionId: "s" });
+    for (const item of live) emit({ agentId: "a", event: { type: "timeline", provider: "claude", turnId: "compact-1", item } });
+  };
+  host.ref.timeline.refetch = async () => ({ entries: history(id) });
+  const id = `lost-${lost}`;
+  const saved: OperationEvidence[] = [];
+  const result = await host.gateway.automatic!((await host.gateway.refresh("a"))!, undefined, {
+    id, sendBy: Date.now() + 30_000, checkpoint: async evidence => { saved.push(evidence); }, current: () => true,
+  });
+  assert.equal(host.sendCount(), 1, "/compact is never sent twice");
+  return { result, evidence: saved.at(-1) };
+}
+const command = (id: string) => ({ turnId: "compact-1", item: { type: "user_message", clientMessageId: id } });
+
+test("a lost live view is not a conversation change: completion is read from the receipt and pinned history", async () => {
+  for (const lost of LOST_VIEW) {
+    const { result, evidence } = await lostView(lost, { live: [BOUNDARY] });
+    assert.equal(result.status, "completed", lost);
+    assert.equal(evidence?.invalidated, false, lost);
+  }
+});
+
+test("after a lost live view, a boundary only history shows is enough", async () => {
+  for (const lost of LOST_VIEW) {
+    const { result, evidence } = await lostView(lost);
+    assert.equal(result.status, "completed", lost);
+    assert.equal(evidence?.invalidated, false, lost);
+    assert.equal(evidence?.turnId, "compact-1", lost);
+  }
+});
+
+test("after a lost live view, another user message after the command in history is a conversation change", async () => {
+  const other = { turnId: "next-turn", item: { type: "user_message", clientMessageId: "someone-else" } };
+  const boundary = { turnId: "compact-1", item: BOUNDARY };
+  for (const lost of LOST_VIEW) {
+    for (const history of [(id: string) => [command(id), other, boundary], (id: string) => [command(id), boundary, other]]) {
+      const { result, evidence } = await lostView(lost, { live: [BOUNDARY], history });
+      assert.equal(result.status, "unknown", lost);
+      assert.equal(evidence?.invalidated, true, lost);
+    }
+  }
+});
+
+test("after a lost live view, completion still needs the native receipt and the command's own boundary in history", async () => {
+  const foreign = (id: string) => [command(id), { turnId: "other-turn", item: BOUNDARY }];
+  // A page without the command is not proof that it was never delivered.
+  const missing = () => [{ turnId: "compact-1", item: BOUNDARY }];
+  for (const lost of LOST_VIEW) {
+    for (const [name, options] of [
+      ["no native completion", { receipt: null }],
+      ["boundary in another turn", { history: foreign }],
+      ["command missing from the page", { history: missing }],
+    ] as const) {
+      const { result, evidence } = await lostView(lost, { live: [BOUNDARY], timeoutMs: 60, ...options });
+      assert.equal(result.status, "unknown", `${lost}: ${name}`);
+      assert.equal(evidence?.invalidated, false, `${lost}: ${name} leaves the evidence for reconciliation`);
+      assert.notEqual(evidence?.boundary, true, `${lost}: ${name} records no boundary`);
+    }
+  }
+});
+
+test("a superseding user message seen live, before or after a lost live view, still ends the attempt as a change", async () => {
+  const message = { type: "user_message", clientMessageId: "someone-else" };
+  for (const lost of LOST_VIEW) {
+    for (const [name, options] of [["before", { before: [message] }], ["after", { live: [message] }]] as const) {
+      const { result, evidence } = await lostView(lost, { ...options });
+      assert.equal(result.status, "unknown", `${lost}: ${name}`);
+      assert.equal(evidence?.invalidated, true, `${lost}: ${name}`);
+    }
+  }
+});
+
+test("an attempt that ends unknown after a lost live view stays open for reconciliation", async () => {
+  const host = fixture([], undefined, false, [], { observer: observer(null), timeoutMs: 40 });
+  const send = host.ref.send;
+  let emit!: (message: unknown) => void;
+  const subscribe = host.ref.timeline.subscribe;
+  host.ref.timeline.subscribe = listener => { emit = listener; return subscribe(listener); };
+  host.ref.send = async (text, options) => {
+    await send(text, options);
+    emit({ agentId: "a", event: { type: "replacement", epoch: "epoch-2" } });
+  };
+  const agent = (await host.gateway.refresh("a"))!;
+  const time = Date.now();
+  let state: import("./model").State = { version: 1, disabled: [], jobs: [], operations: [{
+    id: "lost-view", agentId: "a", revision: agent.revision!, target: { sessionId: agent.sessionId, activityKey: agent.activityKey ?? null },
+    kind: "manual", state: "requested", createdAt: time, updatedAt: time, result: null, inputFingerprint: "lost-view",
+    sendBy: time + 10_000, attempt: 0 }] };
+  let tail: Promise<unknown> = Promise.resolve();
+  const errors: unknown[] = [];
+  const worker = createOperationWorker({
+    store: { read: async () => structuredClone(state), write: async next => { state = structuredClone(next); } },
+    update: change => {
+      const result = tail.then(() => { const next = structuredClone(state); const value = change(next); state = next; return value; });
+      tail = result.catch(() => {});
+      return result;
+    },
+    gateway: host.gateway, settings: async () => ({ ...DEFAULT_SETTINGS }), now: Date.now, onError: error => errors.push(error),
+  });
+  await worker.reconcile();
+  worker.stop();
+  host.stop();
+  assert.deepEqual(errors, []);
+  assert.equal(host.sendCount(), 1);
+  assert.equal(state.operations[0].state, "observing", "left for reconciliation, not finished");
+  assert.equal(state.operations[0].result, null);
+  assert.equal(state.operations[0].evidence?.invalidated, false);
 });
