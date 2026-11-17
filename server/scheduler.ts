@@ -160,12 +160,26 @@ export function createScheduler(options: {
   };
   async function runPlan(plan: Plan) {
     const seq = ++reads;
-    let observations: Promise<Observation | null>[];
+    // A read starts when the host call starts, so this records each observation
+    // there: the raw read holds single-flight, and its wait is bounded from then.
+    const started: Promise<Observation | null>[] = [];
+    const waits: Promise<Observation | null>[] = [];
+    const failures: unknown[] = [];
+    const track = (observation: Promise<Observation | null>) => {
+      started.push(observation);
+      const wait = bounded(observation, INSPECT_TIMEOUT_MS);
+      wait.catch((reason) => { failures.push(reason); });
+      waits.push(wait);
+    };
     if (plan.full) {
-      const listing = gateway.list();
-      hostWork = listing.then((listed) => Promise.allSettled(listed), () => {});
-      // A listing page that fails or times out fails the whole scan.
-      observations = await bounded(listing, INSPECT_TIMEOUT_MS);
+      const listing = gateway.list(track);
+      // A listing page that fails or times out fails the whole scan, but reads
+      // started on any page still hold single-flight until they settle.
+      hostWork = (async () => {
+        await listing.catch(() => {});
+        await Promise.allSettled(started);
+      })();
+      await bounded(listing, INSPECT_TIMEOUT_MS);
     } else {
       const ids = new Set(plan.agentIds);
       if (plan.attention) {
@@ -179,18 +193,13 @@ export function createScheduler(options: {
       if (ids.size === 0) return;
       // Paseo cannot list agents by ID, so conversations that need attention
       // are read one by one instead of paging the whole directory.
-      observations = [...ids].map((id) => gateway.refresh(id));
-      hostWork = Promise.allSettled(observations);
+      for (const id of ids) track(gateway.refresh(id));
+      hostWork = Promise.allSettled(started);
     }
     // Each observation is bounded on its own, so one conversation's timeout
-    // does not hide another's result. Single-flight is still held on the raw
-    // reads until every host read ends.
-    const failures: unknown[] = [];
-    const results = await Promise.allSettled(observations.map((observation) => {
-      const wait = bounded(observation, INSPECT_TIMEOUT_MS);
-      wait.catch((reason) => { failures.push(reason); });
-      return wait;
-    }));
+    // does not hide another's result. Single-flight stays on the raw reads
+    // until every host read ends.
+    const results = await Promise.allSettled(waits);
     const agents = results
       .flatMap((result) => result.status === "fulfilled" && result.value ? [result.value] : []);
     for (const agent of agents) fence(agent.agentId, seq);
@@ -606,7 +615,11 @@ export function createScheduler(options: {
       const [state, config, agents] = await Promise.all([
         serialize(() => store.read()),
         settings(),
-        bounded(gateway.list().then((listed) => Promise.all(listed)), INSPECT_TIMEOUT_MS),
+        bounded((async () => {
+          const observations: Promise<Observation>[] = [];
+          await gateway.list((observation) => observations.push(observation));
+          return Promise.all(observations);
+        })(), INSPECT_TIMEOUT_MS),
       ]);
       return Promise.all(
         agents

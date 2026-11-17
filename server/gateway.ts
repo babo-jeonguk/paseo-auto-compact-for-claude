@@ -81,23 +81,22 @@ export function createGateway(options: {
     };
   }
   const gateway: Gateway = {
-    async list() {
+    async list(observe) {
       const { config } = await requireApi().config.get();
-      const agents: Promise<Observation>[] = [];
       let cursor: string | undefined;
       do {
         const page = await requireApi().agents.list({ filter: { includeBackground: true },
           page: { limit: 200, ...(cursor ? { cursor } : {}) } });
         // Observations run while later pages are listed. The caller handles
-        // each one; until then a rejection must not count as unhandled.
+        // each one from the moment it starts; until then a rejection must not
+        // count as unhandled.
         for (const { agent } of page.entries) {
           const observed = observation(agent, config.providers);
           observed.catch(() => {});
-          agents.push(observed);
+          observe(observed);
         }
         cursor = page.pageInfo.hasMore ? page.pageInfo.nextCursor ?? undefined : undefined;
       } while (cursor);
-      return agents;
     },
     async refresh(id) {
       const current = await requireApi().agents.ref(id).refresh();

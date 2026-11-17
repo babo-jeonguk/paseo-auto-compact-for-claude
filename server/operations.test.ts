@@ -31,7 +31,8 @@ function fixture(options: { agents?: string[] } = {}) {
   const hooks = new Map<string, Hook>();
   let evidence: Evidence = null;
   const gateway: Gateway = {
-    list: async () => Object.values(observations).map(async observation => observation), refresh: async id => observations[id] ?? null,
+    list: async (observe) => Object.values(observations).forEach(observation => observe(Promise.resolve(observation))),
+    refresh: async id => observations[id] ?? null,
     compact: async (id, _expected, execution) => {
       calls.push(id);
       events.push(`${id}:send`);

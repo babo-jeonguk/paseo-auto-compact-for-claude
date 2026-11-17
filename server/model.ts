@@ -113,10 +113,12 @@ export interface DispatchGuard {
 // written. Before it they throw: a Refusal when a reading shows sending would be
 // wrong, anything else when it could not be checked.
 export interface Gateway {
-  // Resolves once every page of the host's agent listing is read. Each listed
-  // agent's observation settles on its own, so one slow or failing read does
-  // not hide the others.
-  list(): Promise<Promise<Observation>[]>;
+  // Pages the host's agent listing and hands each listed agent's observation to
+  // `observe` synchronously, as soon as that observation starts. Resolves once
+  // every page is read; rejects if the config read or a listing page fails. Each
+  // observation settles on its own, so one slow or failing read does not hide
+  // the others.
+  list(observe: (observation: Promise<Observation>) => void): Promise<void>;
   refresh(agentId: string): Promise<Observation | null>;
   compact(
     agentId: string,

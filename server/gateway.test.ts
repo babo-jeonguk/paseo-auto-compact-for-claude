@@ -551,7 +551,9 @@ const INELIGIBLE = ["archived", "internal", "child", "unavailable", "closed", "c
 
 test("the full list still observes every agent, but reads native ledgers only for eligible Claude agents", async () => {
   const { host, reads } = directory();
-  const observations = await Promise.all(await host.gateway.list());
+  const listed: Promise<import("./model").Observation>[] = [];
+  await host.gateway.list((observation) => { listed.push(observation); });
+  const observations = await Promise.all(listed);
   assert.deepEqual(observations.map(agent => agent.agentId),
     ["a", "b", "c", ...INELIGIBLE], "every listed agent is still reported");
   assert.deepEqual(observations.filter(agent => agent.eligible).map(agent => agent.agentId), ["a", "b", "c"]);
@@ -570,7 +572,8 @@ test("the full list still observes every agent, but reads native ledgers only fo
 
 test("each listed agent's observation settles on its own, so a slow or failing one hides no other", async () => {
   const dir = directory(2, { slow: ["b"], broken: ["c"] }), { host } = dir;
-  const listed = await host.gateway.list();
+  const listed: Promise<import("./model").Observation>[] = [];
+  await host.gateway.list((observation) => { listed.push(observation); });
   assert.equal(dir.listCalls, Math.ceil((3 + INELIGIBLE.length) / 2), "every page is listed without waiting for b");
   assert.equal(listed.length, 3 + INELIGIBLE.length, "b is still listed");
   // Everything but b settles although b's read never ends.

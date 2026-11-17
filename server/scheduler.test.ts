@@ -59,14 +59,16 @@ function fixture(automatic = true) {
     return structuredClone(agents.find((a) => a.agentId === id) ?? null);
   };
   const gateway: Gateway = {
-    list: async () => {
+    list: async (observe) => {
       counts.lists++;
       const listed = structuredClone(agents);
       if (listGate) await listGate;
-      return listed.map(async (agent) => {
-        await listedHolds.get(agent.agentId)?.();
-        return agent;
-      });
+      for (const agent of listed) {
+        observe((async () => {
+          await listedHolds.get(agent.agentId)?.();
+          return agent;
+        })());
+      }
     },
     refresh,
     compact,
