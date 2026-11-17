@@ -196,6 +196,8 @@ export function createObserver(options: { home?: string; now?: () => number } = 
         JSON.stringify(configuration) + '); }\n', { mode: 0o600 });
       await atomic(join(parent, 'current.json'), { launchId, build: observerAsset.version });
       launchesStartedHere.set(request.agentId, launchId);
+      // Best effort: a failed prune only leaves stale launch directories on disk,
+      // and the launch must proceed.
       await prune(parent, launchId).catch(() => {});
       const existing = request.env.CLAUDE_CODE_PLUGIN_DIRS?.split(delimiter)
         .filter(path => path && !path.startsWith(parent + sep));

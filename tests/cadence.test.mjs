@@ -3,7 +3,6 @@ import { test } from "node:test";
 import { countdownTickDelay, directoryRefreshDelay, nextRenderAt, operationPollDelay, pollFailures,
   sessionPollDelay, surfaceActive, DIRECTORY_REFRESH_MS, OPERATION_LOOKUP_MS, OPERATION_POLL_MS,
   SESSION_BACKOFF_MS, SESSION_POLL_MS, STATUS_FRESH_MS } from "../client/cadence.ts";
-import { STATUS_GRACE_MS } from "../client/session-state.ts";
 
 test("cadences are the agreed values", () => {
   assert.equal(SESSION_POLL_MS, 10_000);
@@ -81,8 +80,7 @@ test("the next render is the earliest visible change: countdown boundary or a fu
 test("status stays fresh across one missed poll, and one failed poll does not reach the grace limit", () => {
   assert.ok(STATUS_FRESH_MS >= 2 * SESSION_POLL_MS, "fresh across one missed poll");
   assert.ok(STATUS_FRESH_MS < SESSION_BACKOFF_MS + SESSION_POLL_MS, "but not hiding a dead host for long");
-  assert.ok(STATUS_GRACE_MS > SESSION_POLL_MS, "the poll after a failed one lands inside the grace");
-  assert.ok(STATUS_GRACE_MS < SESSION_BACKOFF_MS + SESSION_POLL_MS);
+  assert.ok(STATUS_FRESH_MS > SESSION_POLL_MS, "the poll after a failed one lands inside the grace");
 });
 
 test("directory discovery refreshes at once on mount, reconnect, visibility and directory changes", () => {

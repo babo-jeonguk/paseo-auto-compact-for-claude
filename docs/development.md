@@ -10,7 +10,7 @@ npm run build:observer
 npm run check
 ```
 
-`check` verifies the embedded observer source, TypeScript, scheduling, file persistence, conversation controls and execution tests. Run `build:observer` after changing `server/observer-source.mjs`. The fast CI matrix runs these checks against Paseo SDK 0.12, 0.13 and 0.14 on Linux, macOS and Windows. The package keeps SDK 0.12 pinned as the minimum compile-time contract. Separate native simulation jobs exercise real Claude with all three Paseo versions on Linux and Windows.
+`check` verifies the embedded observer source, TypeScript, scheduling, file persistence, conversation controls and execution tests. Run `build:observer` after changing `server/observer-source.mjs`. The fast CI matrix runs these checks on Linux, macOS and Windows against each Paseo SDK version listed in `.github/workflows/check.yml`. The package keeps SDK 0.12 pinned as the minimum compile-time contract. Separate native simulation jobs exercise real Claude with each Paseo version in that workflow's simulation matrix on Linux and Windows.
 
 The `Paseo release` workflow checks npm every day at 18:00 KST. The first beta or release of a Paseo line newer than the newest `@getpaseo/cli` in `tests/simulation/package.json` opens one `paseo-release` issue for that line, mentioning the repository owner; later betas of the line and its `.0` release are comments on that issue, and patch releases are ignored. The baseline is the simulation, not the SDK pin, because the pin stays at the 0.12 minimum contract. The pull request that adds the line to the simulation closes the issue. `node --import tsx scripts/watch-paseo-release.ts --dry-run` prints what it would post.
 

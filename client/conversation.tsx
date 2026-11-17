@@ -17,7 +17,7 @@ import { operationRowStatus, operationPending, compactRpc, operationRpc, session
 import { compactSettings } from "../shared/settings";
 import { canSkip, errorLabel, tokenLabel } from "./format";
 import { canUndoSkip, compactCompletionNotice, compactOutcomeNotice, INPUT_IDLE_GRACE_MS, pendingPresentation,
-  sessionKey, sessionPresentation, STATUS_GRACE_MS, type Presentation } from "./session-state";
+  sessionKey, sessionPresentation, type Presentation } from "./session-state";
 import { compactSubmissions } from "./compact-submission";
 import { OPERATION_LOOKUP_MS, nextRenderAt, onHostReconnected, operationPollDelay,
   sessionFailures, sessionPollDelay, STATUS_FRESH_MS } from "./cadence";
@@ -92,7 +92,7 @@ export function useConversation(hostId: string, agentId: string) {
     dueAt: current?.label.startsWith("Compact in ") ? row?.dueAt ?? null : null,
     deadlines: [
       fresh ? query.dataUpdatedAt + STATUS_FRESH_MS : null,
-      pendingSince.current !== null ? pendingSince.current + STATUS_GRACE_MS : null,
+      pendingSince.current !== null ? pendingSince.current + STATUS_FRESH_MS : null,
       row?.undoSkip?.dueAt,
       row?.inputIdleSince != null ? row.inputIdleSince + INPUT_IDLE_GRACE_MS : null,
     ],
