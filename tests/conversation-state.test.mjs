@@ -4,6 +4,7 @@ import { canUndoSkip, compactCompletionNotice, compactOutcomeNotice, pillLabel, 
   INPUT_IDLE_GRACE_MS } from "../client/session-state.ts";
 import { STATUS_FRESH_MS } from "../client/cadence.ts";
 import { DEFAULT_SETTINGS } from "../shared/settings.ts";
+import { BLOCKED_REASONS, RowSchema } from "../shared/rpc.ts";
 
 const now = 1_000_000;
 const row = {
@@ -53,19 +54,44 @@ test("actionable failures share one label but preserve their distinct next steps
   for (const [changes, explanation] of [
     [{ status: "failed" }, /failed/],
     [{ status: "unknown" }, /could not be confirmed/],
-    [{ status: "blocked", detail: "Settings unreadable" }, /Settings/],
-    [{ status: "blocked", detail: "Claude observer unavailable" }, /Reopen/],
-    [{ status: "blocked", detail: "Idle delay exceeds the 5-minute cache window" }, /shorter delay/],
+    [{ status: "blocked", blockedReason: "settings_unreadable" }, /Settings/],
+    [{ status: "blocked", blockedReason: "observer_missing" }, /Reopen.*load/],
+    [{ status: "blocked", blockedReason: "observer_not_supported" }, /Reopen/],
+    [{ status: "blocked", blockedReason: "idle_delay_exceeds_cache" }, /shorter delay/],
   ]) {
     assert.equal(present(changes).label, "Check compact");
     assert.match(present(changes).description, explanation);
   }
 });
 
+test("a starting or briefly unreadable observer is waited for, never a reason to reopen", () => {
+  for (const blockedReason of ["observer_starting", "observer_unreadable"]) {
+    const view = present({ status: "blocked", blockedReason });
+    assert.equal(view.label, "Compact on");
+    assert.doesNotMatch(view.description, /reopen/i);
+    assert.match(view.description, /wait/i);
+  }
+});
+
+test("the reason code alone chooses the presentation; the server's wording never does", () => {
+  for (const blockedReason of BLOCKED_REASONS) {
+    const plain = present({ status: "blocked", blockedReason, detail: "" });
+    for (const detail of ["Settings unreadable", "Claude observer unavailable", "Idle delay exceeds the cache window",
+      "Waiting for connection after launch"])
+      assert.deepEqual(present({ status: "blocked", blockedReason, detail }), plain, `${blockedReason}: ${detail}`);
+  }
+  // An older server sends no code: the generic text, whatever the detail says.
+  const generic = present({ status: "blocked", detail: "" });
+  assert.match(generic.description, /next reply/);
+  for (const detail of ["Settings unreadable", "Claude observer unavailable", "Idle delay exceeds the cache window"])
+    assert.deepEqual(present({ status: "blocked", detail }), generic);
+  assert.equal(RowSchema.parse({ ...row, status: "blocked", detail: "Claude observer unavailable" }).blockedReason, undefined);
+});
+
 test("normal waiting remains on and a persistent pending-input mismatch needs attention", () => {
-  for (const detail of ["Waiting for an observed ordinary turn", "Context usage unknown",
-    "Cache window passed", "Waiting for cache data", "Waiting for connection"])
-    assert.equal(present({ status: "blocked", detail }).label, "Compact on");
+  for (const blockedReason of ["waiting_for_turn", "context_usage_unknown", "cache_window_passed", "waiting_for_reply",
+    "claude_working", "policy_changed", undefined])
+    assert.equal(present({ status: "blocked", blockedReason }).label, "Compact on");
   assert.match(present({ status: "busy", busyReason: "permission" }).description, /permission/);
   assert.match(present({ status: "busy", busyReason: "input" }).description, /pending input/);
   assert.equal(present({ status: "busy", busyReason: "input", inputIdleSince: now - INPUT_IDLE_GRACE_MS + 1 }).label, "Compact on");

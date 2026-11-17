@@ -6,6 +6,7 @@ import { homedir } from 'node:os';
 import { z } from 'zod';
 import { observerAsset } from './observer-assets.generated';
 import { Refusal, type NativeOperation, type Observation, type StoredOperation } from './model';
+import type { Blocked } from '../shared/rpc';
 import { createCacheReader } from './cache';
 import { CLOCK_STEP_TOLERANCE_MS } from './deadline';
 
@@ -29,7 +30,9 @@ const ReceiptSchema = z.object({
   revision: z.number().int(), status: z.enum(['completed', 'failed', 'unknown']),
   reason: z.string().nullable(), observedAt: z.number().finite(),
 });
-const ManifestSchema = z.object({ launchId: z.string().uuid(), build: z.string() });
+// `preparedAt` is absent from launches prepared by earlier releases.
+const ManifestSchema = z.object({ launchId: z.string().uuid(), build: z.string(),
+  preparedAt: z.number().finite().optional() });
 // Ledgers and receipts are small; anything larger is not one of ours.
 const MAX_FILE_BYTES = 32_768;
 // The input-counting, command-guard, cancellation and clock-step fixes keep the
@@ -43,6 +46,19 @@ const compatibleBuilds = new Set([observerAsset.version,
   '7d9c570c36bcad4db9ef816c0b704c5b0d01d12c7522b215cdfbbfc160c86648',
   '9fa0456c8d59db1297e540db98993d8d23e34dbfb4a487843334926447ece70b',
   'ece7bf8ce5445aedb974f30472983b78c7358b8feea99d15c1ef2369d88a26e4']);
+
+// What a placeholder ledger means. Session open writes `{}` and the observer
+// replaces it on its first write, which it makes during any turn. So once an
+// ordinary turn has both started and finished after the launch was prepared,
+// a placeholder means the observer never loaded. Until then it is starting.
+// Waiting for the turn to finish, not just start, keeps this clear of the
+// observer's first asynchronous write; no elapsed-time guess is involved.
+export function placeholderReason(preparedAt: number, agent: Pick<Observation, 'idle' | 'revision'>): Blocked {
+  const turnAt = agent.revision === null ? NaN : Date.parse(agent.revision);
+  return agent.idle && turnAt > preparedAt
+    ? { reason: 'observer_missing', detail: 'Claude observer did not load in this session; reopen it' }
+    : { reason: 'observer_starting', detail: 'Claude observer starting; waiting for a completed reply' };
+}
 
 export function createObserver(options: { home?: string; now?: () => number } = {}) {
   const base = join(options.home ?? process.env.PASEO_HOME ?? join(homedir(), '.paseo'),
@@ -75,8 +91,11 @@ export function createObserver(options: { home?: string; now?: () => number } = 
   // null means there is no usable observer: none launched, an incompatible,
   // closed or unsafe launch, or a heartbeat older than a minute. Failing to read
   // one is different and is thrown, so nothing treats a busy or half-written
-  // file as proof that the observer is gone.
-  async function read(agentId: string): Promise<{ ledger: Ledger; directory: string } | null> {
+  // file as proof that the observer is gone. A ledger still holding the
+  // session-open placeholder is neither: it returns `ledger: null` with the
+  // time its launch was prepared (see placeholderReason).
+  async function read(agentId: string): Promise<{ ledger: Ledger; directory: string } |
+    { ledger: null; directory: string; preparedAt: number } | null> {
     // Reading and parsing together: a missing file is absence, anything else a fault.
     const load = async <T>(work: () => Promise<T>) => {
       try { return await work(); }
@@ -93,7 +112,12 @@ export function createObserver(options: { home?: string; now?: () => number } = 
     const path = join(directory, 'ledger.json');
     const info = await load(() => lstat(path));
     if (!info || !info.isFile() || info.isSymbolicLink() || info.size > MAX_FILE_BYTES) return null;
-    const ledger = await load(async () => LedgerSchema.parse(JSON.parse(await readFile(path, 'utf8'))));
+    const raw: unknown = await load(async () => JSON.parse(await readFile(path, 'utf8')));
+    if (raw && typeof raw === 'object' && !Array.isArray(raw) && Object.keys(raw).length === 0)
+      // Launches from earlier releases recorded no preparation time; the
+      // placeholder is written then and never touched until the observer writes.
+      return { ledger: null, directory, preparedAt: manifest.preparedAt ?? info.mtimeMs };
+    const ledger = raw === null ? null : await load(async () => LedgerSchema.parse(raw));
     if (!ledger || ledger.launchId !== manifest.launchId || ledger.closed ||
         now() < ledger.updatedAt - CLOCK_STEP_TOLERANCE_MS || now() - ledger.updatedAt > 60_000) return null;
     const cache = await cacheWindow(ledger.cacheRequest, ledger.transcriptPath,
@@ -116,14 +140,15 @@ export function createObserver(options: { home?: string; now?: () => number } = 
       await rm(directory, { recursive: true, force: true }).catch(() => {});
     }
   }
-  function reason(ledger: Ledger | undefined, agent: Observation, dueAt = now()) {
+  function reason(ledger: Ledger | undefined, agent: Observation, dueAt = now()): Blocked | null {
     if (!ledger || ledger.sessionId !== agent.sessionId)
-      return 'Claude observer unavailable; start a new conversation session';
+      return { reason: 'observer_missing', detail: 'Claude observer unavailable; start a new conversation session' };
     if (ledger.activeTurns.length || ledger.pendingInputs || ledger.compact?.status === 'running')
-      return 'Claude is still working';
-    if (ledger.cacheDeadline === null) return 'Waiting for an ordinary reply';
-    if (now() >= ledger.cacheDeadline - 30_000) return 'Cache window passed';
-    if (dueAt >= ledger.cacheDeadline - 30_000) return `Idle delay exceeds the ${ledger.cache?.ttlMinutes}-minute cache window (${ledger.cache?.source})`;
+      return { reason: 'claude_working', detail: 'Claude is still working' };
+    if (ledger.cacheDeadline === null) return { reason: 'waiting_for_reply', detail: 'Waiting for an ordinary reply' };
+    if (now() >= ledger.cacheDeadline - 30_000) return { reason: 'cache_window_passed', detail: 'Cache window passed' };
+    if (dueAt >= ledger.cacheDeadline - 30_000) return { reason: 'idle_delay_exceeds_cache',
+      detail: `Idle delay exceeds the ${ledger.cache?.ttlMinutes}-minute cache window (${ledger.cache?.source})` };
     return null;
   }
   async function cancel(operation: { directory: string; id: string }, sent = true) {
@@ -194,7 +219,9 @@ export function createObserver(options: { home?: string; now?: () => number } = 
       await writeFile(join(mod, 'hooks', 'hooks.json'), JSON.stringify({ modules: ['./register.mjs'] }), { mode: 0o600 });
       await writeFile(join(mod, 'hooks', 'register.mjs'), observerAsset.source + '\nexport function register(on) { registerObserver(on, ' +
         JSON.stringify(configuration) + '); }\n', { mode: 0o600 });
-      await atomic(join(parent, 'current.json'), { launchId, build: observerAsset.version });
+      // The preparation time is durable so a restarted plugin reads a
+      // placeholder ledger the same way (see placeholderReason).
+      await atomic(join(parent, 'current.json'), { launchId, build: observerAsset.version, preparedAt: now() });
       launchesStartedHere.set(request.agentId, launchId);
       // Best effort: a failed prune only leaves stale launch directories on disk,
       // and the launch must proceed.
@@ -206,19 +233,27 @@ export function createObserver(options: { home?: string; now?: () => number } = 
     },
     // In memory, so it never fails: whether this instance started that launch.
     startedHere: (agentId: string, launchId: string) => launchesStartedHere.get(agentId) === launchId,
-    async readiness(agent: Observation, dueAt?: number) {
+    async readiness(agent: Observation, dueAt?: number): Promise<Blocked | null> {
       // A status display; an unreadable observer is reported, never thrown.
       const current = await read(agent.agentId).catch(() => undefined);
-      return current === undefined ? 'Claude observer status unavailable; retrying'
-        : reason(current?.ledger, agent, dueAt);
+      if (current === undefined)
+        return { reason: 'observer_unreadable', detail: 'Claude observer status unavailable; retrying' };
+      if (current?.ledger === null) return placeholderReason(current.preparedAt, agent);
+      return reason(current?.ledger, agent, dueAt);
     },
     async prepare(agent: Observation, requireCache: boolean, expiresAt: number, id: string = randomUUID()) {
       const current = await read(agent.agentId);
+      if (current?.ledger === null) {
+        const placeholder = placeholderReason(current.preparedAt, agent);
+        // A starting observer is a fault: retried until the send deadline.
+        if (placeholder.reason === 'observer_starting') throw new Error(placeholder.detail);
+        throw new Refusal(placeholder.detail);
+      }
       if (!current || current.ledger.sessionId !== agent.sessionId) throw new Refusal('Claude observer unavailable');
       const { ledger, directory } = current;
       if (ledger.activeTurns.length || ledger.pendingInputs || ledger.compact?.status === 'running')
         throw new Refusal('Claude is still working');
-      if (requireCache) { const blocked = reason(ledger, agent); if (blocked) throw new Refusal(blocked); }
+      if (requireCache) { const blocked = reason(ledger, agent); if (blocked) throw new Refusal(blocked.detail); }
       const request = { id, launchId: ledger.launchId, generation: ledger.generation,
         sessionId: ledger.sessionId, revision: ledger.revision, preparedAt: now(), expiresAt,
         requireCache, cacheDeadline: ledger.cacheDeadline, clockEpoch: ledger.clockEpoch, status: 'prepared' };

@@ -354,8 +354,8 @@ test('idle pending input is distinguished from an active reply without allowing 
   let activeTurns: string[] = [];
   native.read = async (id) => {
     const current = await read(id);
-    return current ? { ...current, ledger: { ...current.ledger, pendingInputs, activeTurns,
-      ordinaryEndedAt: 1000 } } : null;
+    return current?.ledger ? { ...current, ledger: { ...current.ledger, pendingInputs, activeTurns,
+      ordinaryEndedAt: 1000 } } : current;
   };
   const host = fixture([], undefined, false, [], { observer: native });
   const stuck = (await host.gateway.refresh('a'))!;
@@ -468,8 +468,8 @@ test("recovery requires both the native receipt and the exact message's command 
 test('native activity identity survives compaction without restoring its scheduling window', async () => {
   const native = observer(null)!;
   const initial = (await native.read('a'))!;
-  let ledger = initial.ledger;
-  native.read = async () => ({ ...initial, ledger });
+  let ledger = initial.ledger!;
+  native.read = async () => ({ directory: initial.directory, ledger });
   const host = fixture([], undefined, false, [], { observer: native });
   const before = await host.gateway.refresh('a');
   assert(before?.activityKey);
@@ -521,7 +521,7 @@ function directory(pageSize = 2, { slow = [] as string[], broken = [] as string[
     if (slow.includes(id)) await new Promise(() => {});
     await holdRead(id);
     const current = await read(id);
-    return current ? { ...current, ledger: { ...current.ledger, sessionId: `native-${id}` } } : null;
+    return current?.ledger ? { ...current, ledger: { ...current.ledger, sessionId: `native-${id}` } } : current;
   };
   const host = createGateway({ observer: native });
   host.attach({

@@ -60,6 +60,36 @@ export const finishedState = (status: "completed" | "failed" | "unknown" | "expi
 // Why nothing is compacted in a session the host must reopen first (Paseo 0.14).
 export const SESSION_RESUME_REQUIRED = "Session must resume after plugin reload; send a message before compacting";
 
+// Why a row is blocked. The controls choose their explanation from this code
+// alone; `detail` is the human-readable reason and may be reworded freely.
+export const BLOCKED_REASONS = [
+  "settings_unreadable",
+  "context_usage_unknown",
+  // This host cannot run the observer at all, so nothing is automatic.
+  "observer_not_supported",
+  // The session's observer has not written yet and no turn has finished since
+  // its launch was prepared: normal startup.
+  "observer_starting",
+  // The observer's file exists but could not be read just now.
+  "observer_unreadable",
+  // No usable observer for this session; reopening it may load one.
+  "observer_missing",
+  "resume_required",
+  "claude_working",
+  "waiting_for_reply",
+  "cache_window_passed",
+  "idle_delay_exceeds_cache",
+  "policy_changed",
+  "waiting_for_turn",
+] as const;
+export const BlockedReasonSchema = z.enum(BLOCKED_REASONS);
+export type BlockedReason = typeof BLOCKED_REASONS[number];
+export type Blocked = { reason: BlockedReason; detail: string };
+// Stored codes are read as plain strings so a code from a newer release still
+// reads after a rollback; one this release does not know is dropped.
+export const knownBlockedReason = (code: string | undefined): BlockedReason | undefined =>
+  BLOCKED_REASONS.includes(code as BlockedReason) ? code as BlockedReason : undefined;
+
 export const RowSchema = z.object({
   agentId: z.string(),
   title: z.string().nullable(),
@@ -77,6 +107,8 @@ export const RowSchema = z.object({
   undoSkip: z.object({ id: z.string(), dueAt: z.number() }).nullable().default(null),
   status: StatusSchema,
   detail: z.string(),
+  // Only for a blocked row. Absent from older servers.
+  blockedReason: BlockedReasonSchema.optional(),
   // Present for an explicit Compact now attempt so the client can correlate
   // its eventual polled outcome without keeping the initiating RPC open.
   operationId: z.string().nullable().default(null),
