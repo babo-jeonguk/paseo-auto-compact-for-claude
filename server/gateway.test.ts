@@ -680,32 +680,36 @@ test("refreshing an ineligible agent does not read its ledger; an eligible one s
 
 // A /compact whose live timeline view is lost right after the send: the host
 // emits `lost`, then `live` items. `history` is what a timeline refetch returns,
-// the command's own entry first unless the test says otherwise.
+// the command's own entry first unless the test says otherwise; `lose` emits
+// another lost view while that read is in flight. `reads` counts the refetches.
 const LOST_VIEW = ["subscription_restored", "replacement", "error"] as const;
+type HistoryEntry = { turnId: string | null; item: unknown };
 const BOUNDARY = { type: "compaction", status: "completed", trigger: "manual" };
 async function lostView(lost: typeof LOST_VIEW[number], { live = [] as readonly unknown[], before = [] as readonly unknown[],
-  history = (id: string) => [command(id), { turnId: "compact-1", item: BOUNDARY }] as Array<{ turnId: string | null; item: unknown }>,
+  history = ((id: string) => [command(id), { turnId: "compact-1", item: BOUNDARY }]) as (id: string, lose: () => void) => HistoryEntry[],
   receipt = { status: "completed", detail: "Native PostCompact" } as { status: "completed" | "unknown"; detail: string } | null,
-  timeoutMs = 1_000 } = {}) {
-  const host = fixture([], undefined, false, [...before], { observer: observer(receipt), timeoutMs });
+  timeoutMs = 1_000, now = Date.now as () => number } = {}) {
+  const host = fixture([], undefined, false, [...before], { observer: observer(receipt), timeoutMs, now });
   const send = host.ref.send;
   let emit!: (message: unknown) => void;
   const subscribe = host.ref.timeline.subscribe;
   host.ref.timeline.subscribe = listener => { emit = listener; return subscribe(listener); };
+  const lose = () => emit({ agentId: "a", event: lost === "replacement" ? { type: lost, epoch: "epoch-2" }
+    : lost === "error" ? { type: lost, error: "transport closed" } : { type: lost }, subscriptionId: "s" });
   host.ref.send = async (text, options) => {
     await send(text, options);
-    emit({ agentId: "a", event: lost === "replacement" ? { type: lost, epoch: "epoch-2" }
-      : lost === "error" ? { type: lost, error: "transport closed" } : { type: lost }, subscriptionId: "s" });
+    lose();
     for (const item of live) emit({ agentId: "a", event: { type: "timeline", provider: "claude", turnId: "compact-1", item } });
   };
-  host.ref.timeline.refetch = async () => ({ entries: history(id) });
+  let reads = 0;
+  host.ref.timeline.refetch = async () => { reads++; return { entries: history(id, lose) }; };
   const id = `lost-${lost}`;
   const saved: OperationEvidence[] = [];
   const result = await host.gateway.automatic!((await host.gateway.refresh("a"))!, undefined, {
-    id, sendBy: Date.now() + 30_000, checkpoint: async evidence => { saved.push(evidence); }, current: () => true,
+    id, sendBy: now() + 30_000, checkpoint: async evidence => { saved.push(evidence); }, current: () => true,
   });
   assert.equal(host.sendCount(), 1, "/compact is never sent twice");
-  return { result, evidence: saved.at(-1) };
+  return { result, evidence: saved.at(-1), reads };
 }
 const command = (id: string) => ({ turnId: "compact-1", item: { type: "user_message", clientMessageId: id } });
 
@@ -748,12 +752,81 @@ test("after a lost live view, completion still needs the native receipt and the 
       ["boundary in another turn", { history: foreign }],
       ["command missing from the page", { history: missing }],
     ] as const) {
-      const { result, evidence } = await lostView(lost, { live: [BOUNDARY], timeoutMs: 60, ...options });
+      const { result, evidence, reads } = await lostView(lost, { live: [BOUNDARY], timeoutMs: 60, ...options });
       assert.equal(result.status, "unknown", `${lost}: ${name}`);
+      // History is only worth reading once Claude reports completion; when it
+      // does, the outcome must come from having read it, not from the deadline.
+      assert.equal(reads > 0, options !== undefined && !("receipt" in options), `${lost}: ${name} reads history`);
       assert.equal(evidence?.invalidated, false, `${lost}: ${name} leaves the evidence for reconciliation`);
       assert.notEqual(evidence?.boundary, true, `${lost}: ${name} records no boundary`);
     }
   }
+});
+
+test("a history page read across another lost live view proves nothing, not even a change", async () => {
+  const other = { turnId: "next-turn", item: { type: "user_message", clientMessageId: "someone-else" } };
+  const boundary = { turnId: "compact-1", item: BOUNDARY };
+  for (const lost of LOST_VIEW) {
+    // The first page is read while the view is lost again, so it may belong to
+    // the replaced epoch; the page read after it shows the real history.
+    let offset = 0, first = true;
+    const history = (id: string, lose: () => void) => {
+      if (!first) return [command(id), boundary];
+      first = false;
+      lose();
+      offset += 1_000; // the next poll may read history again
+      return [command(id), other, boundary];
+    };
+    const { result, evidence, reads } = await lostView(lost, { history, timeoutMs: 5_000, now: () => Date.now() + offset });
+    assert.equal(reads, 2, lost);
+    assert.equal(result.status, "completed", lost);
+    assert.equal(evidence?.invalidated, false, lost);
+  }
+});
+
+test("after a lost live view, history is read at most once a second while completion is awaited", async () => {
+  let time = Date.now();
+  const native = observer({ status: "completed", detail: "Native PostCompact" })!;
+  let polls = 0;
+  const receipt = native.receipt;
+  native.receipt = (...args) => { polls++; return receipt(...args); };
+  const host = fixture([], undefined, false, [], { observer: native, timeoutMs: 120_000, now: () => time });
+  const send = host.ref.send;
+  let emit!: (message: unknown) => void;
+  const subscribe = host.ref.timeline.subscribe;
+  host.ref.timeline.subscribe = listener => { emit = listener; return subscribe(listener); };
+  host.ref.send = async (text, options) => {
+    await send(text, options);
+    emit({ agentId: "a", event: { type: "subscription_restored" }, subscriptionId: "s" });
+  };
+  let reads = 0;
+  // The page never shows the boundary, so the attempt keeps polling.
+  host.ref.timeline.refetch = async () => { reads++; return { entries: [command("interval")] }; };
+  const attempt = host.gateway.automatic!((await host.gateway.refresh("a"))!, undefined, {
+    id: "interval", sendBy: time + 30_000, checkpoint: async () => {}, current: () => true,
+  });
+  const until = async (done: () => boolean) => {
+    for (let tries = 0; !done(); tries++) {
+      assert.ok(tries < 2_000, "the attempt stopped polling");
+      await new Promise(resolve => setTimeout(resolve, 1));
+    }
+  };
+  const pollsAfter = async (count: number) => { const target = polls + count; await until(() => polls >= target); };
+  try {
+    await until(() => reads >= 1);
+    await pollsAfter(5);
+    assert.equal(reads, 1, "no second read within the same instant");
+    time += 999;
+    await pollsAfter(5);
+    assert.equal(reads, 1, "no second read before a second has passed");
+    time += 1;
+    await until(() => reads >= 2);
+    assert.equal(reads, 2, "one more read once a second has passed");
+  } finally {
+    time += 120_000; // past the live deadline, so the attempt ends even if an assertion failed
+    assert.equal((await attempt).status, "unknown");
+  }
+  assert.equal(host.sendCount(), 1);
 });
 
 test("a superseding user message seen live, before or after a lost live view, still ends the attempt as a change", async () => {
