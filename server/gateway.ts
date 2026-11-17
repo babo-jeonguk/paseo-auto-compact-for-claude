@@ -264,13 +264,17 @@ export function createGateway(options: {
           const at = losses;
           // A failed or late read is evidence of nothing; the next poll reads again.
           const found = await wait(history(agentId, id)).catch(() => null);
-          if (found?.laterInput) {
-            superseded = true;
-            await checkpoint(true).catch(() => {});
-            return { status: "unknown", detail: "Conversation changed during compaction; no automatic retry" };
+          // A page read across another loss may belong to the replaced epoch, so
+          // it proves nothing as a whole: neither a later user message nor a
+          // pinned turn or boundary. The next poll reads history again.
+          if (found && losses === at) {
+            if (found.laterInput) {
+              superseded = true;
+              await checkpoint(true).catch(() => {});
+              return { status: "unknown", detail: "Conversation changed during compaction; no automatic retry" };
+            }
+            pinned = found;
           }
-          // A page read across another loss may belong to the replaced epoch.
-          if (found && losses === at) pinned = found;
         }
         const { turnId, boundary: proven } = proof();
         const ended = turnId ? endings.get(turnId) : null;
