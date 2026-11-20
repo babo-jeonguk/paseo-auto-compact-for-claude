@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { registerObserver } from '../server/observer-source.mjs';
 
 function fixture(env = {}, settings = {}) {
-  let time = 1_000_000, contextTokens = 100_000;
+  let time = 1_000_000, contextTokens = 100_000, usageGate = null;
   const hooks = new Map(), files = new Map();
   const timers = new Set();
   const configuration = { launchId: 'launch-1', ledger: '/ledger', request: '/request', receipts: '/receipts' };
@@ -13,7 +13,9 @@ function fixture(env = {}, settings = {}) {
     } },
     fs: { write: async (p, v) => files.set(p, v), read: async p => files.get(p) ?? '{}' },
     session: { id: async () => 'native-1',
-      usage: async () => ({ context: { window: 1_000_000, ...(contextTokens === undefined ? {} : { tokens: contextTokens }) } }) },
+      // A held reading resolves to the context as it is when released.
+      usage: async () => { await usageGate;
+        return { context: { window: 1_000_000, ...(contextTokens === undefined ? {} : { tokens: contextTokens }) } }; } },
     env: { get: async name => env[name] },
     settings: { read: async () => settings } };
   registerObserver((name, ...rest) => { hooks.set(name, rest.at(-1)); return { catch() {} }; }, configuration);
@@ -39,6 +41,7 @@ function fixture(env = {}, settings = {}) {
     timers: () => timers.size,
     advance(ms) { time += ms; },
     context(tokens) { contextTokens = tokens; },
+    holdUsage() { let release; usageGate = new Promise(resolve => { release = () => { usageGate = null; resolve(); }; }); return release; },
     async start() { await event('session.start'); },
     async ordinary(reported = usage, responseDelay = 0) {
       await event('prompt.submit', { text: 'ordinary input' });
@@ -354,7 +357,7 @@ test('with classic hooks skipped by an organization policy, a reset context wind
   assert.deepEqual(f.ledger().compact, { id: 'operation-1', status: 'completed', revision: 1, reason: null });
 });
 
-test('with classic hooks skipped, an unchanged context window fails and new input makes it unknown', async () => {
+test('with classic hooks skipped, an unchanged context window fails', async () => {
   const f = fixture(); await f.start(); await f.ordinary(); f.request();
   await f.compact();
   for (let i = 0; i < 19; i++) await f.tick();
@@ -362,12 +365,66 @@ test('with classic hooks skipped, an unchanged context window fails and new inpu
   await f.tick();
   assert.equal(f.ledger().compact.status, 'failed');
   assert.equal(f.ledger().compact.reason, 'Claude returned without completing compaction');
-  const overlap = fixture(); await overlap.start(); await overlap.ordinary(); overlap.request();
-  await overlap.compact();
-  await overlap.event('prompt.submit', { text: 'new work' });
-  overlap.context(undefined);
-  await overlap.tick();
-  assert.equal(overlap.ledger().compact.status, 'unknown');
+});
+
+// Paseo 0.16.2 and later deliver input steered into a compaction right after
+// the command returns. Submitting it does not refill the context; the next
+// model response does.
+test('with classic hooks skipped, a context already reset when the command returns completes despite steered input', async () => {
+  const f = fixture(); await f.start(); await f.ordinary(); f.request();
+  await f.compact(async () => f.context(undefined));
+  // The steered input is answered before the first 500 ms poll.
+  await f.event('prompt.submit', { text: 'steered input', origin: { kind: 'sdk' } });
+  await f.event('turn.start', { text: 'steered input', turnId: 'user-2' });
+  await f.step('user-2');
+  await f.tick();
+  const { id, status, reason } = f.ledger().compact;
+  assert.deepEqual({ id, status, reason }, { id: 'operation-1', status: 'completed', reason: null });
+  assert.equal(JSON.parse(f.files.get('/receipts/operation-1.json')).status, 'completed');
+});
+
+test('with classic hooks skipped, input submitted after the command does not stop a later reset from counting', async () => {
+  const f = fixture(); await f.start(); await f.ordinary(); f.request();
+  await f.compact();
+  await f.event('prompt.submit', { text: 'steered input', origin: { kind: 'sdk' } });
+  assert.equal(f.ledger().compact.status, 'running');
+  f.context(undefined);
+  await f.tick();
+  assert.equal(f.ledger().compact.status, 'completed');
+});
+
+test('with classic hooks skipped, a later model request before any reset leaves completion unknown', async () => {
+  const f = fixture(); await f.start(); await f.ordinary(); f.request();
+  await f.compact();
+  await f.event('prompt.submit', { text: 'steered input', origin: { kind: 'sdk' } });
+  await f.event('turn.start', { text: 'steered input', turnId: 'user-2' });
+  await f.step('user-2');
+  // A refill cannot be told apart from a compaction that did nothing.
+  assert.equal(f.ledger().compact.status, 'unknown');
+  f.context(undefined);
+  for (let i = 0; i < 21; i++) await f.tick();
+  assert.equal(f.ledger().compact.status, 'unknown');
+});
+
+test('with classic hooks skipped, a reading that ends after the operation was superseded records nothing', async () => {
+  for (const [name, supersede] of [
+    ['session end', f => f.event('session.end')],
+    ['model switch', f => f.event('classic.PostModelSwitch', { to_model: 'another-model' })],
+    ['later model request', async f => {
+      await f.event('turn.start', { text: 'steered input', turnId: 'user-2' });
+      await f.step('user-2');
+    }],
+  ]) {
+    const f = fixture(); await f.start(); await f.ordinary(); f.request();
+    await f.compact();
+    const release = f.holdUsage();
+    const reading = f.tick();
+    await supersede(f);
+    f.context(undefined);
+    release();
+    await reading;
+    assert.equal(f.ledger().compact.status, 'unknown', name);
+  }
 });
 
 test('without a context reading before /compact, completion stays unknown rather than guessed', async () => {
