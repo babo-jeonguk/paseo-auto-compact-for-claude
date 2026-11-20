@@ -110,7 +110,11 @@ async function confirm($, operation) {
     // Read the time before the usage; the usage reading is then the last
     // await before the write, and the check after it covers both.
     const readAt = await $.clock.now();
-    const reset = (await $.session.usage()).context.tokens === undefined;
+    // A failed reading is no evidence of anything, either way: count it as no
+    // reset seen so the deadline rule decides (read again before the limit,
+    // failed at it) rather than ending the operation on the failed read.
+    let reset;
+    try { reset = (await $.session.usage()).context.tokens === undefined; } catch { reset = false; }
     // A reading counts only if nothing superseded the operation while it ran;
     // nothing is awaited between this check and the write below.
     if (!current()) return true;
