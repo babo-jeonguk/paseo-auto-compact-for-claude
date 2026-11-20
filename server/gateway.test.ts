@@ -968,25 +968,61 @@ test("live observation reports a confirmed query-restart refusal promptly for bo
   }
 });
 
-test("a generation change without a matching refusal stays unknown until the observation deadline", async () => {
-  const obs = await realObserverFixture();
+test("a generation change without a matching refusal stays pending until the observation deadline", async () => {
+  let time = 1_000_000;
+  const obs = await realObserverFixture(() => time);
+  const host = fixture([], undefined, false, [], {
+    observer: obs.native, now: () => time, timeoutMs: 120_000, pollMs: 1,
+  });
+  let attempt: Promise<import("./model").CompactOutcome> | undefined;
   try {
-    const host = fixture([], undefined, false, [], { observer: obs.native, timeoutMs: 40, pollMs: 1 });
     const send = host.ref.send;
+    const originalResult = obs.native.result;
+    let pollsOnNewGeneration = 0;
+    obs.native.result = async (agentId, op) => {
+      const res = await originalResult(agentId, op);
+      if (obs.ledger.generation === "gen-2") pollsOnNewGeneration++;
+      return res;
+    };
     host.ref.send = async (text, options) => {
       await send(text, options);
       obs.ledger.generation = "gen-2";
       obs.ledger.revision = 0;
+      obs.ledger.compact = null;
       await obs.saveLedger();
     };
     const agent = (await host.gateway.refresh("a"))!;
-    const outcome = await host.gateway.compact("a", agent, {
-      id: "gen-only", sendBy: Date.now() + 30_000, checkpoint: async () => {}, current: () => true,
+    let settled = false;
+    attempt = host.gateway.compact("a", agent, {
+      id: "gen-only", sendBy: time + 30_000, checkpoint: async () => {}, current: () => true,
     });
+    void attempt.finally(() => { settled = true; });
+    const until = async (done: () => boolean) => {
+      for (let tries = 0; !done(); tries++) {
+        assert.ok(tries < 2_000, "the attempt stopped polling before the deadline");
+        await new Promise(resolve => setTimeout(resolve, 1));
+      }
+    };
+    await until(() => pollsOnNewGeneration >= 3);
+    assert.equal(settled, false, "a bare generation change must not exit live observation early");
+    assert.equal((await obs.readRequest()).status, "prepared");
+    time += 59_000;
+    await obs.saveLedger();
+    const afterChange = pollsOnNewGeneration;
+    await until(() => pollsOnNewGeneration >= afterChange + 2);
+    assert.equal(settled, false, "execution must stay pending before the live deadline");
+    assert.equal((await obs.readRequest()).status, "prepared");
+    time += 61_000;
+    const outcome = await attempt;
     assert.equal(outcome.status, "unknown");
     assert.equal(host.sendCount(), 1);
+    assert.equal((await obs.readRequest()).status, "cancelled");
+  } finally {
+    time += 120_000;
+    await attempt?.catch(() => {});
     host.stop();
-  } finally { await obs.close(); }
+    await obs.close();
+  }
 });
 
 test("stopping the plugin after dispatch preserves request.json so a query-restart refusal remains recoverable", async () => {
