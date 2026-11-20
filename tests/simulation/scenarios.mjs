@@ -20,18 +20,21 @@ async function settledAgainstEvidence(f, id, operationId) {
     const current = (await f.rpc('operation', { operationId })).operation;
     return ['succeeded', 'failed', 'unknown'].includes(current?.state) ? current : null;
   }, 'settled compaction outcome');
-  // Every caller dispatched the command, so Claude has a receipt for it and Paseo one command row.
+  // Every caller dispatched the command, so Claude recorded an outcome for it and Paseo one
+  // command row. The plugin pre-creates an empty receipt file, which is not a record.
   const receipt = await f.receipt(id, operationId);
+  assert.equal(receipt.id, operationId, `Claude recorded the request: ${JSON.stringify(receipt)}`);
+  assert(['completed', 'failed', 'unknown'].includes(receipt.status), JSON.stringify(receipt));
   const rows = await f.timeline(id);
   const commands = rows.filter(row => row.item.type === 'user_message' && row.item.clientMessageId === operationId);
   assert.equal(commands.length, 1, '/compact is sent exactly once');
   const { turnId } = commands[0];
   assert(turnId, 'the command row names its turn');
-  const boundaryAt = rows.findIndex(row => row.turnId === turnId && row.item.type === 'compaction' &&
+  const boundary = rows.some(row => row.turnId === turnId && row.item.type === 'compaction' &&
     row.item.status === 'completed' && row.item.trigger === 'manual');
-  const evidence = { outcome: operation.state, native: receipt.status, boundary: boundaryAt >= 0 };
+  const evidence = { outcome: operation.state, native: receipt.status, boundary };
   assert.equal(operation.state === 'succeeded', receipt.status === 'completed' && evidence.boundary, JSON.stringify(evidence));
-  return { ...evidence, receipt, boundaryAt };
+  return { ...evidence, receipt };
 }
 // Starts Compact now on a conversation whose reply is scheduled and holds
 // Claude's compaction request at the model; `next` holds the request after it.
@@ -46,17 +49,18 @@ async function heldCompaction(f, model, id) {
 }
 // Settles a held compaction that other input overlapped, then checks the
 // follow-up: its own reply, one model request each, and when the compaction
-// completed, a reply that comes after the command's boundary.
+// completed, a follow-up request that started only after Claude recorded that
+// completion. Both times come from the same machine clock.
 async function overlapSettled(f, model, id, held, label) {
   await waitFor(() => held.next.requestId, `${label}: its own request`);
   held.next.release();
-  const { receipt, boundaryAt, ...evidence } = await settledAgainstEvidence(f, id, held.accepted.operationId);
+  const { receipt, ...evidence } = await settledAgainstEvidence(f, id, held.accepted.operationId);
   await replied(f, id, held.next, `${label}: its own reply`);
   assert.equal(model.count - held.requestsBefore, 2, 'one compaction request and one for the follow-up');
   if (evidence.outcome === 'succeeded') {
-    const replyAt = (await f.timeline(id)).findIndex(row => row.item.type === 'assistant_message' &&
-      row.item.text.includes(`SIMULATION_REPLY_${held.next.requestId}`));
-    assert(replyAt > boundaryAt, 'a completed compaction is answered only after its boundary');
+    const followUp = model.requests.find(request => request.id === held.next.requestId);
+    assert(followUp.at >= receipt.observedAt,
+      `the follow-up started ${receipt.observedAt - followUp.at} ms before Claude recorded the compaction`);
   }
   return evidence;
 }
@@ -578,7 +582,7 @@ export const scenarios = [
       const prepared = await f.ledger(id);
       const accepted = await f.rpc('now', { agentId: id, revision: row.revision, target: row.target });
       assert.equal(accepted.status, 'running'); assert(accepted.operationId);
-      const { receipt, boundaryAt, ...evidence } = await settledAgainstEvidence(f, id, accepted.operationId);
+      const { receipt, ...evidence } = await settledAgainstEvidence(f, id, accepted.operationId);
       assert.equal(evidence.outcome, 'succeeded', JSON.stringify(evidence));
       assert.equal(receipt.launchId, prepared.launchId);
       assert.equal(receipt.generation, prepared.generation);

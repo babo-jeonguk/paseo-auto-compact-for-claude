@@ -3,19 +3,20 @@ import { test } from 'node:test';
 import { registerObserver } from '../server/observer-source.mjs';
 
 function fixture(env = {}, settings = {}) {
-  let time = 1_000_000, contextTokens = 100_000, usageGate = null, afterUsage = null, clockGate = null;
+  let time = 1_000_000, contextTokens = 100_000, usageGate = null, afterUsage = null, clockGate = null, usageFailures = 0;
   const hooks = new Map(), files = new Map();
   const timers = new Set();
   const configuration = { launchId: 'launch-1', ledger: '/ledger', request: '/request', receipts: '/receipts' };
   // A held clock read blocks only the first read after a context reading.
   const $ = { clock: { now: async () => { if (clockGate) { const gate = clockGate; clockGate = null; await gate(); } return time; }, every: (_ms, fn) => {
       const timer = { fn, cancel() { timers.delete(timer); } };
-      timers.add(timer); return timer;
+      timer.ms = _ms; timers.add(timer); return timer;
     } },
     fs: { write: async (p, v) => files.set(p, v), read: async p => files.get(p) ?? '{}' },
     session: { id: async () => 'native-1',
       // A held reading resolves to the context as it is when released.
-      usage: async () => { await usageGate; if (afterUsage) { clockGate = afterUsage; afterUsage = null; }
+      usage: async () => { await usageGate;
+        if (usageFailures > 0) { usageFailures--; throw new Error('usage unavailable'); } if (afterUsage) { clockGate = afterUsage; afterUsage = null; }
         return { context: { window: 1_000_000, ...(contextTokens === undefined ? {} : { tokens: contextTokens }) } }; } },
     env: { get: async name => env[name] },
     settings: { read: async () => settings } };
@@ -40,6 +41,8 @@ function fixture(env = {}, settings = {}) {
     async () => { await inner(); return {}; });
   return { event, step, ledger, request, files, compact, tick,
     timers: () => timers.size,
+    intervals: () => [...timers].map(timer => timer.ms),
+    failUsage(count = 1) { usageFailures = count; },
     advance(ms) { time += ms; },
     context(tokens) { contextTokens = tokens; },
     holdClockAfterUsage() {
@@ -466,6 +469,28 @@ test('with classic hooks skipped, a reading that ends after the operation was re
   await reading;
   assert.equal(f.files.get('/receipts/operation-1.json'), undefined, 'no receipt for the replaced operation');
   assert.deepEqual({ id: f.ledger().compact.id, status: f.ledger().compact.status }, { id: null, status: 'running' });
+});
+
+test('with classic hooks skipped, the window is read every 500 ms after the command returns', async () => {
+  const f = fixture(); await f.start(); await f.ordinary(); f.request();
+  await f.compact();
+  assert.deepEqual(f.intervals().sort((a, b) => a - b), [500, 5_000], 'confirmation reads and the heartbeat');
+});
+
+test('with classic hooks skipped, a context reading that fails is retried, and the 10-second limit still applies', async () => {
+  // The first reading, as the command returns, fails; a later one sees the reset.
+  const g = fixture(); await g.start(); await g.ordinary(); g.request();
+  await g.compact(async () => { g.context(undefined); g.failUsage(1); });
+  assert.equal(g.ledger().compact.status, 'running');
+  await g.tick();
+  assert.equal(g.ledger().compact.status, 'completed');
+  // Readings that keep failing end as a failure at the limit, not a stuck operation.
+  const h = fixture(); await h.start(); await h.ordinary(); h.request();
+  await h.compact(async () => h.failUsage(1_000));
+  for (let i = 0; i < 19; i++) await h.tick();
+  assert.equal(h.ledger().compact.status, 'running');
+  await h.tick();
+  assert.equal(h.ledger().compact.status, 'failed');
 });
 
 test('without a context reading before /compact, completion stays unknown rather than guessed', async () => {
