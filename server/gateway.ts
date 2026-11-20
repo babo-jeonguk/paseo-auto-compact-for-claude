@@ -305,8 +305,11 @@ export function createGateway(options: {
         pending.delete(agentId);
       }
       const cleanupMs = options.cleanupTimeoutMs ?? CLEANUP_TIMEOUT_MS;
+      // When the plugin stops after dispatch, leave the prepared request intact
+      // so a restarting query can still attribute its refusal; the next instance's
+      // reconciliation retires it once the operation settles.
       await Promise.all([
-        operation ? bounded(observer!.cancel(operation, sent), cleanupMs).catch(() => {}) : undefined,
+        operation && !(sent && stopped) ? bounded(observer!.cancel(operation, sent), cleanupMs).catch(() => {}) : undefined,
         subscription ? bounded(Promise.resolve(subscription.release()), cleanupMs).catch(() => {}) : undefined,
       ]);
       busy.delete(agentId);

@@ -439,3 +439,56 @@ test('heartbeat and session closure do not recreate a successfully written expir
   assert.equal(f.files.has('/receipts/operation-1.json'), false);
   assert.equal(f.ledger().closed, true);
 });
+
+test('a new generation in the same launch and session records an attributable query-restart refusal', async () => {
+  for (const mode of ['command', 'precompact']) {
+    const f = fixture(); await f.start();
+    const prepared = { launchId: 'launch-1', generation: 'prior-generation', sessionId: 'native-1', revision: 3 };
+    f.request(prepared);
+    let ran = false;
+    const outcome = mode === 'command'
+      ? await f.compact(async () => { ran = true; })
+      : await f.event('classic.PreCompact', { trigger: 'manual' }, async () => { ran = true; return {}; });
+    assert.equal(ran, false, `${mode}: compaction must be blocked`);
+    assert.match(mode === 'command' ? outcome.text : outcome.block, /query restarted/i, mode);
+    const compact = f.ledger().compact;
+    assert.equal(compact.id, 'operation-1', mode);
+    assert.equal(compact.status, 'failed', mode);
+    assert.equal(compact.refusal, 'query_restarted', mode);
+    assert.deepEqual(compact.prepared, prepared, mode);
+    assert.match(compact.reason, /query restarted/i, mode);
+    const receipt = JSON.parse(f.files.get('/receipts/operation-1.json'));
+    assert.equal(receipt.id, 'operation-1', mode);
+    assert.equal(receipt.launchId, 'launch-1', mode);
+    assert.notEqual(receipt.generation, prepared.generation, mode);
+    assert.equal(receipt.sessionId, 'native-1', mode);
+    assert.equal(receipt.status, 'failed', mode);
+    assert.equal(receipt.refusal, 'query_restarted', mode);
+    assert.deepEqual(receipt.prepared, prepared, mode);
+    // A subsequent manual /compact in the new generation runs unblocked and preserves the refusal receipt.
+    await f.compact(async () => { ran = true; });
+    assert.equal(ran, true, `${mode}: later manual compact is not blocked`);
+    assert.equal(f.ledger().compact.id, null, mode);
+    assert.deepEqual(JSON.parse(f.files.get('/receipts/operation-1.json')), receipt, mode);
+  }
+});
+
+test('different launch, different session or generic cancellation never records a query-restart refusal', async () => {
+  for (const [name, overrides] of [
+    ['different launch', { launchId: 'other-launch', generation: 'prior-generation' }],
+    ['different session', { sessionId: 'other-session', generation: 'prior-generation' }],
+    ['generic cancellation', { status: 'cancelled', generation: 'prior-generation' }],
+  ]) {
+    const f = fixture(); await f.start();
+    if (overrides.status === 'cancelled')
+      f.files.set('/request', JSON.stringify({ id: 'operation-1', status: 'cancelled' }));
+    else
+      f.request(overrides);
+    const outcome = await f.compact(async () => { throw new Error('must not compact'); });
+    assert(outcome.text, name);
+    const receipt = JSON.parse(f.files.get('/receipts/operation-1.json'));
+    assert.equal(receipt.status, 'failed', name);
+    assert.equal(receipt.refusal, undefined, name);
+    assert.equal(receipt.prepared, undefined, name);
+  }
+});
