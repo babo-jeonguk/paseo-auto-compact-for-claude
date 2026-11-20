@@ -104,28 +104,52 @@ const CONFIRMATION_READ_INTERVAL_MS = 500;
 async function confirm($, operation) {
   confirming = operation;
   const deadline = await $.clock.now() + CONFIRMATION_WINDOW_MS;
-  const settled = async () => {
-    const current = () => state.compact === operation && operation.status === 'running';
-    if (!current()) return true;
-    // Read the time before the usage; the usage reading is then the last
-    // await before the write, and the check after it covers both.
-    const readAt = await $.clock.now();
-    // A failed reading is no evidence of anything, either way: count it as no
-    // reset seen so the deadline rule decides (read again before the limit,
-    // failed at it) rather than ending the operation on the failed read.
-    let reset;
-    try { reset = (await $.session.usage()).context.tokens === undefined; } catch { reset = false; }
-    // A reading counts only if nothing superseded the operation while it ran;
-    // nothing is awaited between this check and the write below.
-    if (!current()) return true;
-    if (!reset && readAt < deadline) return false;
-    operation.status = reset ? 'completed' : 'failed';
-    if (!reset) operation.reason = 'Claude returned without completing compaction';
-    await save($);
-    return true;
+  const current = () => state.compact === operation && operation.status === 'running';
+  // A reading is evidence of completion only: no fill while the operation is
+  // still current and running. A rejected reading, a fill or a superseded
+  // operation records nothing.
+  let reading = null;
+  const read = async () => {
+    try {
+      let reset;
+      try {
+        reset = (await $.session.usage()).context.tokens === undefined;
+      } catch {
+        // A rejected read is no evidence of a reset or a fill. It records
+        // nothing and the interval still decides at the limit. Caught so it is
+        // not unhandled.
+        return;
+      }
+      // Nothing is awaited between this check and the write below.
+      if (!reset || !current()) return;
+      operation.status = 'completed';
+      await save($);
+    } finally {
+      reading = null;
+    }
   };
-  if (await settled()) return;
-  const timer = await $.clock.every(CONFIRMATION_READ_INTERVAL_MS, async () => { if (await settled()) timer.cancel(); });
+  const startReading = () => {
+    if (reading) return reading;
+    // A failed write is not retried here; the heartbeat saves this state again.
+    reading = read().catch(() => {});
+    return reading;
+  };
+  // The limit is decided here, never by a reading, so a reading that starts
+  // before it and returns after it cannot defer the failure.
+  const timer = await $.clock.every(CONFIRMATION_READ_INTERVAL_MS, async () => {
+    if (!current()) { timer.cancel(); return; }
+    // A reading is never awaited here, so one that does not settle cannot hold the ticks.
+    startReading();
+    const now = await $.clock.now();
+    // A later model request may have recorded unknown while the clock was read.
+    if (!current()) { timer.cancel(); return; }
+    if (now < deadline) return;
+    operation.status = 'failed';
+    operation.reason = 'Claude returned without completing compaction';
+    timer.cancel();
+    await save($);
+  });
+  startReading();
 }
 
 export function registerObserver(on, config) {

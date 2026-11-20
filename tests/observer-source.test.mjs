@@ -22,7 +22,13 @@ function fixture(env = {}, settings = {}) {
     settings: { read: async () => settings } };
   registerObserver((name, ...rest) => { hooks.set(name, rest.at(-1)); return { catch() {} }; }, configuration);
   const event = (name, input = {}, next = async () => ({})) => hooks.get(name)($, input, next);
-  const tick = async (ms = 500) => { time += ms; for (const timer of [...timers]) await timer.fn(); };
+  // Runs the timers due after `ms` (only those with interval `only`, if given), then lets
+  // readings they started settle, as the next event-loop turn would.
+  const tick = async (ms = 500, only) => {
+    time += ms;
+    for (const timer of [...timers]) if (only === undefined || timer.ms === only) await timer.fn();
+    await new Promise(resolve => setImmediate(resolve));
+  };
   const ledger = () => JSON.parse(files.get('/ledger'));
   const request = (overrides = {}) => {
     const state = ledger();
@@ -45,6 +51,13 @@ function fixture(env = {}, settings = {}) {
     failUsage(count = 1) { usageFailures = count; },
     advance(ms) { time += ms; },
     context(tokens) { contextTokens = tokens; },
+    holdNextClock() {
+      let release, reached;
+      const held = new Promise(resolve => { release = resolve; });
+      const arrival = new Promise(resolve => { reached = resolve; });
+      clockGate = () => { reached(); return held; };
+      return { release, reached: arrival };
+    },
     holdClockAfterUsage() {
       let release, reached;
       const held = new Promise(resolve => { release = resolve; });
@@ -525,6 +538,22 @@ test('with classic hooks skipped, a reading still pending at the 10-second limit
   release();
   await f.step('user-2');
   assert.equal(f.ledger().compact.status, 'failed');
+});
+
+test('with classic hooks skipped, a model request while the limit reads the clock keeps unknown', async () => {
+  const f = fixture(); await f.start(); await f.ordinary(); f.request();
+  await f.compact();
+  for (let i = 0; i < 19; i++) await f.tick(500, 500);
+  await f.event('turn.start', { text: 'steered input', turnId: 'user-2' });
+  // The confirmation's tick at the 10-second limit waits on the clock while a model request starts.
+  const { release, reached } = f.holdNextClock();
+  const limit = f.tick(500, 500);
+  await reached;
+  const stepping = f.step('user-2');
+  await new Promise(resolve => setImmediate(resolve));
+  release();
+  await limit; await stepping;
+  assert.equal(f.ledger().compact.status, 'unknown', 'the limit never rewrites a recorded result');
 });
 
 test('without a context reading before /compact, completion stays unknown rather than guessed', async () => {
