@@ -269,13 +269,16 @@ export function createGateway(options: {
         if (ended && ended.outcome.kind !== "completed")
           return { status: "failed", detail: "Compact turn failed or was cancelled; no automatic retry" };
         if (proven && (operation ? native?.status === "completed" : ended?.outcome.kind === "completed")) {
+          const at = losses;
           const after = await wait(gateway.refresh(agentId));
           if (after?.sessionId !== before.sessionId)
             return { status: "failed", detail: "Claude session changed during compaction" };
           await checkpoint(true);
           if (!currentWorker())
             return { status: "unknown", detail: "Worker stopped during completion verification; no automatic retry" };
-          return { status: "completed", detail: "Compaction completed in the same Claude session" };
+          // A view lost during verification voids the proof read before it; the
+          // next poll proves the command's turn and boundary again from history.
+          if (losses === at) return { status: "completed", detail: "Compaction completed in the same Claude session" };
         }
         await wait(new Promise(resolve => setTimeout(resolve, options.pollMs ?? 50)));
       }

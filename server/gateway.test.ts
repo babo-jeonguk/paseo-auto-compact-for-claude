@@ -775,12 +775,13 @@ test("a live view lost while completion is verified is proved again from history
   const subscribe = host.ref.timeline.subscribe;
   host.ref.timeline.subscribe = listener => { emit = listener; return subscribe(listener); };
   const send = host.ref.send;
-  let sent = false;
+  let sent = false, lost = false;
   host.ref.send = async (text, options) => { await send(text, options); sent = true; };
   const refresh = host.ref.refresh;
+  // The view is lost once, during the first session check after the send.
   host.ref.refresh = async () => {
     const current = await refresh();
-    if (sent) emit({ agentId: "a", event: { type: "replacement", epoch: "epoch-2" } });
+    if (sent && !lost) { lost = true; emit({ agentId: "a", event: { type: "replacement", epoch: "epoch-2" } }); }
     return current;
   };
   let reads = 0;
