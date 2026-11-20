@@ -93,27 +93,35 @@ async function admit($, trigger) {
   return reason;
 }
 
+// Time after /compact returns to wait for the live window to report the reset before failing.
+const CONFIRMATION_WINDOW_MS = 10_000;
+// How often to read the live window during that time.
+const CONFIRMATION_READ_INTERVAL_MS = 500;
 // The live window reports no fill from just after a compaction until the
 // next response; a cancelled or no-op /compact leaves the old fill in place.
 // It is read once as the command returns, then every 500 ms, until a later
 // main model request starts (see turn.step) or 10 seconds pass.
 async function confirm($, operation) {
   confirming = operation;
-  const deadline = await $.clock.now() + 10_000;
+  const deadline = await $.clock.now() + CONFIRMATION_WINDOW_MS;
   const settled = async () => {
     const current = () => state.compact === operation && operation.status === 'running';
     if (!current()) return true;
+    // Read the time before the usage; the usage reading is then the last
+    // await before the write, and the check after it covers both.
+    const readAt = await $.clock.now();
     const reset = (await $.session.usage()).context.tokens === undefined;
-    // A reading counts only if nothing superseded the operation while it ran.
+    // A reading counts only if nothing superseded the operation while it ran;
+    // nothing is awaited between this check and the write below.
     if (!current()) return true;
-    if (!reset && await $.clock.now() < deadline) return false;
+    if (!reset && readAt < deadline) return false;
     operation.status = reset ? 'completed' : 'failed';
     if (!reset) operation.reason = 'Claude returned without completing compaction';
     await save($);
     return true;
   };
   if (await settled()) return;
-  const timer = await $.clock.every(500, async () => { if (await settled()) timer.cancel(); });
+  const timer = await $.clock.every(CONFIRMATION_READ_INTERVAL_MS, async () => { if (await settled()) timer.cancel(); });
 }
 
 export function registerObserver(on, config) {

@@ -45,7 +45,9 @@ const compatibleBuilds = new Set([observerAsset.version,
   '8a6c0217779bc4f83c7029c8170c35da8d2ed8028622019f4a09808491dff90f',
   '7d9c570c36bcad4db9ef816c0b704c5b0d01d12c7522b215cdfbbfc160c86648',
   '9fa0456c8d59db1297e540db98993d8d23e34dbfb4a487843334926447ece70b',
-  'ece7bf8ce5445aedb974f30472983b78c7358b8feea99d15c1ef2369d88a26e4']);
+  'ece7bf8ce5445aedb974f30472983b78c7358b8feea99d15c1ef2369d88a26e4',
+  // v1.2.1
+  '134e83d3751cca2f86c2ccda713162c7e739827df129e2020ab88a039c564e63']);
 
 // What a placeholder ledger means. Session open writes `{}` and the observer
 // replaces it on its first write, which it makes at session start and during
@@ -291,8 +293,6 @@ export function createObserver(options: { home?: string; now?: () => number } = 
       if (!ledger) return null; // transient/partial ledger reads are not terminal evidence
       if (ledger.launchId !== operation.launchId || ledger.generation !== operation.generation)
         return { status: 'unknown' as const, detail: 'Claude observer changed or became unavailable' };
-      if (ledger.revision !== operation.revision)
-        return { status: 'unknown' as const, detail: 'User activity overlapped compaction; no automatic retry' };
       if (ledger.compact?.id !== operation.id || ledger.compact.status === 'running') return null;
       if (ledger.compact.revision !== operation.revision)
         return { status: 'unknown' as const, detail: 'Compaction receipt belongs to another activity revision' };
