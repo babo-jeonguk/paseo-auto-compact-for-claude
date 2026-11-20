@@ -52,8 +52,8 @@ async function heldCompaction(f, model, id) {
 // completed, a follow-up request that started only after Claude recorded that
 // completion. Both times come from the same machine clock. What the host did
 // with the input is its own behavior, returned for the report: whether the
-// compaction request was answered or cut off, and whether the follow-up
-// request arrived while the compaction request was still open.
+// compaction request was answered or cut off, read once the model has seen
+// that request close.
 async function overlapSettled(f, model, id, held, label) {
   await waitFor(() => held.next.requestId, `${label}: its own request`);
   held.next.release();
@@ -65,8 +65,8 @@ async function overlapSettled(f, model, id, held, label) {
   if (evidence.outcome === 'succeeded')
     assert(followUp.at >= receipt.observedAt,
       `the follow-up started ${receipt.observedAt - followUp.at} ms before Claude recorded the compaction`);
-  return { ...evidence, compactionRequest: compaction.cancelled ? 'cut off' : 'answered',
-    followUpWhileCompactionOpen: followUp.at < compaction.closedAt };
+  await waitFor(() => compaction.closedAt !== undefined, `${label}: the compaction request closed`);
+  return { ...evidence, compactionRequest: compaction.cancelled ? 'cut off' : 'answered' };
 }
 // Paseo batches agent messages per recipient for two seconds. Waiting 750 ms
 // longer shows whether this host delivers one while the compaction runs.
