@@ -32,7 +32,7 @@ export async function startModel() {
       const entry = { id, ttl: mode, answered: false, cancelled: false, at: arrivedAt,
         texts: userTexts.map(text => String(text).slice(0, 4000)) };
       requests.push(entry);
-      res.on('close', () => { if (!entry.answered) entry.cancelled = true; });
+      res.on('close', () => { entry.closedAt = Date.now(); if (!entry.answered) entry.cancelled = true; });
       if (nextGate) {
         const gate = nextGate; nextGate = null;
         gate.requestId = id; gate.arrived(id);

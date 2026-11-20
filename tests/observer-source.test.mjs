@@ -526,12 +526,12 @@ test('with classic hooks skipped, a context reading that never settles holds nei
 test('with classic hooks skipped, a reading still pending at the 10-second limit does not defer the failure', async () => {
   const f = fixture(); await f.start(); await f.ordinary(); f.request();
   await f.compact();
-  for (let i = 0; i < 18; i++) await f.tick();
-  // The reading started at 9.5 seconds is still pending when the limit passes.
+  for (let i = 0; i < 18; i++) await f.tick(500, 500);
+  // The reading the 9.5-second tick starts is still pending when the limit passes.
   const release = f.holdUsage();
-  void f.tick();
-  void f.tick();
-  await new Promise(resolve => setImmediate(resolve));
+  await f.tick(500, 500);
+  assert.equal(f.ledger().compact.status, 'running');
+  await f.tick(500, 500);
   assert.equal(f.ledger().compact.status, 'failed');
   // A model request after the limit does not turn the failure into unknown.
   await f.event('turn.start', { text: 'steered input', turnId: 'user-2' });

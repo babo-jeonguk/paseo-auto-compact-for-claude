@@ -50,19 +50,23 @@ async function heldCompaction(f, model, id) {
 // Settles a held compaction that other input overlapped, then checks the
 // follow-up: its own reply, one model request each, and when the compaction
 // completed, a follow-up request that started only after Claude recorded that
-// completion. Both times come from the same machine clock.
+// completion. Both times come from the same machine clock. What the host did
+// with the input is its own behavior, returned for the report: whether the
+// compaction request was answered or cut off, and whether the follow-up
+// request arrived while the compaction request was still open.
 async function overlapSettled(f, model, id, held, label) {
   await waitFor(() => held.next.requestId, `${label}: its own request`);
   held.next.release();
   const { receipt, ...evidence } = await settledAgainstEvidence(f, id, held.accepted.operationId);
   await replied(f, id, held.next, `${label}: its own reply`);
   assert.equal(model.count - held.requestsBefore, 2, 'one compaction request and one for the follow-up');
-  if (evidence.outcome === 'succeeded') {
-    const followUp = model.requests.find(request => request.id === held.next.requestId);
+  const compaction = model.requests.find(request => request.id === held.compact.requestId);
+  const followUp = model.requests.find(request => request.id === held.next.requestId);
+  if (evidence.outcome === 'succeeded')
     assert(followUp.at >= receipt.observedAt,
       `the follow-up started ${receipt.observedAt - followUp.at} ms before Claude recorded the compaction`);
-  }
-  return evidence;
+  return { ...evidence, compactionRequest: compaction.cancelled ? 'cut off' : 'answered',
+    followUpWhileCompactionOpen: followUp.at < compaction.closedAt };
 }
 // Paseo batches agent messages per recipient for two seconds. Waiting 750 ms
 // longer shows whether this host delivers one while the compaction runs.
@@ -554,16 +558,15 @@ export const scenarios = [
       await f.rpc('toggle', { agentId: source, enabled: false });
       await f.turn(id, 'AGENT_MESSAGE_READY: reply without tools.');
       const held = await heldCompaction(f, model, id);
-      let deliveredDuringCompaction;
       try {
         await f.send(id, 'AGENT_MESSAGE_DURING_COMPACT: reply without tools.', { sourceAgentId: source });
-        // No event marks a message that was not delivered, so this waits out the batch window.
+        // No event marks a message that was not delivered, so this keeps the compaction
+        // open past the batch window before letting it finish.
         await new Promise(resolve => setTimeout(resolve, AGENT_MESSAGE_BATCH_WAIT_MS));
-        deliveredDuringCompaction = held.next.requestId !== null;
       } finally { held.compact.release(); }
       const evidence = await overlapSettled(f, model, id, held, 'the agent message');
       await f.rpc('toggle', { agentId: id, enabled: false });
-      return { ...evidence, deliveredDuringCompaction };
+      return evidence;
     },
   },
   {
