@@ -60,6 +60,7 @@ On a heavily loaded machine, `--minimal-builtins` omits the released server's li
 | Operation identity | Same-ID retries during execution and after completion do not resend; conflicting input is rejected; history remains queryable after new activity |
 | Retention | Stop the plugin, age a completed native operation and seed recent/pending controls; reload deletes eligible history and orphan receipts, preserves controls, and does not resend unchanged activity |
 | Input overlap | Compaction is cancelled or remains unconfirmed; the user's own response remains on the timeline |
+| Query restart | Compact now and an automatic reservation right after a pending thinking-level change both report `failed_after_dispatch` promptly, with one `/compact` command, zero compaction model requests and no completed boundary |
 | Changing TTL | New 5m/mixed responses are re-detected; later 1h data restores scheduling |
 | Missing TTL | Labeled default retains 50/55-minute scheduling |
 | Configuration | Explicit settings work; environment takes priority over merged settings |
