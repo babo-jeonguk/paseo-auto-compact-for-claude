@@ -586,6 +586,104 @@ export const scenarios = [
     },
   },
   {
+    name: 'Compact now right after a pending thinking-level change fails promptly as a query restart without compacting',
+    async run({ fixture: f, model }) {
+      await f.settings({ idleMinutes: 50 });
+      const id = await f.agent();
+      await f.client.setAgentThinkingOption(id, 'low');
+      await f.turn(id, 'EFFORT_COMPACT_NOW: reply without tools.');
+      const row = await scheduled(f, id);
+      const before = await f.ledger(id);
+      await f.client.setAgentThinkingOption(id, 'high');
+      const requestsBefore = model.count;
+      const operationId = randomUUID();
+      const accepted = await f.rpc('now', { agentId: id, revision: row.revision, target: row.target, operationId });
+      assert.equal(accepted.status, 'running');
+      assert.equal(accepted.operationId, operationId);
+      const operation = await waitFor(async () => {
+        const current = (await f.rpc('operation', { operationId })).operation;
+        return current && ['succeeded', 'failed', 'unknown'].includes(current.state) ? current : null;
+      }, 'prompt query-restart refusal for Compact now');
+      assert.equal(operation.state, 'failed', JSON.stringify(operation));
+      assert.equal(operation.result?.code, 'failed_after_dispatch', JSON.stringify(operation));
+      assert.match(operation.result?.message ?? '', /query restarted/i, JSON.stringify(operation));
+      const after = await f.ledger(id);
+      assert.equal(after.launchId, before.launchId);
+      assert.notEqual(after.generation, before.generation);
+      const receipt = await f.receipt(id, operationId);
+      assert.equal(receipt.id, operationId);
+      assert.equal(receipt.status, 'failed');
+      assert.equal(receipt.refusal, 'query_restarted');
+      assert.equal(model.count, requestsBefore, 'a refused restart must send zero compaction model requests');
+      const rows = await f.timeline(id);
+      assert.equal(rows.filter(entry => entry.item.type === 'user_message' && entry.item.clientMessageId === operationId).length, 1,
+        'exactly one /compact command must be sent');
+      assert.equal(boundaries(rows).length, 0, 'no completed compaction boundary may exist');
+      // Verify the same durable refusal receipt finishes the operation on restart reconciliation without resending.
+      const statePath = join(f.home, 'plugin-data/auto-compact-for-claude/state.json');
+      await f.client.disablePlugin('auto-compact-for-claude');
+      const state = JSON.parse(await readFile(statePath, 'utf8'));
+      const stored = state.operations.find(entry => entry.id === operationId);
+      assert(stored?.evidence?.dispatchStartedAt, 'dispatch marker must be persisted');
+      stored.state = 'observing';
+      stored.result = null;
+      await writeFile(statePath, JSON.stringify(state));
+      assert.equal((await f.client.enablePlugin('auto-compact-for-claude')).status, 'running');
+      const recovered = await waitFor(async () => {
+        const current = (await f.rpc('operation', { operationId })).operation;
+        return current && ['succeeded', 'failed', 'unknown'].includes(current.state) ? current : null;
+      }, 'reconciled query-restart refusal after plugin restart');
+      assert.equal(recovered.state, 'failed', JSON.stringify(recovered));
+      assert.equal(recovered.result?.code, 'failed_after_dispatch', JSON.stringify(recovered));
+      assert.match(recovered.result?.message ?? '', /query restarted/i, JSON.stringify(recovered));
+      assert.equal(model.count, requestsBefore, 'reconciliation must not send compaction requests');
+      assert.equal((await f.timeline(id)).filter(entry => entry.item.type === 'user_message' && entry.item.clientMessageId === operationId).length, 1,
+        'reconciliation must not resend /compact');
+      await f.rpc('toggle', { agentId: id, enabled: false });
+    },
+  },
+  {
+    name: 'an automatic reservation right after a pending thinking-level change fails promptly as a query restart',
+    async run({ fixture: f, model }) {
+      await f.settings({ idleMinutes: 1 });
+      const id = await f.agent();
+      try {
+        await f.client.setAgentThinkingOption(id, 'low');
+        await f.turn(id, 'EFFORT_AUTOMATIC: reply without tools.');
+        await scheduled(f, id);
+        const before = await f.ledger(id);
+        await f.client.setAgentThinkingOption(id, 'high');
+        const requestsBefore = model.count;
+        const settled = await waitFor(async () => {
+          const current = await f.row(id);
+          const op = current.latestOperation;
+          // The observer can record the refusal before Paseo finishes closing the /compact turn.
+          return op?.kind === 'automatic' && ['succeeded', 'failed', 'unknown'].includes(op.state) && current.status !== 'busy'
+            ? { row: current, op } : null;
+        }, 'prompt query-restart refusal for automatic reservation', 100_000);
+        assert.equal(settled.row.status, 'failed', JSON.stringify(settled));
+        assert.equal(settled.op.state, 'failed', JSON.stringify(settled));
+        assert.equal(settled.op.result?.code, 'failed_after_dispatch', JSON.stringify(settled));
+        assert.match(settled.op.result?.message ?? '', /query restarted/i, JSON.stringify(settled));
+        const after = await f.ledger(id);
+        assert.equal(after.launchId, before.launchId);
+        assert.notEqual(after.generation, before.generation);
+        const receipt = await f.receipt(id, settled.op.id);
+        assert.equal(receipt.id, settled.op.id);
+        assert.equal(receipt.status, 'failed');
+        assert.equal(receipt.refusal, 'query_restarted');
+        assert.equal(model.count, requestsBefore, 'a refused restart must send zero compaction model requests');
+        const rows = await f.timeline(id);
+        assert.equal(rows.filter(entry => entry.item.type === 'user_message' && entry.item.clientMessageId === settled.op.id).length, 1,
+          'exactly one /compact command must be sent');
+        assert.equal(boundaries(rows).length, 0, 'no completed compaction boundary may exist');
+      } finally {
+        await f.rpc('toggle', { agentId: id, enabled: false });
+        await f.settings({ idleMinutes: 50 });
+      }
+    },
+  },
+  {
     name: 'daemon restart preserves OFF; reopening the same conversation permits a fresh reservation',
     async run({ fixture: f, model, id, sessionId }) {
       const settings = await f.settings(), requests = model.count;

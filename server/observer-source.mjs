@@ -12,6 +12,9 @@ let consumedCancelId = null;
 // Only a larger step is a rollback. Must equal CLOCK_STEP_TOLERANCE_MS in
 // server/deadline.ts; it stays within the 30 s cache-deadline margin.
 const CLOCK_STEP_TOLERANCE_MS = 10_000;
+// Must equal QUERY_RESTARTED_REFUSAL in server/observer.ts.
+const QUERY_RESTARTED_REFUSAL = 'query_restarted';
+const QUERY_RESTARTED_REASON = 'Claude query restarted before compaction ran';
 async function save($) {
   const now = await $.clock.now();
   if (state.updatedAt && now < state.updatedAt - CLOCK_STEP_TOLERANCE_MS) {
@@ -27,7 +30,9 @@ async function save($) {
     ? { path: configuration.receipts + '/' + encodeURIComponent(compact.id) + '.json',
         value: JSON.stringify({ id: compact.id, launchId: state.launchId, generation: state.generation,
           sessionId: state.sessionId, revision: compact.revision, status: compact.status,
-          reason: compact.reason ?? null, observedAt: compact.observedAt }) } : null;
+          reason: compact.reason ?? null, observedAt: compact.observedAt,
+          ...(compact.refusal ? { refusal: compact.refusal } : {}),
+          ...(compact.prepared ? { prepared: compact.prepared } : {}) }) } : null;
   writes = writes.catch(() => {}).then(async () => {
     // A receipt survives later activity and launch pruning. Partial reads are
     // treated as unavailable and retried by the server, never as completion.
@@ -68,10 +73,26 @@ async function admit($, trigger) {
     return 'Auto Compact cancelled its pending /compact. Run /compact again to compact manually.';
   }
   let reason = null;
+  let refusal = null;
+  let prepared = null;
   if (!request || request.status !== 'prepared' || trigger === 'auto' || state.compact?.id === request.id)
     state.compact = { id: null, status: 'running', revision: state.revision };
   else {
-    if (request.launchId !== state.launchId || request.generation !== state.generation ||
+    // Paseo can restart Claude's query inside the same launch and resumed
+    // session (for example after a pending thinking-level change). Record the
+    // refused prepared identity so the server can attribute this refusal
+    // without accepting a bare generation change or an unrelated cancellation.
+    if (request.launchId === state.launchId &&
+        typeof request.sessionId === 'string' && request.sessionId.length > 0 &&
+        request.sessionId === state.sessionId &&
+        typeof request.generation === 'string' && request.generation.length > 0 &&
+        request.generation !== state.generation &&
+        Number.isInteger(request.revision)) {
+      reason = QUERY_RESTARTED_REASON;
+      refusal = QUERY_RESTARTED_REFUSAL;
+      prepared = { launchId: request.launchId, generation: request.generation,
+        sessionId: request.sessionId, revision: request.revision };
+    } else if (request.launchId !== state.launchId || request.generation !== state.generation ||
         request.sessionId !== state.sessionId) reason = 'Claude session changed';
     else if (request.revision !== state.revision || state.activeTurns.length || state.pendingInputs)
       reason = 'New conversation activity';
@@ -81,7 +102,8 @@ async function admit($, trigger) {
         !Number.isFinite(request.cacheDeadline) || now >= request.cacheDeadline - 30_000))
       reason = 'Cache window passed';
     state.compact = { id: request.id, status: reason ? 'failed' : 'running',
-      revision: state.revision, reason };
+      revision: state.revision, reason,
+      ...(refusal ? { refusal, prepared } : {}) };
   }
   state.cacheRequest = null;
   state.ordinaryEndedAt = null;

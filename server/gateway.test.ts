@@ -1,14 +1,19 @@
 import assert from "node:assert/strict";
 import { mock, test } from "node:test";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { bounded, OBSERVATION_MS } from "./deadline";
 import { Refusal, type OperationEvidence, type StoredOperation } from "./model";
 import { createGateway } from "./gateway";
+import { createObserver, QUERY_RESTARTED_REFUSAL } from "./observer";
 import { createOperationWorker } from "./operations";
 import { createScheduler } from "./scheduler";
 import { DEFAULT_SETTINGS } from "../shared/settings";
 import type {
   PluginHandlerContext,
   PluginLifecycleEvents,
+  PluginSessionOpenRequest,
 } from "@getpaseo/plugin/server";
 
 function fixture(
@@ -875,4 +880,240 @@ test("an attempt that ends unknown after a lost live view stays open for reconci
   assert.equal(state.operations[0].state, "observing", "left for reconciliation, not finished");
   assert.equal(state.operations[0].result, null);
   assert.equal(state.operations[0].evidence?.invalidated, false);
+});
+
+async function realObserverFixture(now = () => Date.now()) {
+  const home = await mkdtemp(join(tmpdir(), "compact-gateway-restart-"));
+  const native = createObserver({ home, now });
+  // Include Paseo 0.14+ session-open fields so this compiles across SDK 0.12–0.16+.
+  await native.prepareSession({
+    agentId: "a", workspaceId: "w", provider: "claude", purpose: "interactive", reason: "create",
+    cwd: home, title: "Conversation", labels: {}, metadata: {}, background: false, tools: [], mcpServers: {}, env: {},
+  } as PluginSessionOpenRequest, true);
+  const parent = join(home, "plugin-data/auto-compact-for-claude/observers",
+    (await readdir(join(home, "plugin-data/auto-compact-for-claude/observers")))[0]);
+  const manifest = JSON.parse(await readFile(join(parent, "current.json"), "utf8"));
+  const directory = join(parent, manifest.launchId);
+  const ledger = {
+    version: 1, launchId: manifest.launchId, generation: "gen-1", sessionId: "native-a",
+    updatedAt: now(), revision: 2, activeTurns: [] as string[], pendingInputs: 0,
+    ordinaryEndedAt: now(), ordinaryRevision: 2, clockEpoch: 0, transcriptPath: null,
+    cacheRequest: { startedAt: now(), model: "claude-sonnet-4-6", policy: { ttl: "1h", source: "settings" } },
+    compact: null as Record<string, unknown> | null, closed: false,
+  };
+  const saveLedger = () => writeFile(join(directory, "ledger.json"), JSON.stringify({ ...ledger, updatedAt: now() }));
+  await saveLedger();
+  const readRequest = () => readFile(join(directory, "request.json"), "utf8").then(text => JSON.parse(text));
+  const writeReceipt = (id: string, value: Record<string, unknown>) =>
+    writeFile(join(parent, "receipts", `${encodeURIComponent(id)}.json`), JSON.stringify(value));
+  return {
+    home, native, parent, directory, launchId: manifest.launchId as string, ledger,
+    saveLedger, readRequest, writeReceipt,
+    close: () => rm(home, { recursive: true, force: true }),
+  };
+}
+
+test("live observation reports a confirmed query-restart refusal promptly for both Compact now and automatic compaction", async () => {
+  for (const kind of ["manual", "automatic"] as const) {
+    let time = 1_000_000;
+    const obs = await realObserverFixture(() => time);
+    try {
+      const host = fixture([], undefined, false, [], {
+        observer: obs.native, now: () => time, timeoutMs: 120_000, pollMs: 1,
+      });
+      const send = host.ref.send;
+      let sawGenerationChange!: () => void;
+      const generationChanged = new Promise<void>(resolve => { sawGenerationChange = resolve; });
+      const originalResult = obs.native.result;
+      let pollsOnNewGeneration = 0;
+      obs.native.result = async (agentId, op) => {
+        const res = await originalResult(agentId, op);
+        if (obs.ledger.generation === "gen-2" && ++pollsOnNewGeneration === 2) sawGenerationChange();
+        return res;
+      };
+      host.ref.send = async (text, options) => {
+        await send(text, options);
+        // First, the restarted query starts with a new generation before /compact is admitted.
+        obs.ledger.generation = "gen-2";
+        obs.ledger.revision = 0;
+        obs.ledger.compact = null;
+        await obs.saveLedger();
+        // Wait until live observation has polled across the generation change without cancelling request.json.
+        void generationChanged.then(async () => {
+          const req = await obs.readRequest();
+          assert.equal(req.status, "prepared", `${kind}: live observation must not cancel request.json on generation change alone`);
+          const prepared = { launchId: req.launchId, generation: req.generation, sessionId: req.sessionId, revision: req.revision };
+          const record = {
+            id: req.id, launchId: obs.launchId, generation: "gen-2", sessionId: "native-a", revision: 0,
+            status: "failed", reason: "Claude query restarted before compaction ran", observedAt: time + 50,
+            refusal: QUERY_RESTARTED_REFUSAL, prepared,
+          };
+          await obs.writeReceipt(req.id, record);
+          obs.ledger.compact = {
+            id: req.id, revision: 0, status: "failed", reason: record.reason,
+            refusal: QUERY_RESTARTED_REFUSAL, prepared,
+          };
+          await obs.saveLedger();
+        });
+      };
+      const agent = (await host.gateway.refresh("a"))!;
+      const execution = { id: `op-${kind}`, sendBy: time + 30_000, checkpoint: async () => {}, current: () => true };
+      const outcome = kind === "automatic"
+        ? await host.gateway.automatic!(agent, { expiresAt: time + 30_000, allowed: async () => true }, execution)
+        : await host.gateway.compact("a", agent, execution);
+      assert.equal(outcome.status, "failed", kind);
+      assert.match(outcome.detail, /query restarted/i, kind);
+      assert.equal(host.sendCount(), 1, kind);
+      assert.equal((await obs.readRequest()).status, "settled", `${kind}: consumed refusal is settled on cleanup`);
+      host.stop();
+    } finally { await obs.close(); }
+  }
+});
+
+test("a generation change without a matching refusal stays pending until the observation deadline", async () => {
+  let time = 1_000_000;
+  const obs = await realObserverFixture(() => time);
+  const host = fixture([], undefined, false, [], {
+    observer: obs.native, now: () => time, timeoutMs: 120_000, pollMs: 1,
+  });
+  let attempt: Promise<import("./model").CompactOutcome> | undefined;
+  try {
+    const send = host.ref.send;
+    const originalResult = obs.native.result;
+    let pollsOnNewGeneration = 0;
+    obs.native.result = async (agentId, op) => {
+      const res = await originalResult(agentId, op);
+      if (obs.ledger.generation === "gen-2") pollsOnNewGeneration++;
+      return res;
+    };
+    host.ref.send = async (text, options) => {
+      await send(text, options);
+      obs.ledger.generation = "gen-2";
+      obs.ledger.revision = 0;
+      obs.ledger.compact = null;
+      await obs.saveLedger();
+    };
+    const agent = (await host.gateway.refresh("a"))!;
+    let settled = false;
+    attempt = host.gateway.compact("a", agent, {
+      id: "gen-only", sendBy: time + 30_000, checkpoint: async () => {}, current: () => true,
+    });
+    void attempt.finally(() => { settled = true; });
+    const until = async (done: () => boolean) => {
+      for (let tries = 0; !done(); tries++) {
+        assert.ok(tries < 2_000, "the attempt stopped polling before the deadline");
+        await new Promise(resolve => setTimeout(resolve, 1));
+      }
+    };
+    await until(() => pollsOnNewGeneration >= 3);
+    assert.equal(settled, false, "a bare generation change must not exit live observation early");
+    assert.equal((await obs.readRequest()).status, "prepared");
+    time += 59_000;
+    await obs.saveLedger();
+    const afterChange = pollsOnNewGeneration;
+    await until(() => pollsOnNewGeneration >= afterChange + 2);
+    assert.equal(settled, false, "execution must stay pending before the live deadline");
+    assert.equal((await obs.readRequest()).status, "prepared");
+    time += 61_000;
+    const outcome = await attempt;
+    assert.equal(outcome.status, "unknown");
+    assert.equal(host.sendCount(), 1);
+    assert.equal((await obs.readRequest()).status, "cancelled");
+  } finally {
+    time += 120_000;
+    await attempt?.catch(() => {});
+    host.stop();
+    await obs.close();
+  }
+});
+
+test("stopping the plugin after dispatch preserves request.json so a query-restart refusal remains recoverable", async () => {
+  let time = 1_000_000;
+  const obs = await realObserverFixture(() => time);
+  try {
+    const host = fixture([], undefined, false, [], { observer: obs.native, now: () => time, timeoutMs: 120_000, pollMs: 1 });
+    const send = host.ref.send;
+    let saved: OperationEvidence | undefined;
+    host.ref.send = async (text, options) => {
+      await send(text, options);
+      host.stop();
+    };
+    const agent = (await host.gateway.refresh("a"))!;
+    const outcome = await host.gateway.compact("a", agent, {
+      id: "stop-after-dispatch", sendBy: time + 30_000,
+      checkpoint: async evidence => { saved = evidence; }, current: () => true,
+    });
+    assert.equal(outcome.status, "unknown");
+    assert.equal(host.sendCount(), 1);
+    const req = await obs.readRequest();
+    assert.equal(req.status, "prepared", "plugin stop after dispatch must not overwrite prepared request with cancelled");
+
+    // Restarted query now admits and refuses the prepared request.
+    const prepared = { launchId: req.launchId, generation: req.generation, sessionId: req.sessionId, revision: req.revision };
+    await obs.writeReceipt(req.id, {
+      id: req.id, launchId: obs.launchId, generation: "gen-2", sessionId: "native-a", revision: 0,
+      status: "failed", reason: "Claude query restarted before compaction ran", observedAt: time + 500,
+      refusal: QUERY_RESTARTED_REFUSAL, prepared,
+    });
+    const restarted = fixture([], undefined, false, [], { observer: obs.native, now: () => time });
+    const stored: StoredOperation = {
+      id: req.id, agentId: "a", revision: agent.revision!, target: { sessionId: "native-a", activityKey: agent.activityKey ?? null },
+      kind: "manual", state: "observing", createdAt: time, updatedAt: time, result: null, inputFingerprint: null,
+      evidence: saved,
+    };
+    const recovered = await restarted.gateway.inspect!(stored);
+    assert.equal(recovered?.status, "failed");
+    assert.match(recovered!.detail, /query restarted/i);
+    assert.equal(restarted.sendCount(), 0);
+    restarted.stop();
+  } finally { await obs.close(); }
+});
+
+test("recovery accepts a confirmed query-restart refusal within the deadline and ignores late or ambiguous receipts", async () => {
+  const obs = await realObserverFixture(() => 1_000_000);
+  try {
+    const host = fixture([], undefined, false, [], { observer: obs.native, now: () => 1_000_000 });
+    const native = { id: "recover-restart", launchId: obs.launchId, generation: "gen-1", sessionId: "native-a", revision: 2 };
+    const operation: StoredOperation = {
+      id: native.id, agentId: "a", revision: "rev", target: { sessionId: "native-a", activityKey: null },
+      kind: "automatic", state: "observing", createdAt: 1_000_000, updatedAt: 1_000_000, result: null, inputFingerprint: null,
+      evidence: { dispatchStartedAt: 1_000_000, native },
+    };
+    const prepared = { launchId: native.launchId, generation: native.generation, sessionId: native.sessionId, revision: native.revision };
+    await obs.writeReceipt(native.id, {
+      id: native.id, launchId: obs.launchId, generation: "gen-2", sessionId: "native-a", revision: 0,
+      status: "failed", reason: "Claude query restarted before compaction ran", observedAt: 1_000_500,
+      refusal: QUERY_RESTARTED_REFUSAL, prepared,
+    });
+    const recovered = await host.gateway.inspect!(operation);
+    assert.equal(recovered?.status, "failed");
+    assert.match(recovered!.detail, /query restarted/i);
+
+    // Late receipt past the observation deadline is ignored.
+    await obs.writeReceipt(native.id, {
+      id: native.id, launchId: obs.launchId, generation: "gen-2", sessionId: "native-a", revision: 0,
+      status: "failed", reason: "Claude query restarted before compaction ran",
+      observedAt: 1_000_000 + OBSERVATION_MS + 1, refusal: QUERY_RESTARTED_REFUSAL, prepared,
+    });
+    assert.equal(await host.gateway.inspect!(operation), null);
+
+    // Foreign-generation completion never completes recovery, even with a matching timeline boundary.
+    host.ref.timeline.refetch = async () => ({ entries: [
+      { turnId: "our-turn", item: { type: "user_message", clientMessageId: native.id } },
+      { turnId: "our-turn", item: { type: "compaction", status: "completed", trigger: "manual" } },
+    ] });
+    await obs.writeReceipt(native.id, {
+      id: native.id, launchId: obs.launchId, generation: "gen-2", sessionId: "native-a", revision: 0,
+      status: "completed", reason: null, observedAt: 1_000_500, refusal: QUERY_RESTARTED_REFUSAL, prepared,
+    });
+    assert.equal(await host.gateway.inspect!(operation), null);
+
+    // Normal matching completion with matching boundary still succeeds.
+    await obs.writeReceipt(native.id, {
+      id: native.id, launchId: obs.launchId, generation: "gen-1", sessionId: "native-a", revision: 2,
+      status: "completed", reason: null, observedAt: 1_000_500,
+    });
+    assert.equal((await host.gateway.inspect!(operation))?.status, "completed");
+    host.stop();
+  } finally { await obs.close(); }
 });

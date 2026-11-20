@@ -10,6 +10,14 @@ import type { Blocked } from '../shared/rpc';
 import { createCacheReader } from './cache';
 import { CLOCK_STEP_TOLERANCE_MS } from './deadline';
 
+// Must equal QUERY_RESTARTED_REFUSAL in server/observer-source.mjs.
+export const QUERY_RESTARTED_REFUSAL = 'query_restarted';
+const QUERY_RESTARTED_DETAIL = 'Claude query restarted before compaction ran';
+
+const PreparedIdentitySchema = z.object({
+  launchId: z.string(), generation: z.string(), sessionId: z.string().nullable(),
+  revision: z.number().int(),
+});
 const LedgerSchema = z.object({
   version: z.literal(1), launchId: z.string(), generation: z.string(),
   sessionId: z.string().nullable(), updatedAt: z.number().finite(), revision: z.number().int().nonnegative(),
@@ -21,7 +29,9 @@ const LedgerSchema = z.object({
   transcriptPath: z.string().nullable().default(null), clockEpoch: z.number().int().default(0),
   closed: z.boolean(),
   compact: z.object({ id: z.string().nullable(), status: z.enum(['running', 'completed', 'failed', 'unknown']),
-    revision: z.number().int(), reason: z.string().nullable().optional() }).nullable(),
+    revision: z.number().int(), reason: z.string().nullable().optional(),
+    refusal: z.string().nullable().optional(),
+    prepared: PreparedIdentitySchema.nullable().optional() }).nullable(),
 });
 type Ledger = z.infer<typeof LedgerSchema> & { cache: Awaited<ReturnType<ReturnType<typeof createCacheReader>>>;
   cacheDeadline: number | null };
@@ -29,15 +39,45 @@ const ReceiptSchema = z.object({
   id: z.string(), launchId: z.string(), generation: z.string(), sessionId: z.string().nullable(),
   revision: z.number().int(), status: z.enum(['completed', 'failed', 'unknown']),
   reason: z.string().nullable(), observedAt: z.number().finite(),
+  refusal: z.string().nullable().optional(),
+  prepared: PreparedIdentitySchema.nullable().optional(),
 });
+type NativeRecord = {
+  id: string | null; launchId: string; generation: string; sessionId: string | null;
+  revision: number; status: 'running' | 'completed' | 'failed' | 'unknown'; reason?: string | null;
+  refusal?: string | null; prepared?: z.infer<typeof PreparedIdentitySchema> | null;
+};
+// One rule for both durable receipts and live ledger polls: a record settles
+// `operation` when it comes from the exact prepared observer identity and
+// revision, or when a newer generation in the same launch and Claude session
+// explicitly refused that exact prepared request because the query restarted.
+// Completion always requires the exact prepared identity.
+function matchNativeRecord(record: NativeRecord, operation: NativeOperation) {
+  if (record.id !== operation.id || record.status === 'running') return null;
+  if (record.launchId === operation.launchId && record.generation === operation.generation &&
+      record.sessionId === operation.sessionId && record.revision === operation.revision) {
+    return { status: record.status, detail: record.reason ??
+      (record.status === 'completed' ? 'Claude observed compaction completion' : 'Compaction did not complete') };
+  }
+  if (record.status === 'failed' && record.refusal === QUERY_RESTARTED_REFUSAL &&
+      record.launchId === operation.launchId && record.generation !== operation.generation &&
+      operation.sessionId !== null && record.sessionId === operation.sessionId &&
+      record.prepared?.launchId === operation.launchId &&
+      record.prepared.generation === operation.generation &&
+      record.prepared.sessionId === operation.sessionId &&
+      record.prepared.revision === operation.revision) {
+    return { status: 'failed' as const, detail: record.reason ?? QUERY_RESTARTED_DETAIL };
+  }
+  return null;
+}
 // `preparedAt` is absent from launches prepared by earlier releases.
 const ManifestSchema = z.object({ launchId: z.string().uuid(), build: z.string(),
   preparedAt: z.number().finite().optional() });
 // Ledgers and receipts are small; anything larger is not one of ours.
 const MAX_FILE_BYTES = 32_768;
-// The input-counting, command-guard, cancellation and clock-step fixes keep the
-// same ledger and reservation contract. Keep already-open sessions observable
-// until reopen.
+// The input-counting, command-guard, cancellation, clock-step and restart-refusal
+// fixes keep the same ledger and reservation contract. Keep already-open sessions
+// observable until reopen.
 const compatibleBuilds = new Set([observerAsset.version,
   'f8a02403e4f6c17e010ddda4d0385109fe8c480dfc379c9bb91d309671f87c7a',
   '61a0e12639e417cd28f7a651c789c00e10606bf994d960276f1916914eb3e6d4',
@@ -45,7 +85,9 @@ const compatibleBuilds = new Set([observerAsset.version,
   '8a6c0217779bc4f83c7029c8170c35da8d2ed8028622019f4a09808491dff90f',
   '7d9c570c36bcad4db9ef816c0b704c5b0d01d12c7522b215cdfbbfc160c86648',
   '9fa0456c8d59db1297e540db98993d8d23e34dbfb4a487843334926447ece70b',
-  'ece7bf8ce5445aedb974f30472983b78c7358b8feea99d15c1ef2369d88a26e4']);
+  'ece7bf8ce5445aedb974f30472983b78c7358b8feea99d15c1ef2369d88a26e4',
+  // v1.2.1
+  '134e83d3751cca2f86c2ccda713162c7e739827df129e2020ab88a039c564e63']);
 
 // What a placeholder ledger means. Session open writes `{}` and the observer
 // replaces it on its first write, which it makes at session start and during
@@ -162,7 +204,15 @@ export function createObserver(options: { home?: string; now?: () => number } = 
     const request = JSON.parse(await readFile(path, 'utf8'));
     if (request.id !== operation.id) return;
     const ledger = LedgerSchema.safeParse(JSON.parse(await readFile(join(operation.directory, 'ledger.json'), 'utf8')));
-    const consumed = ledger.success && ledger.data.compact?.id === operation.id;
+    // A durable receipt also proves Claude already consumed this request, even
+    // if later activity overwrote ledger.compact before release ran.
+    const recorded = await readFile(join(operation.directory, '..', 'receipts', receiptName(operation.id)), 'utf8')
+      .then(text => {
+        const parsed = ReceiptSchema.safeParse(JSON.parse(text));
+        return parsed.success && parsed.data.id === operation.id;
+      })
+      .catch(() => false);
+    const consumed = (ledger.success && ledger.data.compact?.id === operation.id) || recorded;
     // Settled requests must not intercept later ordinary/manual compaction.
     // An unobserved send remains cancelled so a late PreCompact cannot run it.
     await atomic(path, { id: operation.id, status: !sent || consumed ? 'settled' : 'cancelled' });
@@ -277,27 +327,32 @@ export function createObserver(options: { home?: string; now?: () => number } = 
         const info = await lstat(path);
         if (!info.isFile() || info.isSymbolicLink() || info.size > MAX_FILE_BYTES) return null;
         const receipt = ReceiptSchema.parse(JSON.parse(await readFile(path, 'utf8')));
-        if (receipt.id !== operation.id || receipt.launchId !== operation.launchId ||
-            receipt.generation !== operation.generation || receipt.sessionId !== operation.sessionId ||
-            receipt.revision !== operation.revision) return null;
-        return { status: receipt.status, observedAt: receipt.observedAt, detail: receipt.reason ??
-          (receipt.status === 'completed' ? 'Claude observed compaction completion' : 'Compaction did not complete') };
+        const matched = matchNativeRecord(receipt, operation);
+        return matched ? { ...matched, observedAt: receipt.observedAt } : null;
       } catch { return null; }
     },
-    async result(agentId: string, operation: Omit<NativeOperation, 'sessionId'>) {
+    async result(agentId: string, operation: NativeOperation) {
       // Polled after sending: a read failure means "no answer yet", never an outcome.
       const current = await read(agentId).catch(() => null);
       const ledger = current?.ledger;
       if (!ledger) return null; // transient/partial ledger reads are not terminal evidence
-      if (ledger.launchId !== operation.launchId || ledger.generation !== operation.generation)
+      if (ledger.launchId !== operation.launchId)
         return { status: 'unknown' as const, detail: 'Claude observer changed or became unavailable' };
+      // A new generation in the same launch may be restarting the Claude query
+      // under this send. Wait for its matching restart refusal instead of
+      // leaving live observation and cancelling request.json prematurely.
+      if (ledger.generation !== operation.generation) {
+        if (!ledger.compact || ledger.compact.status === 'running') return null;
+        return matchNativeRecord({ ...ledger.compact, launchId: ledger.launchId,
+          generation: ledger.generation, sessionId: ledger.sessionId }, operation);
+      }
       if (ledger.revision !== operation.revision)
         return { status: 'unknown' as const, detail: 'User activity overlapped compaction; no automatic retry' };
       if (ledger.compact?.id !== operation.id || ledger.compact.status === 'running') return null;
       if (ledger.compact.revision !== operation.revision)
         return { status: 'unknown' as const, detail: 'Compaction receipt belongs to another activity revision' };
-      return { status: ledger.compact.status, detail: ledger.compact.reason ??
-        (ledger.compact.status === 'completed' ? 'Claude observed compaction completion' : 'Compaction did not complete') };
+      return matchNativeRecord({ ...ledger.compact, launchId: ledger.launchId,
+        generation: ledger.generation, sessionId: ledger.sessionId }, operation);
     },
     cancel,
     // A finished operation whose call did not end normally, such as one
