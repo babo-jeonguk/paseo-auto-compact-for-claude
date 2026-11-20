@@ -493,6 +493,40 @@ test('with classic hooks skipped, a context reading that fails is retried, and t
   assert.equal(h.ledger().compact.status, 'failed');
 });
 
+test('with classic hooks skipped, a context reading that never settles holds neither the command nor the 10-second limit', async () => {
+  const f = fixture(); await f.start(); await f.ordinary(); f.request();
+  let release;
+  const returned = f.compact(async () => { release = f.holdUsage(); });
+  const timeout = new Promise(resolve => setTimeout(() => resolve('blocked'), 1_000));
+  assert.notEqual(await Promise.race([returned.then(() => 'returned'), timeout]), 'blocked', 'the command returns');
+  for (let i = 0; i < 19; i++) void f.tick(); // each tick's reading stays pending
+  assert.equal(f.ledger().compact.status, 'running');
+  void f.tick();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.ledger().compact.status, 'failed', 'no reset seen within 10 seconds');
+  f.context(undefined);
+  release();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.ledger().compact.status, 'failed', 'a late reading cannot change it');
+});
+
+test('with classic hooks skipped, a reading still pending at the 10-second limit does not defer the failure', async () => {
+  const f = fixture(); await f.start(); await f.ordinary(); f.request();
+  await f.compact();
+  for (let i = 0; i < 18; i++) await f.tick();
+  // The reading started at 9.5 seconds is still pending when the limit passes.
+  const release = f.holdUsage();
+  void f.tick();
+  void f.tick();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.ledger().compact.status, 'failed');
+  // A model request after the limit does not turn the failure into unknown.
+  await f.event('turn.start', { text: 'steered input', turnId: 'user-2' });
+  release();
+  await f.step('user-2');
+  assert.equal(f.ledger().compact.status, 'failed');
+});
+
 test('without a context reading before /compact, completion stays unknown rather than guessed', async () => {
   const f = fixture(); await f.start(); await f.ordinary(); f.request();
   f.context(undefined);

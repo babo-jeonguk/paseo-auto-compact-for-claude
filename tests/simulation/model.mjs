@@ -8,6 +8,8 @@ export async function startModel() {
   const held = new Set();
   const requests = [];
   const server = createServer(async (req, res) => {
+    // Stamped on arrival, before the body is read, so ordering checks see when the request started.
+    const arrivedAt = Date.now();
     try {
       let text = '';
       for await (const chunk of req) text += chunk;
@@ -27,7 +29,7 @@ export async function startModel() {
           : (message.content ?? []).filter(block => block.type === 'text').map(block => block.text));
       const id = ++count, mode = ttl;
       // Keep test diagnostics metadata-only, even though all inputs are synthetic.
-      const entry = { id, ttl: mode, answered: false, cancelled: false, at: Date.now(),
+      const entry = { id, ttl: mode, answered: false, cancelled: false, at: arrivedAt,
         texts: userTexts.map(text => String(text).slice(0, 4000)) };
       requests.push(entry);
       res.on('close', () => { if (!entry.answered) entry.cancelled = true; });
