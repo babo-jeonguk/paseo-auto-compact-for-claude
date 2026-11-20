@@ -7,6 +7,9 @@ let lastReceiptValue = null;
 // A cancelled request blocks one late plugin /compact. Claude cannot tell that
 // command from the user's own, so later ones run as unrequested compaction.
 let consumedCancelId = null;
+// The /compact whose context reset is being read after the command returned.
+// Input submitted then does not refill the context; the next model request does.
+let confirming = null;
 // Paseo and Claude read the same wall clock, which a VM host may step back by
 // a second or two to correct drift (WSL2: observed -1.8 s every few minutes).
 // Only a larger step is a rollback. Must equal CLOCK_STEP_TOLERANCE_MS in
@@ -90,19 +93,63 @@ async function admit($, trigger) {
   return reason;
 }
 
+// Time after /compact returns to wait for the live window to report the reset before failing.
+const CONFIRMATION_WINDOW_MS = 10_000;
+// How often to read the live window during that time.
+const CONFIRMATION_READ_INTERVAL_MS = 500;
 // The live window reports no fill from just after a compaction until the
 // next response; a cancelled or no-op /compact leaves the old fill in place.
+// It is read once as the command returns, then every 500 ms, until a later
+// main model request starts (see turn.step) or 10 seconds pass.
 async function confirm($, operation) {
-  const deadline = await $.clock.now() + 10_000;
-  const timer = await $.clock.every(500, async () => {
-    if (state.compact !== operation || operation.status !== 'running') return timer.cancel();
-    const reset = (await $.session.usage()).context.tokens === undefined;
-    if (!reset && await $.clock.now() < deadline) return;
+  confirming = operation;
+  const deadline = await $.clock.now() + CONFIRMATION_WINDOW_MS;
+  const current = () => state.compact === operation && operation.status === 'running';
+  // A reading is evidence of completion only: no fill while the operation is
+  // still current and running. A rejected reading, a fill or a superseded
+  // operation records nothing.
+  let reading = null;
+  const read = async () => {
+    try {
+      let reset;
+      try {
+        reset = (await $.session.usage()).context.tokens === undefined;
+      } catch {
+        // A rejected read is no evidence of a reset or a fill. It records
+        // nothing and the interval still decides at the limit. Caught so it is
+        // not unhandled.
+        return;
+      }
+      // Nothing is awaited between this check and the write below.
+      if (!reset || !current()) return;
+      operation.status = 'completed';
+      await save($);
+    } finally {
+      reading = null;
+    }
+  };
+  const startReading = () => {
+    if (reading) return reading;
+    // A failed write is not retried here; the heartbeat saves this state again.
+    reading = read().catch(() => {});
+    return reading;
+  };
+  // The limit is decided here, never by a reading, so a reading that starts
+  // before it and returns after it cannot defer the failure.
+  const timer = await $.clock.every(CONFIRMATION_READ_INTERVAL_MS, async () => {
+    if (!current()) { timer.cancel(); return; }
+    // A reading is never awaited here, so one that does not settle cannot hold the ticks.
+    startReading();
+    const now = await $.clock.now();
+    // A later model request may have recorded unknown while the clock was read.
+    if (!current()) { timer.cancel(); return; }
+    if (now < deadline) return;
+    operation.status = 'failed';
+    operation.reason = 'Claude returned without completing compaction';
     timer.cancel();
-    operation.status = reset ? 'completed' : 'failed';
-    if (!reset) operation.reason = 'Claude returned without completing compaction';
     await save($);
   });
+  startReading();
 }
 
 export function registerObserver(on, config) {
@@ -110,6 +157,7 @@ export function registerObserver(on, config) {
   writes = Promise.resolve();
   lastReceiptValue = null;
   consumedCancelId = null;
+  confirming = null;
   state = {
     version: 1, launchId: configuration.launchId, generation: crypto.randomUUID(),
     sessionId: null, updatedAt: 0, revision: 0, activeTurns: [], pendingInputs: 0,
@@ -159,7 +207,7 @@ export function registerObserver(on, config) {
       state.cacheRequest = null;
       state.ordinaryEndedAt = null;
       state.ordinaryRevision = null;
-      supersede();
+      if (state.compact !== confirming) supersede();
       await save($);
     }
     return next(e);
@@ -180,6 +228,12 @@ export function registerObserver(on, config) {
     return next(e);
   });
   on('turn.step', async function* ($, e, next) {
+    // A main model request may refill the context window, so a reset read
+    // from now on cannot be told apart from a /compact that did nothing.
+    if (e.agentId === undefined && confirming && state.compact === confirming && confirming.status === 'running') {
+      confirming.status = 'unknown';
+      confirming.reason = 'Compaction completion could not be observed';
+    }
     if (!state.activeTurns.includes(e.turnId)) state.activeTurns.push(e.turnId);
     if (e.agentId === undefined && e.turnId === ordinaryTurnId) {
       absorbedCurrentTurnInputs += pendingCurrentTurnInputs;

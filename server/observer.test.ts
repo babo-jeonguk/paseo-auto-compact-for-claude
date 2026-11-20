@@ -71,7 +71,9 @@ test('the compatible pre-fix observer stays readable during rollout; unknown bui
       '8a6c0217779bc4f83c7029c8170c35da8d2ed8028622019f4a09808491dff90f',
       '7d9c570c36bcad4db9ef816c0b704c5b0d01d12c7522b215cdfbbfc160c86648',
       '9fa0456c8d59db1297e540db98993d8d23e34dbfb4a487843334926447ece70b',
-      'ece7bf8ce5445aedb974f30472983b78c7358b8feea99d15c1ef2369d88a26e4']) {
+      'ece7bf8ce5445aedb974f30472983b78c7358b8feea99d15c1ef2369d88a26e4',
+      // v1.2.1
+      '134e83d3751cca2f86c2ccda713162c7e739827df129e2020ab88a039c564e63']) {
       await writeFile(manifestPath, JSON.stringify({ ...f.manifest, build }));
       assert(await f.observer.read('a'));
       f.ledger.pendingInputs = 1; await f.save();
@@ -129,8 +131,12 @@ test('native receipt must match operation and revision; settling preserves subse
     assert.equal((await f.observer.result('a', operation))?.status, 'completed');
     await f.observer.cancel(operation);
     assert.equal(JSON.parse(await readFile(join(f.directory, 'request.json'), 'utf8')).status, 'settled');
+    // Input after the command advances the ledger; the operation's own record still decides.
     f.ledger.revision++; await f.save();
-    assert.equal((await f.observer.result('a', operation))?.status, 'unknown');
+    assert.equal((await f.observer.result('a', operation))?.status, 'completed');
+    f.ledger.compact = { id: operation.id, revision: 1, status: 'running' }; await f.save();
+    assert.equal(await f.observer.result('a', operation), null, 'still running is no answer yet');
+    f.ledger.compact = { id: operation.id, revision: 1, status: 'completed' }; f.ledger.revision--; await f.save();
     const next = await f.observer.prepare(f.agent, true, 1_030_000);
     await f.observer.cancel(operation);
     assert.equal(JSON.parse(await readFile(join(f.directory, 'request.json'), 'utf8')).id, next.id);

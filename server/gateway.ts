@@ -22,16 +22,13 @@ const commandBoundary = (item: TimelineItem, turnId: string | null | undefined, 
 // What a history page proves about the /compact sent with message ID `id`.
 // History is evidence only when that caller-known ID pins the command's turn;
 // a bounded page can miss old work, so a missing command (null) is never proof
-// of non-delivery. `laterInput` is another user message after the command.
+// of non-delivery. Other input around the command proves nothing either way:
+// Paseo 0.16.2 and later deliver a steered message after the compaction, and
+// any input that did stop it shows as Claude's failure or the turn's outcome.
 function pinnedCommand(entries: ReadonlyArray<{ turnId?: string | null; item: TimelineItem }>, id: string) {
-  const at = entries.findIndex(entry => entry.item.type === "user_message" && entry.item.clientMessageId === id);
-  const turnId = at < 0 ? null : entries[at].turnId ?? null;
+  const turnId = entries.find(entry => entry.item.type === "user_message" && entry.item.clientMessageId === id)?.turnId ?? null;
   if (turnId === null) return null;
-  return {
-    turnId,
-    boundary: entries.some(entry => commandBoundary(entry.item, entry.turnId, turnId)),
-    laterInput: entries.slice(at + 1).some(entry => entry.item.type === "user_message" && entry.item.clientMessageId !== id),
-  };
+  return { turnId, boundary: entries.some(entry => commandBoundary(entry.item, entry.turnId, turnId)) };
 }
 // The SDK's lost live view: after a reconnect (`subscription_restored`) history
 // may have been missed, a `replacement` invalidates the previous timeline epoch,
@@ -136,7 +133,9 @@ export function createGateway(options: {
     compact: (id, expected, execution) => compact(id, expected, false, undefined, execution),
     async inspect(operation) {
       const evidence = operation.evidence;
-      if (evidence?.invalidated) return { status: "unknown", detail: "Conversation changed during compaction; no automatic retry" };
+      // Set when the observer changed at the dispatch boundary, and by releases
+      // that still treated later input as a change; neither can complete now.
+      if (evidence?.invalidated) return { status: "unknown", detail: "Compaction evidence no longer attributable; no automatic retry" };
       if (!evidence?.native || !observer) return null;
       const native = await observer.receipt(operation.agentId, evidence.native);
       if (native && native.observedAt > deadlineOf(operation)) return null;
@@ -165,7 +164,7 @@ export function createGateway(options: {
     busy.add(agentId);
     const id = execution?.id ?? randomUUID();
     let operation: Awaited<ReturnType<Observer['prepare']>> | undefined;
-    let sent = false, armed = false, cancelled = false, superseded = false, ownershipLost = false;
+    let sent = false, armed = false, cancelled = false, ownershipLost = false;
     let boundary = false;
     // Lost live views so far. After one, the live command turn and boundary
     // prove nothing on their own; `pinned` holds what history read since the
@@ -184,7 +183,7 @@ export function createGateway(options: {
       const { turnId, boundary } = proof();
       // A lost live view is not a change: the evidence stays valid, so
       // reconciliation keeps checking it until the observation deadline.
-      const value = { ...evidence, ...(turnId ? { turnId } : {}), boundary, invalidated: superseded || ownershipLost };
+      const value = { ...evidence, ...(turnId ? { turnId } : {}), boundary, invalidated: ownershipLost };
       const serialized = JSON.stringify(value);
       if (!force && serialized === saved && now() - lastCheckpoint < CHECKPOINT_INTERVAL_MS) return;
       await wait(execution.checkpoint(value));
@@ -212,10 +211,8 @@ export function createGateway(options: {
         if (!armed) return;
         if (LOST_VIEW.has(event.type)) { losses++; pinned = null; }
         if (event.type !== "timeline") return;
-        if (event.item.type === "user_message") {
-          if (event.item.clientMessageId === id) entry.turnId = event.turnId ?? null;
-          else superseded = true;
-        }
+        // Only the command's own message pins its turn; other input is not evidence.
+        if (event.item.type === "user_message" && event.item.clientMessageId === id) entry.turnId = event.turnId ?? null;
         if (commandBoundary(event.item, event.turnId, entry.turnId)) boundary = true;
       });
       await read(subscription.ready);
@@ -252,7 +249,6 @@ export function createGateway(options: {
       await bounded(send, Math.min(options.dispatchTimeoutMs ?? SEND_TIMEOUT_MS, deadline - now())).catch(() => {});
       while (currentWorker() && !cancelled) {
         await checkpoint();
-        if (superseded) return { status: "unknown", detail: "Conversation changed during compaction; no automatic retry" };
         const native = operation ? await read(observer!.receipt(agentId, evidence.native!)) ??
           await read(observer!.result(agentId, operation)) : null;
         if (native && native.status !== "completed") return native;
@@ -265,16 +261,8 @@ export function createGateway(options: {
           // A failed or late read is evidence of nothing; the next poll reads again.
           const found = await wait(history(agentId, id)).catch(() => null);
           // A page read across another loss may belong to the replaced epoch, so
-          // it proves nothing as a whole: neither a later user message nor a
-          // pinned turn or boundary. The next poll reads history again.
-          if (found && losses === at) {
-            if (found.laterInput) {
-              superseded = true;
-              await checkpoint(true).catch(() => {});
-              return { status: "unknown", detail: "Conversation changed during compaction; no automatic retry" };
-            }
-            pinned = found;
-          }
+          // it pins neither a turn nor a boundary. The next poll reads history again.
+          if (found && losses === at) pinned = found;
         }
         const { turnId, boundary: proven } = proof();
         const ended = turnId ? endings.get(turnId) : null;
@@ -286,9 +274,10 @@ export function createGateway(options: {
           if (after?.sessionId !== before.sessionId)
             return { status: "failed", detail: "Claude session changed during compaction" };
           await checkpoint(true);
-          if (superseded || !currentWorker())
-            return { status: "unknown", detail: "Conversation changed during completion verification; no automatic retry" };
-          // A view lost during verification may hide a later message: prove it again from history.
+          if (!currentWorker())
+            return { status: "unknown", detail: "Worker stopped during completion verification; no automatic retry" };
+          // A view lost during verification voids the proof read before it; the
+          // next poll proves the command's turn and boundary again from history.
           if (losses === at) return { status: "completed", detail: "Compaction completed in the same Claude session" };
         }
         await wait(new Promise(resolve => setTimeout(resolve, options.pollMs ?? 50)));

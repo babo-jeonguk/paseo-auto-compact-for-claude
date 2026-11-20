@@ -177,7 +177,8 @@ test("completed command ownership is released; stock gateway offers no automatic
   host.stop();
 });
 
-function observer(result: { status: 'completed' | 'unknown'; detail: string } | null) {
+type Receipt = { status: 'completed' | 'failed' | 'unknown'; detail: string };
+function observer(result: Receipt | null) {
   const operation = { id: 'operation-1', launchId: 'launch', generation: 'generation',
     sessionId: 'native-a', revision: 1, preparedAt: Date.now(), expiresAt: Date.now() + 30000,
     directory: '/unused', status: 'prepared', requireCache: true };
@@ -209,11 +210,74 @@ test('automatic public dispatch requires both its own boundary and matching nati
     assert.equal((await host.gateway.automatic!(agent)).status, expected);
     assert.equal(host.sendCount(), 1);
   }
+  // Input after the command (a steered message, say) is not evidence either way.
   const foreign = [...boundary, { type: 'user_message', clientMessageId: 'unrelated' }];
   const host = fixture(boundary, undefined, false, foreign, {
     observer: observer({ status: 'completed', detail: 'Native PostCompact' }), timeoutMs: 1_000,
   });
-  assert.equal((await host.gateway.automatic!((await host.gateway.refresh('a'))!)).status, 'unknown');
+  assert.equal((await host.gateway.automatic!((await host.gateway.refresh('a'))!)).status, 'completed');
+  assert.equal(host.sendCount(), 1);
+});
+
+// Another user message seen live after the send, in its own turn or in the
+// command's, followed by what Claude and the host report for the command.
+async function overlap({ receipt = { status: 'completed', detail: 'Native PostCompact' } as Receipt | null,
+  outcome = { kind: 'completed' } as unknown, events = [] as Array<{ turnId: string; item: unknown }>, timeoutMs = 1_000 } = {}) {
+  const host = fixture([], outcome, false, [], { observer: observer(receipt), timeoutMs });
+  const send = host.ref.send;
+  let emit!: (message: unknown) => void;
+  const subscribe = host.ref.timeline.subscribe;
+  host.ref.timeline.subscribe = listener => { emit = listener; return subscribe(listener); };
+  host.ref.send = async (text, options) => {
+    // Every event, the turn's end included, is seen after the command and the steered input.
+    const end = host.ended;
+    let ending: Parameters<typeof end>[0] | undefined;
+    host.ended = event => { ending = event; };
+    await send(text, options);
+    host.ended = end;
+    for (const { turnId, item } of events) emit({ agentId: 'a', event: { type: 'timeline', provider: 'claude', turnId, item } });
+    if (ending) end(ending);
+  };
+  const saved: OperationEvidence[] = [];
+  const result = await host.gateway.automatic!((await host.gateway.refresh('a'))!, undefined, {
+    id: 'overlap', sendBy: Date.now() + 30_000, checkpoint: async evidence => { saved.push(evidence); }, current: () => true,
+  });
+  assert.equal(host.sendCount(), 1, '/compact is never sent twice');
+  return { result, evidence: saved.at(-1) };
+}
+const STEERED = { type: 'user_message', clientMessageId: 'steered' };
+const OWN_BOUNDARY = { turnId: 'compact-1', item: { type: 'compaction', status: 'completed', trigger: 'manual' } };
+
+test('input after the command does not decide the outcome: Claude and the command turn do', async () => {
+  for (const [name, events] of [
+    ['steered into the command turn', [{ turnId: 'compact-1', item: STEERED }, OWN_BOUNDARY]],
+    ['in its own later turn', [OWN_BOUNDARY, { turnId: 'next-turn', item: STEERED }]],
+    ['seen before the boundary', [{ turnId: 'next-turn', item: STEERED }, OWN_BOUNDARY]],
+  ] as const) {
+    const { result, evidence } = await overlap({ events: [...events] });
+    assert.equal(result.status, 'completed', name);
+    assert.equal(evidence?.invalidated, false, name);
+  }
+});
+
+test('with input after the command, a failure Claude or the host reports is still a failure', async () => {
+  const events = [{ turnId: 'next-turn', item: STEERED }];
+  assert.equal((await overlap({ events, receipt: { status: 'failed', detail: 'Cancelled' } })).result.status, 'failed');
+  assert.equal((await overlap({ events, outcome: { kind: 'canceled' } })).result.status, 'failed');
+});
+
+test('with input after the command and no completion from Claude, the attempt stays open for reconciliation', async () => {
+  const { result, evidence } = await overlap({ events: [{ turnId: 'next-turn', item: STEERED }, OWN_BOUNDARY],
+    receipt: null, timeoutMs: 60 });
+  assert.equal(result.status, 'unknown');
+  assert.equal(evidence?.invalidated, false, 'the evidence stays valid for reconciliation');
+});
+
+test('a boundary in any turn but the command\'s own never completes the attempt', async () => {
+  const boundary = { type: 'compaction', status: 'completed', trigger: 'manual' };
+  const { result } = await overlap({ events: [{ turnId: 'next-turn', item: STEERED }, { turnId: 'next-turn', item: boundary }],
+    timeoutMs: 60 });
+  assert.equal(result.status, 'unknown');
 });
 
 test('last-moment off policy and expired delivery prevent public send', async () => {
@@ -457,6 +521,13 @@ test("recovery requires both the native receipt and the exact message's command 
     { turnId: "our-turn", item: { type: "compaction", status: "completed", trigger: "manual" } },
   ] });
   assert.equal((await host.gateway.inspect!(operation))?.status, "completed");
+  host.ref.timeline.refetch = async () => ({ entries: [
+    { turnId: "our-turn", item: { type: "user_message", clientMessageId: operation.id } },
+    { turnId: "next-turn", item: { type: "user_message", clientMessageId: "steered" } },
+    { turnId: "our-turn", item: { type: "compaction", status: "completed", trigger: "manual" } },
+  ] });
+  assert.equal((await host.gateway.inspect!(operation))?.status, "completed", "later input is not evidence");
+  // A record stored as invalidated by an earlier release keeps its answer.
   operation.evidence!.invalidated = true;
   assert.equal((await host.gateway.inspect!(operation))?.status, "unknown");
   operation.evidence!.invalidated = false;
@@ -682,6 +753,48 @@ test("refreshing an ineligible agent does not read its ledger; an eligible one s
 // emits `lost`, then `live` items. `history` is what a timeline refetch returns,
 // the command's own entry first unless the test says otherwise; `lose` emits
 // another lost view while that read is in flight. `reads` counts the refetches.
+test("recovery completes from stored boundary evidence when history no longer pins the command", async () => {
+  const host = fixture([], undefined, false, [], { observer: observer({ status: "completed", detail: "receipt" }) });
+  const operation: StoredOperation = {
+    id: "stored", agentId: "a", revision: "rev", target: { sessionId: "native-a", activityKey: null },
+    kind: "manual", state: "observing", createdAt: 1, updatedAt: 1, result: null, inputFingerprint: null,
+    evidence: { dispatchStartedAt: 1, turnId: "our-turn", boundary: true, native: { id: "stored", launchId: "launch",
+      generation: "gen", sessionId: "native-a", revision: 1 } },
+  };
+  // After a daemon restart the restored rows carry neither message nor turn IDs.
+  host.ref.timeline.refetch = async () => ({ entries: [
+    { turnId: null, item: { type: "user_message", text: "/compact" } },
+    { turnId: null, item: { type: "user_message", clientMessageId: "steered" } },
+  ] });
+  assert.equal((await host.gateway.inspect!(operation))?.status, "completed");
+});
+
+test("a live view lost while completion is verified is proved again from history", async () => {
+  const host = fixture([], undefined, false, [BOUNDARY_ITEM], { observer: observer({ status: "completed", detail: "Native PostCompact" }) });
+  let emit!: (message: unknown) => void;
+  const subscribe = host.ref.timeline.subscribe;
+  host.ref.timeline.subscribe = listener => { emit = listener; return subscribe(listener); };
+  const send = host.ref.send;
+  let sent = false, lost = false;
+  host.ref.send = async (text, options) => { await send(text, options); sent = true; };
+  const refresh = host.ref.refresh;
+  // The view is lost once, during the first session check after the send.
+  host.ref.refresh = async () => {
+    const current = await refresh();
+    if (sent && !lost) { lost = true; emit({ agentId: "a", event: { type: "replacement", epoch: "epoch-2" } }); }
+    return current;
+  };
+  let reads = 0;
+  host.ref.timeline.refetch = async () => { reads++; return { entries: [command("verify"), { turnId: "compact-1", item: BOUNDARY_ITEM }] }; };
+  const result = await host.gateway.automatic!((await refresh().then(() => host.gateway.refresh("a")))!, undefined, {
+    id: "verify", sendBy: Date.now() + 30_000, checkpoint: async () => {}, current: () => true,
+  });
+  assert.equal(result.status, "completed");
+  assert.ok(reads > 0, "the proof seen before the loss was not trusted on its own");
+  assert.equal(host.sendCount(), 1);
+});
+
+const BOUNDARY_ITEM = { type: "compaction", status: "completed", trigger: "manual" };
 const LOST_VIEW = ["subscription_restored", "replacement", "error"] as const;
 type HistoryEntry = { turnId: string | null; item: unknown };
 const BOUNDARY = { type: "compaction", status: "completed", trigger: "manual" };
@@ -730,14 +843,14 @@ test("after a lost live view, a boundary only history shows is enough", async ()
   }
 });
 
-test("after a lost live view, another user message after the command in history is a conversation change", async () => {
+test("after a lost live view, another user message after the command in history is not evidence", async () => {
   const other = { turnId: "next-turn", item: { type: "user_message", clientMessageId: "someone-else" } };
   const boundary = { turnId: "compact-1", item: BOUNDARY };
   for (const lost of LOST_VIEW) {
     for (const history of [(id: string) => [command(id), other, boundary], (id: string) => [command(id), boundary, other]]) {
       const { result, evidence } = await lostView(lost, { live: [BOUNDARY], history });
-      assert.equal(result.status, "unknown", lost);
-      assert.equal(evidence?.invalidated, true, lost);
+      assert.equal(result.status, "completed", lost);
+      assert.equal(evidence?.invalidated, false, lost);
     }
   }
 });
@@ -829,13 +942,13 @@ test("after a lost live view, history is read at most once a second while comple
   assert.equal(host.sendCount(), 1);
 });
 
-test("a superseding user message seen live, before or after a lost live view, still ends the attempt as a change", async () => {
+test("another user message seen live, before or after a lost live view, does not end the attempt", async () => {
   const message = { type: "user_message", clientMessageId: "someone-else" };
   for (const lost of LOST_VIEW) {
     for (const [name, options] of [["before", { before: [message] }], ["after", { live: [message] }]] as const) {
       const { result, evidence } = await lostView(lost, { ...options });
-      assert.equal(result.status, "unknown", `${lost}: ${name}`);
-      assert.equal(evidence?.invalidated, true, `${lost}: ${name}`);
+      assert.equal(result.status, "completed", `${lost}: ${name}`);
+      assert.equal(evidence?.invalidated, false, `${lost}: ${name}`);
     }
   }
 });

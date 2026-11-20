@@ -14,7 +14,7 @@ Codex subscription sessions do not need this plugin: [caches are retained indefi
 
 ## Requirements
 
-- **Paseo 0.12 or later**, including Paseo 0.16.
+- **Paseo 0.12 or later**, including Paseo 0.16 and the 0.17 beta (0.17.0-beta.1).
 - A Claude provider using a native Claude Code CLI that supports Mods. Claude profiles are supported too.
 - The Paseo web, desktop or Android app. The iOS app is unverified.
 

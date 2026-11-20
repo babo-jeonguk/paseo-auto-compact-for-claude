@@ -142,7 +142,7 @@ export async function startFixture({ root, plugin, cliPackage, appVersion, binar
       return result.id;
     },
     async row(id) { return (await fixture.rpc('session', { agentId: id })).row; },
-    async send(id, text) { await client.sendMessage(id, text); },
+    async send(id, text, options) { return client.sendMessage(id, text, options); },
     async turn(id, label) {
       const replies = await fixture.timeline(id);
       const seen = new Set(replies.filter(e => e.item.type === 'assistant_message').map(e => e.item.text));
