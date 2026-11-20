@@ -11,6 +11,7 @@ import { startFixture } from './fixture.mjs';
 import { startModel } from './model.mjs';
 import { scenarios } from './scenarios.mjs';
 import { acquireNativeSlot } from './execution.mjs';
+import { paseoPackages } from './paseo-versions.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const plugin = resolve(here, '../..');
@@ -25,17 +26,6 @@ const value = (name, fallback) => {
   return process.argv[at + 1];
 };
 const paseoRequested = value('--paseo', '0.12.0');
-const paseoPackages = new Map([
-  ['0.12.0', '@getpaseo/cli-0-12'],
-  ['0.13.0', '@getpaseo/cli-0-13'],
-  ['0.14.0', '@getpaseo/cli-0-14'],
-  ['0.15.0-beta.1', '@getpaseo/cli-0-15'],
-  ['0.15.0', '@getpaseo/cli-0-15-stable'],
-  ['0.16.0-beta.1', '@getpaseo/cli-0-16-beta'],
-  ['0.16.0', '@getpaseo/cli-0-16-stable'],
-  ['0.16.2', '@getpaseo/cli-0-16-2'],
-  ['0.17.0-beta.1', '@getpaseo/cli-0-17-beta'],
-]);
 assert(paseoPackages.has(paseoRequested), `Unsupported Paseo simulation version: ${paseoRequested}`);
 const reportRoot = resolve(value('--report-dir', join(plugin, 'test-results', `${process.platform}-${process.arch}`)));
 const reportDir = join(reportRoot, `paseo-${paseoRequested}`);
@@ -111,7 +101,7 @@ try {
     'server/model.ts', 'server/store.ts', 'server/operations.ts', 'server/retention.ts', 'server/deadline.ts', 'shared/rpc.ts', 'shared/providers.ts', 'paseo-plugin.json', 'package.json'])
     report.sourceFiles[path] = sha(await readFile(join(plugin, path)));
   report.simulationFiles = {};
-  for (const path of ['matrix.mjs', 'run.mjs', 'execution.mjs', 'fixture.mjs', 'model.mjs', 'scenarios.mjs', 'package.json', 'package-lock.json'])
+  for (const path of ['matrix.mjs', 'run.mjs', 'execution.mjs', 'fixture.mjs', 'model.mjs', 'scenarios.mjs', 'paseo-versions.mjs', 'package.json', 'package-lock.json'])
     report.simulationFiles[path] = sha(await readFile(join(here, path)));
   model = await startModel();
   fixture = await startFixture({ root, plugin, cliPackage, appVersion: report.appVersion,

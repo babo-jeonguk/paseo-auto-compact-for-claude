@@ -60,7 +60,7 @@ On a heavily loaded machine, `--minimal-builtins` omits the released server's li
 | Operation identity | Same-ID retries during execution and after completion do not resend; conflicting input is rejected; history remains queryable after new activity |
 | Retention | Stop the plugin, age a completed native operation and seed recent/pending controls; reload deletes eligible history and orphan receipts, preserves controls, and does not resend unchanged activity |
 | Input overlap | An explicit interrupt stops the compaction, which is never reported completed; the user's own response remains on the timeline |
-| Steered and agent input | A steered message, and a message from another agent held past Paseo's two-second batch window, each get their own reply. The plugin's outcome must match what Claude's receipt and the command's own boundary show, read apart from the plugin, and `/compact` is sent once. The report's `detail` records which way the host went: Paseo 0.16.2 and 0.17.0-beta.1 finish the compaction, earlier versions stop it |
+| Steered and agent input | A steered message, and a message from another agent held past Paseo's two-second batch window, each get their own reply. The plugin's outcome must match what Claude's receipt and the command's own boundary show, read apart from the plugin, and `/compact` is sent once. When the compaction completes, the follow-up is answered after the command's boundary, and each overlap makes one model request. The report's `detail` records which way the host went; in local runs Paseo 0.16.2 and 0.17.0-beta.1 finished the compaction and 0.12.0 and 0.16.0 stopped it |
 | Thinking level | After a change from low to high and an ordinary reply, Compact now completes on a receipt from the observer it was prepared for; the report records whether the change kept that observer |
 | Changing TTL | New 5m/mixed responses are re-detected; later 1h data restores scheduling |
 | Missing TTL | Labeled default retains 50/55-minute scheduling |
@@ -134,7 +134,7 @@ npm run test:simulation:0.14 -- --expect-platform linux
 
 The first command runs every version in the matrix: 0.12.0, 0.13.0, 0.14.0, 0.15.0, 0.16.2 and 0.17.0-beta.1. 0.15.0-beta.1, 0.16.0-beta.1 and 0.16.0 stay pinned and run through their own scripts. The version-specific commands accept `--claude /absolute/native/claude`, `--tools /npm/prefix`, or `--report-dir /results`. A custom tools prefix may contain the matching ordinary `@getpaseo/cli` package or the versioned aliases used by this repository. Overrides still use an isolated home and the local model server. `npm run test:simulation:0.12 -- --help` lists the options.
 
-To change a tested Claude/Paseo version, edit its exact alias in `tests/simulation/package.json`, regenerate the lockfile with `npm install --prefix tests/simulation --ignore-scripts`, and run the full suite on both OSes. Commit both package and lockfile. Keep 0.12 in the matrix while it remains the declared minimum. Do not infer native compatibility from the unit suite alone.
+To change a tested Claude/Paseo version, edit its exact alias in `tests/simulation/package.json` and its entry in `tests/simulation/paseo-versions.mjs`, regenerate the lockfile with `npm install --prefix tests/simulation --ignore-scripts`, and run the full suite on both OSes. Commit both package and lockfile. Keep 0.12 in the matrix while it remains the declared minimum. Do not infer native compatibility from the unit suite alone.
 
 ## CI
 
