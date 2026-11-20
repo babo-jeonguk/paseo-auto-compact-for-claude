@@ -753,6 +753,47 @@ test("refreshing an ineligible agent does not read its ledger; an eligible one s
 // emits `lost`, then `live` items. `history` is what a timeline refetch returns,
 // the command's own entry first unless the test says otherwise; `lose` emits
 // another lost view while that read is in flight. `reads` counts the refetches.
+test("recovery completes from stored boundary evidence when history no longer pins the command", async () => {
+  const host = fixture([], undefined, false, [], { observer: observer({ status: "completed", detail: "receipt" }) });
+  const operation: StoredOperation = {
+    id: "stored", agentId: "a", revision: "rev", target: { sessionId: "native-a", activityKey: null },
+    kind: "manual", state: "observing", createdAt: 1, updatedAt: 1, result: null, inputFingerprint: null,
+    evidence: { dispatchStartedAt: 1, turnId: "our-turn", boundary: true, native: { id: "stored", launchId: "launch",
+      generation: "gen", sessionId: "native-a", revision: 1 } },
+  };
+  // After a daemon restart the restored rows carry neither message nor turn IDs.
+  host.ref.timeline.refetch = async () => ({ entries: [
+    { turnId: null, item: { type: "user_message", text: "/compact" } },
+    { turnId: null, item: { type: "user_message", clientMessageId: "steered" } },
+  ] });
+  assert.equal((await host.gateway.inspect!(operation))?.status, "completed");
+});
+
+test("a live view lost while completion is verified is proved again from history", async () => {
+  const host = fixture([], undefined, false, [BOUNDARY_ITEM], { observer: observer({ status: "completed", detail: "Native PostCompact" }) });
+  let emit!: (message: unknown) => void;
+  const subscribe = host.ref.timeline.subscribe;
+  host.ref.timeline.subscribe = listener => { emit = listener; return subscribe(listener); };
+  const send = host.ref.send;
+  let sent = false;
+  host.ref.send = async (text, options) => { await send(text, options); sent = true; };
+  const refresh = host.ref.refresh;
+  host.ref.refresh = async () => {
+    const current = await refresh();
+    if (sent) emit({ agentId: "a", event: { type: "replacement", epoch: "epoch-2" } });
+    return current;
+  };
+  let reads = 0;
+  host.ref.timeline.refetch = async () => { reads++; return { entries: [command("verify"), { turnId: "compact-1", item: BOUNDARY_ITEM }] }; };
+  const result = await host.gateway.automatic!((await refresh().then(() => host.gateway.refresh("a")))!, undefined, {
+    id: "verify", sendBy: Date.now() + 30_000, checkpoint: async () => {}, current: () => true,
+  });
+  assert.equal(result.status, "completed");
+  assert.ok(reads > 0, "the proof seen before the loss was not trusted on its own");
+  assert.equal(host.sendCount(), 1);
+});
+
+const BOUNDARY_ITEM = { type: "compaction", status: "completed", trigger: "manual" };
 const LOST_VIEW = ["subscription_restored", "replacement", "error"] as const;
 type HistoryEntry = { turnId: string | null; item: unknown };
 const BOUNDARY = { type: "compaction", status: "completed", trigger: "manual" };

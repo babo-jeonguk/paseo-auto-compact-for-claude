@@ -3,18 +3,19 @@ import { test } from 'node:test';
 import { registerObserver } from '../server/observer-source.mjs';
 
 function fixture(env = {}, settings = {}) {
-  let time = 1_000_000, contextTokens = 100_000, usageGate = null;
+  let time = 1_000_000, contextTokens = 100_000, usageGate = null, afterUsage = null, clockGate = null;
   const hooks = new Map(), files = new Map();
   const timers = new Set();
   const configuration = { launchId: 'launch-1', ledger: '/ledger', request: '/request', receipts: '/receipts' };
-  const $ = { clock: { now: async () => time, every: (_ms, fn) => {
+  // A held clock read blocks only the first read after a context reading.
+  const $ = { clock: { now: async () => { if (clockGate) { const gate = clockGate; clockGate = null; await gate(); } return time; }, every: (_ms, fn) => {
       const timer = { fn, cancel() { timers.delete(timer); } };
       timers.add(timer); return timer;
     } },
     fs: { write: async (p, v) => files.set(p, v), read: async p => files.get(p) ?? '{}' },
     session: { id: async () => 'native-1',
       // A held reading resolves to the context as it is when released.
-      usage: async () => { await usageGate;
+      usage: async () => { await usageGate; if (afterUsage) { clockGate = afterUsage; afterUsage = null; }
         return { context: { window: 1_000_000, ...(contextTokens === undefined ? {} : { tokens: contextTokens }) } }; } },
     env: { get: async name => env[name] },
     settings: { read: async () => settings } };
@@ -41,6 +42,13 @@ function fixture(env = {}, settings = {}) {
     timers: () => timers.size,
     advance(ms) { time += ms; },
     context(tokens) { contextTokens = tokens; },
+    holdClockAfterUsage() {
+      let release, reached;
+      const held = new Promise(resolve => { release = resolve; });
+      const arrival = new Promise(resolve => { reached = resolve; });
+      afterUsage = () => { reached(); return held; };
+      return { release, reached: arrival };
+    },
     holdUsage() { let release; usageGate = new Promise(resolve => { release = () => { usageGate = null; resolve(); }; }); return release; },
     async start() { await event('session.start'); },
     async ordinary(reported = usage, responseDelay = 0) {
@@ -425,6 +433,39 @@ test('with classic hooks skipped, a reading that ends after the operation was su
     await reading;
     assert.equal(f.ledger().compact.status, 'unknown', name);
   }
+});
+
+test('with classic hooks skipped, a reading in flight never rewrites a result already recorded', async () => {
+  const f = fixture(); await f.start(); await f.ordinary(); f.request();
+  await f.compact();
+  for (let i = 0; i < 19; i++) await f.tick();
+  assert.equal(f.ledger().compact.status, 'running');
+  await f.event('turn.start', { text: 'steered input', turnId: 'user-2' });
+  // The last reading of the 10-second window is held right after it reads the context,
+  // while the steered input's model request starts and records its own result.
+  const { release, reached } = f.holdClockAfterUsage();
+  const reading = f.tick();
+  await reached;
+  await f.step('user-2');
+  const recorded = f.ledger().compact.status;
+  assert.notEqual(recorded, 'running');
+  release();
+  await reading;
+  assert.equal(f.ledger().compact.status, recorded, 'a terminal result is never rewritten');
+});
+
+test('with classic hooks skipped, a reading that ends after the operation was replaced records nothing for it', async () => {
+  const f = fixture(); await f.start(); await f.ordinary(); f.request();
+  await f.compact();
+  const release = f.holdUsage();
+  const reading = f.tick();
+  // Claude's own automatic compaction takes the observer's current operation.
+  await f.event('classic.PreCompact', { trigger: 'auto' });
+  f.context(undefined);
+  release();
+  await reading;
+  assert.equal(f.files.get('/receipts/operation-1.json'), undefined, 'no receipt for the replaced operation');
+  assert.deepEqual({ id: f.ledger().compact.id, status: f.ledger().compact.status }, { id: null, status: 'running' });
 });
 
 test('without a context reading before /compact, completion stays unknown rather than guessed', async () => {
