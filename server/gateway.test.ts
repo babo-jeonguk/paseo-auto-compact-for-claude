@@ -13,6 +13,7 @@ import { DEFAULT_SETTINGS } from "../shared/settings";
 import type {
   PluginHandlerContext,
   PluginLifecycleEvents,
+  PluginSessionOpenRequest,
 } from "@getpaseo/plugin/server";
 
 function fixture(
@@ -884,10 +885,11 @@ test("an attempt that ends unknown after a lost live view stays open for reconci
 async function realObserverFixture(now = () => Date.now()) {
   const home = await mkdtemp(join(tmpdir(), "compact-gateway-restart-"));
   const native = createObserver({ home, now });
+  // Include Paseo 0.14+ session-open fields so this compiles across SDK 0.12–0.16+.
   await native.prepareSession({
     agentId: "a", workspaceId: "w", provider: "claude", purpose: "interactive", reason: "create",
-    cwd: home, env: {},
-  }, true);
+    cwd: home, title: "Conversation", labels: {}, metadata: {}, background: false, tools: [], mcpServers: {}, env: {},
+  } as PluginSessionOpenRequest, true);
   const parent = join(home, "plugin-data/auto-compact-for-claude/observers",
     (await readdir(join(home, "plugin-data/auto-compact-for-claude/observers")))[0]);
   const manifest = JSON.parse(await readFile(join(parent, "current.json"), "utf8"));
