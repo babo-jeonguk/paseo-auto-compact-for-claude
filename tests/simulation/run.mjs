@@ -33,6 +33,8 @@ const paseoPackages = new Map([
   ['0.15.0', '@getpaseo/cli-0-15-stable'],
   ['0.16.0-beta.1', '@getpaseo/cli-0-16-beta'],
   ['0.16.0', '@getpaseo/cli-0-16-stable'],
+  ['0.16.2', '@getpaseo/cli-0-16-2'],
+  ['0.17.0-beta.1', '@getpaseo/cli-0-17-beta'],
 ]);
 assert(paseoPackages.has(paseoRequested), `Unsupported Paseo simulation version: ${paseoRequested}`);
 const reportRoot = resolve(value('--report-dir', join(plugin, 'test-results', `${process.platform}-${process.arch}`)));
@@ -119,9 +121,10 @@ try {
     const started = Date.now();
     console.log(`RUN  ${scenario.name}`);
     try {
-      await scenario.run(context);
-      report.checks.push({ name: scenario.name, result: 'passed', durationMs: Date.now() - started });
-      console.log(`PASS ${scenario.name}`);
+      // A scenario may return what the host did, for checks that accept more than one host behavior.
+      const detail = await scenario.run(context);
+      report.checks.push({ name: scenario.name, result: 'passed', durationMs: Date.now() - started, ...(detail ? { detail } : {}) });
+      console.log(`PASS ${scenario.name}${detail ? ` ${JSON.stringify(detail)}` : ''}`);
     } catch (error) {
       report.checks.push({ name: scenario.name, result: 'failed', durationMs: Date.now() - started, error: String(error.stack ?? error) });
       throw error;

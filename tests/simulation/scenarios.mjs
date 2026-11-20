@@ -9,6 +9,30 @@ const scheduled = (f, id, source) => waitFor(async () => {
   return row.status === 'scheduled' && row.dueAt && (!source || row.cache?.source === source) ? row : null;
 }, `scheduled reservation${source ? ` (${source})` : ''}`);
 const boundaries = rows => rows.filter(row => row.item.type === 'compaction' && row.item.status === 'completed');
+// Waits for the plugin's outcome of `operationId`, then checks it against what
+// Claude and Paseo recorded themselves, read apart from the plugin: Claude's
+// receipt for that request, and a completed manual compaction boundary in the
+// /compact message's own turn. Both mean success; anything less never does.
+// Hosts differ in whether overlapping input stops a compaction, so the
+// returned evidence says which way this one went.
+async function settledAgainstEvidence(f, id, operationId) {
+  const operation = await waitFor(async () => {
+    const current = (await f.rpc('operation', { operationId })).operation;
+    return ['succeeded', 'failed', 'unknown'].includes(current?.state) ? current : null;
+  }, 'settled compaction outcome');
+  const receipt = await f.receipt(id, operationId).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+  const rows = await f.timeline(id);
+  const commands = rows.filter(row => row.item.type === 'user_message' && row.item.clientMessageId === operationId);
+  assert(commands.length <= 1, '/compact is sent at most once');
+  const turnId = commands[0]?.turnId;
+  const boundary = !!turnId && rows.some(row => row.turnId === turnId && row.item.type === 'compaction' &&
+    row.item.status === 'completed' && row.item.trigger === 'manual');
+  const evidence = { outcome: operation.state, native: receipt?.status ?? null, boundary };
+  assert.equal(operation.state === 'succeeded', receipt?.status === 'completed' && boundary, JSON.stringify(evidence));
+  return { ...evidence, receipt };
+}
+const replied = (f, id, request, label) => waitFor(async () => (await f.timeline(id)).some(row =>
+  row.item.type === 'assistant_message' && row.item.text.includes(`SIMULATION_REPLY_${request.requestId}`)), label);
 
 export const scenarios = [
   {
@@ -439,7 +463,7 @@ export const scenarios = [
       assert.equal(operation.status, 'running'); assert(operation.operationId);
       await waitFor(() => compact.requestId, 'in-flight compaction');
       const user = model.holdNext();
-      await f.send(id, 'INPUT_DURING_COMPACT: reply without tools.');
+      await f.send(id, 'INPUT_DURING_COMPACT: reply without tools.', { activeTurnBehavior: 'interrupt' });
       compact.release();
       await waitFor(() => user.requestId, 'overlapping user request');
       const result = await waitFor(async () => {
@@ -467,6 +491,85 @@ export const scenarios = [
       assert.notEqual(fresh.revision, row.revision);
       const settled = (await f.rpc('operation', { operationId: operation.operationId })).operation;
       assert(['failed', 'unknown'].includes(settled?.state), JSON.stringify(settled));
+    },
+  },
+  {
+    name: 'input steered into a compaction gets its own reply, and the outcome agrees with what Claude and Paseo recorded',
+    async run({ fixture: f, model }) {
+      await f.settings({ idleMinutes: 50 });
+      const id = await f.agent();
+      await f.turn(id, 'STEER_READY: reply without tools.');
+      const row = await scheduled(f, id);
+      const compact = model.holdNext();
+      const accepted = await f.rpc('now', { agentId: id, revision: row.revision, target: row.target });
+      assert.equal(accepted.status, 'running'); assert(accepted.operationId);
+      await waitFor(() => compact.requestId, 'in-flight compaction');
+      const reply = model.holdNext();
+      // Paseo 0.16.2 and later deliver a steer after the compaction; earlier hosts stop it.
+      try { await f.send(id, 'STEERED_DURING_COMPACT: reply without tools.', { activeTurnBehavior: 'steer' }); }
+      finally { compact.release(); }
+      await waitFor(() => reply.requestId, 'the steered message\'s own request');
+      reply.release();
+      const { receipt, ...evidence } = await settledAgainstEvidence(f, id, accepted.operationId);
+      await replied(f, id, reply, 'the steered message\'s own reply');
+      const fresh = await scheduled(f, id);
+      assert.notEqual(fresh.revision, row.revision);
+      await f.rpc('toggle', { agentId: id, enabled: false });
+      return evidence;
+    },
+  },
+  {
+    name: 'a message from another agent during a compaction gets its own reply, and the outcome agrees with what Claude and Paseo recorded',
+    async run({ fixture: f, model }) {
+      await f.settings({ idleMinutes: 50 });
+      const id = await f.agent(), source = await f.agent();
+      await f.rpc('toggle', { agentId: source, enabled: false });
+      await f.turn(id, 'AGENT_MESSAGE_READY: reply without tools.');
+      const row = await scheduled(f, id);
+      const compact = model.holdNext();
+      const accepted = await f.rpc('now', { agentId: id, revision: row.revision, target: row.target });
+      assert.equal(accepted.status, 'running'); assert(accepted.operationId);
+      await waitFor(() => compact.requestId, 'in-flight compaction');
+      const reply = model.holdNext();
+      let deliveredDuringCompaction;
+      try {
+        await f.send(id, 'AGENT_MESSAGE_DURING_COMPACT: reply without tools.', { sourceAgentId: source });
+        // Agent messages are batched for two seconds. Waiting past that window
+        // shows whether this host delivers the message while the compaction runs
+        // (Paseo 0.17 holds it until the turn ends); no event marks its absence.
+        await new Promise(resolve => setTimeout(resolve, 2_750));
+        deliveredDuringCompaction = reply.requestId !== null;
+      } finally { compact.release(); }
+      await waitFor(() => reply.requestId, 'the agent message\'s own request');
+      reply.release();
+      const { receipt, ...evidence } = await settledAgainstEvidence(f, id, accepted.operationId);
+      await replied(f, id, reply, 'the agent message\'s own reply');
+      await f.rpc('toggle', { agentId: id, enabled: false });
+      return { ...evidence, deliveredDuringCompaction };
+    },
+  },
+  {
+    name: 'after a thinking-level change, the observer keeps working and Compact now completes on its own evidence',
+    async run({ fixture: f }) {
+      await f.settings({ idleMinutes: 50 });
+      const id = await f.agent();
+      await f.client.setAgentThinkingOption(id, 'low');
+      await f.turn(id, 'EFFORT_READY: reply without tools.');
+      const before = await f.ledger(id);
+      // Paseo 0.17 applies this to a running Claude query; otherwise the next
+      // query restarts. The reply below absorbs either before compaction.
+      await f.client.setAgentThinkingOption(id, 'high');
+      await f.turn(id, 'EFFORT_CHANGED: reply without tools.');
+      const row = await scheduled(f, id);
+      const prepared = await f.ledger(id);
+      const accepted = await f.rpc('now', { agentId: id, revision: row.revision, target: row.target });
+      assert.equal(accepted.status, 'running'); assert(accepted.operationId);
+      const { receipt, ...evidence } = await settledAgainstEvidence(f, id, accepted.operationId);
+      assert.equal(evidence.outcome, 'succeeded', JSON.stringify(evidence));
+      assert.equal(receipt.launchId, prepared.launchId);
+      assert.equal(receipt.generation, prepared.generation);
+      await f.rpc('toggle', { agentId: id, enabled: false });
+      return { ...evidence, observerKept: prepared.launchId === before.launchId && prepared.generation === before.generation };
     },
   },
   {
