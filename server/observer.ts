@@ -87,7 +87,9 @@ const compatibleBuilds = new Set([observerAsset.version,
   '9fa0456c8d59db1297e540db98993d8d23e34dbfb4a487843334926447ece70b',
   'ece7bf8ce5445aedb974f30472983b78c7358b8feea99d15c1ef2369d88a26e4',
   // v1.2.1
-  '134e83d3751cca2f86c2ccda713162c7e739827df129e2020ab88a039c564e63']);
+  '134e83d3751cca2f86c2ccda713162c7e739827df129e2020ab88a039c564e63',
+  // main after #23 (query-restart refusal), installed by direct GitHub updates
+  '35dc721b4f7cd02d1618f04fb9b9f856513ba21d07dc6abcac291911d94e8509']);
 
 // What a placeholder ledger means. Session open writes `{}` and the observer
 // replaces it on its first write, which it makes at session start and during
