@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { mkdir, mkdtemp, readFile, readdir, rm, symlink, utimes, writeFile } from 'node:fs/promises';
 import { join, delimiter } from 'node:path';
 import { tmpdir } from 'node:os';
-import { createObserver } from './observer';
+import { createObserver, QUERY_RESTARTED_REFUSAL } from './observer';
 import { CLOCK_STEP_TOLERANCE_MS } from './deadline';
 import type { PluginSessionOpenRequest } from '@getpaseo/plugin/server';
 import type { Observation, StoredOperation } from './model';
@@ -95,7 +95,14 @@ test('observer rejects mismatched sessions, busy native work, default TTL fallba
     assert.equal((await f.observer.read('a'))?.ledger?.cache?.source, 'default');
     const manual = await f.observer.prepare(f.agent, false, 1_030_000);
     f.ledger.generation = 'reloaded'; await f.save();
-    assert.equal((await f.observer.result('a', manual))?.status, 'unknown');
+    assert.equal(await f.observer.result('a', manual), null,
+      'a generation change alone waits for a matching refusal or the observation deadline');
+    await f.observer.prepareSession(f.request, true);
+    const nextManifest = JSON.parse(await readFile(join(f.parent, 'current.json'), 'utf8'));
+    await writeFile(join(f.parent, nextManifest.launchId, 'ledger.json'),
+      JSON.stringify({ ...f.ledger, launchId: nextManifest.launchId }));
+    assert.equal((await f.observer.result('a', manual))?.status, 'unknown',
+      'a different launch cannot read the old request file');
   } finally { await f.close(); }
 });
 
@@ -119,6 +126,7 @@ test('the observer and the server use the same clock-step tolerance', async () =
   const source = await readFile(new URL('./observer-source.mjs', import.meta.url), 'utf8');
   assert.equal(Number(/const CLOCK_STEP_TOLERANCE_MS = ([\d_]+);/.exec(source)?.[1].replaceAll('_', '')),
     CLOCK_STEP_TOLERANCE_MS);
+  assert.equal(/const QUERY_RESTARTED_REFUSAL = '([^']+)';/.exec(source)?.[1], QUERY_RESTARTED_REFUSAL);
 });
 
 test('native receipt must match operation and revision; settling preserves subsequent manual compact', async () => {
@@ -140,6 +148,17 @@ test('native receipt must match operation and revision; settling preserves subse
     const next = await f.observer.prepare(f.agent, true, 1_030_000);
     await f.observer.cancel(operation);
     assert.equal(JSON.parse(await readFile(join(f.directory, 'request.json'), 'utf8')).id, next.id);
+    // Once a durable receipt exists, release settles request.json even if later
+    // activity replaced ledger.compact.
+    await writeFile(join(f.parent, 'receipts', `${encodeURIComponent(next.id)}.json`), JSON.stringify({
+      id: next.id, launchId: next.launchId, generation: 'generation-2', sessionId: next.sessionId,
+      revision: 0, status: 'failed', reason: 'Claude query restarted before compaction ran',
+      observedAt: 1_000_050, refusal: QUERY_RESTARTED_REFUSAL,
+      prepared: { launchId: next.launchId, generation: next.generation, sessionId: next.sessionId, revision: next.revision },
+    }));
+    f.ledger.compact = null; await f.save();
+    await f.observer.release('a', next, true);
+    assert.equal(JSON.parse(await readFile(join(f.directory, 'request.json'), 'utf8')).status, 'settled');
   } finally { await f.close(); }
 });
 
@@ -323,5 +342,73 @@ test('a placeholder from a launch prepared before preparation times were recorde
       'observer_starting');
     assert.equal((await reader.readiness({ ...f.agent, revision: new Date(present + 500).toISOString() }))?.reason,
       'observer_missing');
+  } finally { await f.close(); }
+});
+
+test('a confirmed query-restart refusal is accepted by both receipt and result; ambiguous or foreign records stay rejected', async () => {
+  const f = await fixture();
+  try {
+    const operation = await f.observer.prepare(f.agent, false, 1_030_000, 'restart-op');
+    const path = join(f.parent, 'receipts', 'restart-op.json');
+    const prepared = {
+      launchId: operation.launchId, generation: operation.generation,
+      sessionId: operation.sessionId, revision: operation.revision,
+    };
+    const validRefusal = {
+      id: operation.id, launchId: operation.launchId, generation: 'generation-2',
+      sessionId: operation.sessionId, revision: 0, status: 'failed',
+      reason: 'Claude query restarted before compaction ran', observedAt: 1_000_050,
+      refusal: QUERY_RESTARTED_REFUSAL, prepared,
+    };
+    await writeFile(path, JSON.stringify(validRefusal));
+    const fromReceipt = await f.observer.receipt('a', operation);
+    assert.equal(fromReceipt?.status, 'failed');
+    assert.match(fromReceipt!.detail, /query restarted/i);
+    assert.equal(fromReceipt?.observedAt, 1_000_050);
+
+    // The same rule applies to live ledger reads when the new generation writes compact.
+    f.ledger.generation = 'generation-2';
+    f.ledger.revision = 0;
+    f.ledger.compact = {
+      id: operation.id, revision: 0, status: 'failed',
+      reason: 'Claude query restarted before compaction ran',
+      refusal: QUERY_RESTARTED_REFUSAL, prepared,
+    } as typeof f.ledger.compact;
+    await f.save();
+    const fromLedger = await f.observer.result('a', operation);
+    assert.equal(fromLedger?.status, 'failed');
+    assert.match(fromLedger!.detail, /query restarted/i);
+
+    // Reject ambiguous, unrelated, generic cancellation, or foreign-generation completion records.
+    const rejected: Array<[string, Record<string, unknown>]> = [
+      ['generic cancellation without refusal code', { refusal: undefined, prepared: undefined, reason: 'Reservation cancelled' }],
+      ['unknown refusal code', { refusal: 'other_refusal' }],
+      ['missing prepared identity', { prepared: undefined }],
+      ['mismatched operation id', { id: 'other-op' }],
+      ['mismatched receipt launchId', { launchId: 'other-launch' }],
+      ['mismatched receipt sessionId', { sessionId: 'other-session' }],
+      ['same generation is not a restart', { generation: operation.generation }],
+      ['mismatched prepared launchId', { prepared: { ...prepared, launchId: 'other-launch' } }],
+      ['mismatched prepared generation', { prepared: { ...prepared, generation: 'other-generation' } }],
+      ['mismatched prepared sessionId', { prepared: { ...prepared, sessionId: 'other-session' } }],
+      ['mismatched prepared revision', { prepared: { ...prepared, revision: operation.revision + 1 } }],
+      ['foreign-generation completion', { status: 'completed', reason: null }],
+      ['foreign-generation unknown', { status: 'unknown', reason: null }],
+    ];
+    for (const [name, patch] of rejected) {
+      const candidate = { ...validRefusal, ...patch };
+      await writeFile(path, JSON.stringify(candidate));
+      assert.equal(await f.observer.receipt('a', operation), null, `receipt must reject: ${name}`);
+      if (candidate.launchId === operation.launchId && candidate.generation !== operation.generation) {
+        f.ledger.generation = String(candidate.generation);
+        f.ledger.sessionId = String(candidate.sessionId);
+        f.ledger.compact = {
+          id: candidate.id, revision: candidate.revision, status: candidate.status,
+          reason: candidate.reason, refusal: candidate.refusal, prepared: candidate.prepared,
+        } as typeof f.ledger.compact;
+        await f.save();
+        assert.equal(await f.observer.result('a', operation), null, `result must reject: ${name}`);
+      }
+    }
   } finally { await f.close(); }
 });

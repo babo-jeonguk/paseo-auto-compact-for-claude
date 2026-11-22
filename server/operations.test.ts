@@ -560,3 +560,25 @@ test("a stopped worker cannot publish late results for any of several operations
   assert.equal(f.operationById("operation-a").result?.message, "native rejection");
   assert.equal(f.operationById("operation-b").result?.message, "native rejection");
 });
+
+test("a confirmed query-restart refusal finishes as failed_after_dispatch after restart without resending", async () => {
+  for (const kind of ["manual", "automatic"] as const) {
+    const f = fixture();
+    const released: string[] = [];
+    f.gateway.release = async operation => { released.push(`${operation.id}:${operation.state}`); };
+    f.operation.kind = kind;
+    f.operation.state = "observing";
+    f.operation.evidence = {
+      dispatchStartedAt: 1000,
+      native: { id: f.operation.id, launchId: "launch", generation: "gen-1", sessionId: "native", revision: 1 },
+    };
+    f.recover();
+    f.evidence = { status: "failed", detail: "Claude query restarted before compaction ran" };
+    await f.make().reconcile();
+    assert.equal(f.operation.state, "failed", kind);
+    assert.equal(f.operation.result?.code, "failed_after_dispatch", kind);
+    assert.match(f.operation.result!.message, /query restarted/i, kind);
+    assert.equal(f.sends, 0, `${kind}: reconciliation must not send again`);
+    assert.deepEqual(released, [`${f.operation.id}:failed`], kind);
+  }
+});
