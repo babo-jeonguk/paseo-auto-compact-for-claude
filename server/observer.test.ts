@@ -169,8 +169,8 @@ test('release caught in the middle of a ledger write still retires the request',
   try {
     const ledgerPath = join(f.directory, 'ledger.json');
     const status = async () => JSON.parse(await readFile(join(f.directory, 'request.json'), 'utf8')).status;
-    // Without a receipt, a sent request whose ledger cannot be read is cancelled, so a
-    // late PreCompact cannot run it; the native guard refuses one later manual /compact.
+    // Without a receipt, a sent request whose ledger cannot be read is cancelled: the native
+    // guard refuses the first non-automatic /compact, the plugin's late one or the user's.
     const unrecorded = await f.observer.prepare(f.agent, true, 1_030_000);
     await writeFile(ledgerPath, '');
     await f.observer.cancel(unrecorded);
