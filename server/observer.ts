@@ -205,7 +205,10 @@ export function createObserver(options: { home?: string; now?: () => number } = 
     const path = join(operation.directory, 'request.json');
     const request = JSON.parse(await readFile(path, 'utf8'));
     if (request.id !== operation.id) return;
-    const ledger = LedgerSchema.safeParse(JSON.parse(await readFile(join(operation.directory, 'ledger.json'), 'utf8')));
+    // The ledger can be caught mid-write; then only a durable receipt can prove consumption.
+    const ledger = await readFile(join(operation.directory, 'ledger.json'), 'utf8')
+      .then(text => LedgerSchema.safeParse(JSON.parse(text)))
+      .catch(() => null);
     // A durable receipt also proves Claude already consumed this request, even
     // if later activity overwrote ledger.compact before release ran.
     const recorded = await readFile(join(operation.directory, '..', 'receipts', receiptName(operation.id)), 'utf8')
@@ -214,7 +217,7 @@ export function createObserver(options: { home?: string; now?: () => number } = 
         return parsed.success && parsed.data.id === operation.id;
       })
       .catch(() => false);
-    const consumed = (ledger.success && ledger.data.compact?.id === operation.id) || recorded;
+    const consumed = (ledger?.success && ledger.data.compact?.id === operation.id) || recorded;
     // Settled requests must not intercept later ordinary/manual compaction.
     // An unobserved send remains cancelled so a late PreCompact cannot run it.
     await atomic(path, { id: operation.id, status: !sent || consumed ? 'settled' : 'cancelled' });

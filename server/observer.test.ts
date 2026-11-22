@@ -164,6 +164,30 @@ test('native receipt must match operation and revision; settling preserves subse
   } finally { await f.close(); }
 });
 
+test('release caught in the middle of a ledger write still retires the request', async () => {
+  const f = await fixture();
+  try {
+    const ledgerPath = join(f.directory, 'ledger.json');
+    const status = async () => JSON.parse(await readFile(join(f.directory, 'request.json'), 'utf8')).status;
+    // Without a receipt, a sent request whose ledger cannot be read is cancelled,
+    // as an unobserved send is.
+    const unrecorded = await f.observer.prepare(f.agent, true, 1_030_000);
+    await writeFile(ledgerPath, '');
+    await f.observer.cancel(unrecorded);
+    assert.equal(await status(), 'cancelled');
+    // A durable receipt alone proves Claude consumed the request.
+    await f.save();
+    const recorded = await f.observer.prepare(f.agent, true, 1_030_000);
+    await writeFile(join(f.parent, 'receipts', `${encodeURIComponent(recorded.id)}.json`), JSON.stringify({
+      id: recorded.id, launchId: recorded.launchId, generation: recorded.generation, sessionId: recorded.sessionId,
+      revision: recorded.revision, status: 'completed', reason: null, observedAt: 1_000_050,
+    }));
+    await writeFile(ledgerPath, '{"version":1,"launch');
+    await f.observer.cancel(recorded);
+    assert.equal(await status(), 'settled');
+  } finally { await f.close(); }
+});
+
 test('opening a session removes closed or long-idle launches of that conversation only', async () => {
   const f = await fixture();
   try {
