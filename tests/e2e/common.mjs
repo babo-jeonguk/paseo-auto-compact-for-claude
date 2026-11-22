@@ -5,6 +5,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
+import { paseoPackages } from '../simulation/paseo-versions.mjs';
 
 export const PLUGIN = 'auto-compact-for-claude';
 export const SOURCE = 'git:babo-jeonguk/paseo-auto-compact-for-claude';
@@ -29,16 +30,11 @@ export function parseOptions(script, defaults, required = []) {
   return name => options.get(name);
 }
 
-// The pinned simulation tools install each Paseo release under an alias; stable releases that
-// followed a tested beta have a -stable suffix. Same mapping as tests/simulation/run.mjs.
-const CLI_ALIASES = new Map([
-  ['0.15.0-beta.1', '@getpaseo/cli-0-15'],
-  ['0.15.0', '@getpaseo/cli-0-15-stable'],
-  ['0.16.0-beta.1', '@getpaseo/cli-0-16-beta'],
-  ['0.16.0', '@getpaseo/cli-0-16-stable'],
-]);
+// The pinned simulation tools install each Paseo release under an alias; the simulation's
+// version map is the one list of them.
 export function cliPackagePath(tools, version) {
-  const alias = CLI_ALIASES.get(version) ?? `@getpaseo/cli-${version.split('.').slice(0, 2).join('-')}`;
+  const alias = paseoPackages.get(version);
+  assert(alias, `Paseo ${version} is not pinned in tests/simulation/paseo-versions.mjs`);
   return tools.resolve(`${alias}/package.json`);
 }
 
