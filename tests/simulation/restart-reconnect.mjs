@@ -13,6 +13,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { startFixture, waitFor } from './fixture.mjs';
 import { startModel } from './model.mjs';
 import { acquireNativeSlot } from './execution.mjs';
+import { paseoPackages } from './paseo-versions.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url)), plugin = resolve(here, '../..');
 const option = (name, fallback) => {
@@ -31,9 +32,8 @@ const nativeTools = createRequire(join(here, 'package.json'));
 const cliPackage = (() => {
   try { return tools.resolve('@getpaseo/cli/package.json'); }
   catch {
-    const alias = version === '0.15.0' ? '@getpaseo/cli-0-15-stable'
-      : version === '0.16.0' ? '@getpaseo/cli-0-16-stable'
-      : version === '0.16.0-beta.1' ? '@getpaseo/cli-0-16-beta' : '@getpaseo/cli-0-15';
+    const alias = paseoPackages.get(version);
+    assert(alias, `Unsupported Paseo version: ${version}`);
     return tools.resolve(`${alias}/package.json`);
   }
 })();
