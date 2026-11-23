@@ -8,6 +8,7 @@ import { createScheduler } from "./scheduler";
 import { createStore } from "./store";
 import { DEFAULT_SETTINGS } from "../shared/settings";
 import type { Gateway, Observation, State, StoredOperation } from "./model";
+import { changes } from "../tests/support/changes";
 
 const now = HISTORY_RETENTION_MS + 1000;
 const operation = (id: string, state: StoredOperation["state"] = "succeeded", updatedAt = 1000): StoredOperation => ({
@@ -59,18 +60,15 @@ async function fixture() {
   const gateway: Gateway = { list: async (observe) => { observe(Promise.resolve(agent)); }, refresh: async () => agent,
     compact: async () => { sends++; return { status: "completed", detail: "completed" }; } };
   // Background work is awaited by the state it commits, not by elapsed time.
-  const waiters = new Set<{ done: (state: State) => boolean; resolve: () => void }>();
+  const signal = changes();
+  let stored = state;
   const store = { read: disk.read, write: async (next: State) => {
     if (failCommit && !next.operations.some(op => op.id === "old")) throw new Error("disk full");
     await disk.write(next);
-    for (const waiter of waiters) if (waiter.done(next)) { waiters.delete(waiter); waiter.resolve(); }
+    stored = structuredClone(next);
+    signal.changed();
   } };
-  // Listen before reading, so a write between the two is not missed.
-  const committed = (done: (state: State) => boolean) => new Promise<void>((resolve, reject) => {
-    const waiter = { done, resolve };
-    waiters.add(waiter);
-    disk.read().then(state => { if (done(state)) { waiters.delete(waiter); resolve(); } }, reject);
-  });
+  const committed = (done: (state: State) => boolean) => signal.until(() => done(stored));
   const receipts: OperationReceipts = {
     remove: async (_agent, id) => {
       assert((await disk.read()).operations.some(op => op.id === id), "receipt must be removed before its record");

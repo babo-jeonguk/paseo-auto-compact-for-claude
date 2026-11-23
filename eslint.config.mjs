@@ -18,6 +18,9 @@ const product = ["index.server.ts", "index.client.tsx", "client/**", "server/**"
 const realTime = 'Unit tests start no real timer with a delay. Advance the injected clock or the test\'s mock timers ' +
   'and wait on observable state such as a fake being called; the test runner bounds every test, so a wait needs ' +
   'no timer of its own (CODING_STANDARDS.md "Tests").';
+const countedWait = 'A unit test waits for a condition through a signal, not by counting loop turns: wait on the fake\'s ' +
+  'change (changes() in tests/support/changes.ts) or on the promise of the step itself; the test runner bounds the ' +
+  'wait (CODING_STANDARDS.md "Tests").';
 const namedTiming = 'A timer or deadline argument is a named constant with an _MS suffix and a comment ' +
   'that says why it has that value (CODING_STANDARDS.md "Named timings").';
 const timer = "/^(setTimeout|setInterval)$/";
@@ -51,6 +54,15 @@ export const projectRules = [
             ":matches(ImportSpecifier:not([imported.name='setImmediate'], [imported.value='setImmediate']), " +
             "ImportNamespaceSpecifier, ImportDefaultSpecifier)",
           message: realTime,
+        },
+        {
+          // A counted loop that awaits and also stops on a condition: a wait
+          // for state that gives up after a number of turns. A fixed number of
+          // steps (advancing a clock N times) checks no condition and passes.
+          // A while loop with its own counter is left to review.
+          selector: "ForStatement:has(AwaitExpression):matches([test.type='LogicalExpression'], " +
+            ":has(BreakStatement), :has(ReturnStatement))",
+          message: countedWait,
         },
         {
           // The same modules loaded at run time, named by a string or a

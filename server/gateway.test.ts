@@ -3,7 +3,7 @@ import { mock, test } from "node:test";
 import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { bounded, OBSERVATION_MS } from "./deadline";
+import { OBSERVATION_MS } from "./deadline";
 import { Refusal, type OperationEvidence, type StoredOperation } from "./model";
 import { createGateway, EVIDENCE_POLL_MS } from "./gateway";
 import { createObserver, QUERY_RESTARTED_REFUSAL } from "./observer";
@@ -467,12 +467,12 @@ test("every external gateway wait is bounded, including send and release", async
     }
     // A wait that expires before sending is a fault for the worker to retry.
     if (stalled === "subscribe" || stalled === "refresh") {
-      await assert.rejects(bounded(host.gateway.compact("a", undefined, { id: "stalled", sendBy: Date.now() + 50,
-        checkpoint: async () => {}, current: () => true }), 2_000), /deadline/i, stalled);
+      await assert.rejects(host.gateway.compact("a", undefined, { id: "stalled", sendBy: Date.now() + 50,
+        checkpoint: async () => {}, current: () => true }), /deadline/i, stalled);
       assert.equal(host.sendCount(), 0, stalled);
       continue;
     }
-    const result = await bounded(host.gateway.compact("a"), 2_000);
+    const result = await host.gateway.compact("a");
     assert.equal(result.status, stalled === "release" ? "completed" : "unknown", stalled);
     assert.equal(host.ownTurn("a", "compact-1"), false);
     host.stop();
@@ -727,7 +727,7 @@ test("a listed conversation's read is bounded from when it starts, not from when
     // Read through a call: an assertion must not narrow it for later checks.
     const outcome = () => settled;
     const scan = scheduler.observe({ kind: "full" });
-    scan.then(() => { settled = "resolved"; }, error => { settled = error; });
+    const ended = scan.then(() => { settled = "resolved"; }, error => { settled = error; });
     await readingA;
     assert.deepEqual(dir.reads, ["a"], "a's read starts with the first page");
     // Paging takes four of the five seconds; a's read never ends.
@@ -736,7 +736,7 @@ test("a listed conversation's read is bounded from when it starts, not from when
     await listing();
     assert.equal(outcome(), "pending", "a's read is not timed out when paging ends");
     mock.timers.tick(1_000);
-    for (let step = 0; step < 20 && outcome() === "pending"; step++) await turn();
+    await ended;
     assert.ok(outcome() instanceof Error, "a's read timed out five seconds after it started");
     assert.deepEqual(reserved(), ["b", "c"], "every other listed reply is still reserved");
   } finally {

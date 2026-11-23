@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createOperationWorker, recoverOperations } from "./operations";
 import { TICK_INTERVAL_MS } from "./scheduler";
+import { changes } from "../tests/support/changes";
 import { DEFAULT_SETTINGS, type Settings } from "../shared/settings";
 import { Refusal, type CompactOutcome, type ExecutionContext, type Gateway, type Observation,
   type State, type StoredOperation } from "./model";
@@ -31,12 +32,15 @@ function fixture(options: { agents?: string[] } = {}) {
   const errors: unknown[] = [], calls: string[] = [], events: string[] = [];
   const hooks = new Map<string, Hook>();
   let evidence: Evidence = null;
+  // Stored states and recorded events wake tests waiting for them.
+  const signal = changes();
+  const record = (event: string) => { events.push(event); signal.changed(); };
   const gateway: Gateway = {
     list: async (observe) => Object.values(observations).forEach(observation => observe(Promise.resolve(observation))),
     refresh: async id => observations[id] ?? null,
     compact: async (id, _expected, execution) => {
       calls.push(id);
-      events.push(`${id}:send`);
+      record(`${id}:send`);
       const hook = hooks.get(id);
       if (hook) {
         const outcome = await hook(execution);
@@ -56,6 +60,7 @@ function fixture(options: { agents?: string[] } = {}) {
       const value = change(next);
       if (writesFail && next.operations[0].state === "succeeded") throw new Error("disk full");
       state = next;
+      signal.changed();
       return value;
     });
     tail = result.catch(() => {});
@@ -66,9 +71,12 @@ function fixture(options: { agents?: string[] } = {}) {
         if (readsFail > 0) { readsFail--; throw new Error("EBUSY"); }
         if (stale) { const value = stale; stale = null; return structuredClone(value); }
         return structuredClone(state);
-      }, write: async next => { state = next; } },
+      }, write: async next => { state = next; signal.changed(); } },
     update, settings, now: () => time, onError: error => errors.push(error) });
   return { make, gateway, errors, calls, events,
+    // Waits until the condition holds after a stored state or a recorded event.
+    until: signal.until,
+    record,
     get agent() { return observations.a; },
     get operation() { return state.operations[0]; },
     operationById(id: string) {
@@ -87,12 +95,6 @@ function fixture(options: { agents?: string[] } = {}) {
     advance(ms: number) { time += ms; },
     recover() { recoverOperations(state, time); },
   };
-}
-
-async function until(condition: () => boolean) {
-  for (let i = 0; i < 500 && !condition(); i++)
-    await new Promise<void>(resolve => setImmediate(resolve));
-  assert.ok(condition(), "expected the condition within the test's bounded wait");
 }
 
 test("durable requested work is dispatched after restart with the original identity", async () => {
@@ -205,7 +207,7 @@ test("the worker wakes itself for a retry instead of waiting for the next tick",
   f.gateway.compact = compact;
   f.advance(wait);
   t.mock.timers.tick(wait);
-  await until(() => f.operation.state === "succeeded");
+  await f.until(() => f.operation.state === "succeeded");
   assert.equal(f.sends, 1);
 });
 
@@ -283,12 +285,15 @@ test("a new worker takes over the claim and fences the earlier one", async () =>
 test("stopped workers cannot publish late results over recovered operations", async () => {
   const f = fixture(), first = f.make();
   let release!: (outcome: CompactOutcome) => void;
+  // Resolves when the send is held.
+  let reached!: () => void;
+  const reaching = new Promise<void>(resolve => { reached = resolve; });
   f.gateway.compact = async (_id, _expected, execution) => {
     await execution!.checkpoint({ dispatchStartedAt: 1000 });
-    return new Promise(resolve => { release = resolve; });
+    return new Promise(resolve => { release = resolve; reached(); });
   };
   const running = first.reconcile();
-  while (!release) await new Promise<void>(resolve => setImmediate(resolve));
+  await reaching;
   first.stop(); f.recover();
   const second = f.make();
   f.evidence = { status: "failed", detail: "native rejection" };
@@ -396,14 +401,14 @@ test("conversations run independently: a held send does not delay another conver
   const heldA = new Promise<void>(resolve => { releaseA = resolve; });
   f.hook("a", async execution => {
     await execution!.checkpoint({ dispatchStartedAt: 1000 });
-    f.events.push("a:marker");
+    f.record("a:marker");
     await heldA;
-    f.events.push("a:release");
+    f.record("a:release");
     return { status: "completed", detail: "A completed" };
   });
   const running = f.make().reconcile();
   try {
-    await until(() => f.operationById("operation-b").state === "succeeded");
+    await f.until(() => f.operationById("operation-b").state === "succeeded");
     assert.equal(f.operationById("operation-a").state, "observing");
     assert.equal(f.sends, 1, "only B has completed its send while A is held");
     assert.ok(f.events.includes("b:send"), "B is sent while A is still held");
@@ -459,23 +464,23 @@ test("overlapping checkpoints and completions of two conversations keep both evi
   const gateB = new Promise<void>(resolve => { releaseB = resolve; });
   f.hook("a", async execution => {
     await execution!.checkpoint({ dispatchStartedAt: 2000, turnId: "turn-a" });
-    f.events.push("a:checkpointed");
+    f.record("a:checkpointed");
     await gateA;
     return { status: "completed", detail: "A completed" };
   });
   f.hook("b", async execution => {
     await execution!.checkpoint({ dispatchStartedAt: 3000, boundary: true });
-    f.events.push("b:checkpointed");
+    f.record("b:checkpointed");
     await gateB;
     return { status: "completed", detail: "B completed" };
   });
   const running = f.make().reconcile();
   try {
-    await until(() => f.events.includes("a:checkpointed") && f.events.includes("b:checkpointed"));
+    await f.until(() => f.events.includes("a:checkpointed") && f.events.includes("b:checkpointed"));
     assert.equal(f.operationById("operation-a").state, "observing");
     assert.equal(f.operationById("operation-b").state, "observing");
     releaseA();
-    await until(() => f.operationById("operation-a").state === "succeeded");
+    await f.until(() => f.operationById("operation-a").state === "succeeded");
     assert.equal(f.operationById("operation-b").state, "observing", "B is still held");
   } finally {
     releaseA(); releaseB();
@@ -504,7 +509,7 @@ test("concurrent reconciles start each operation only once", async () => {
   const first = worker.reconcile(), second = worker.reconcile();
   try {
     // Both reconciles have passed the claim point by the time the run observes.
-    await until(() => f.operation.state === "observing");
+    await f.until(() => f.operation.state === "observing");
     assert.equal(f.calls.filter(id => id === "a").length, 1);
   } finally {
     release();
@@ -540,17 +545,17 @@ test("a stopped worker cannot publish late results for any of several operations
   let releaseA!: (outcome: CompactOutcome) => void, releaseB!: (outcome: CompactOutcome) => void;
   f.hook("a", async execution => {
     await execution!.checkpoint({ dispatchStartedAt: 1000 });
-    f.events.push("a:checkpointed");
+    f.record("a:checkpointed");
     return new Promise(resolve => { releaseA = resolve; });
   });
   f.hook("b", async execution => {
     await execution!.checkpoint({ dispatchStartedAt: 1000 });
-    f.events.push("b:checkpointed");
+    f.record("b:checkpointed");
     return new Promise(resolve => { releaseB = resolve; });
   });
   const first = f.make();
   const running = first.reconcile();
-  await until(() => f.events.includes("a:checkpointed") && f.events.includes("b:checkpointed"));
+  await f.until(() => f.events.includes("a:checkpointed") && f.events.includes("b:checkpointed"));
   first.stop();
   f.recover();
   f.evidence = () => ({ status: "failed", detail: "native rejection" });
