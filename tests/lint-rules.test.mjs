@@ -57,6 +57,8 @@ test('unit tests start no real timer with a delay', () => {
       "import { setImmediate } from 'node:timers';",
       // A key built at run time is left to review: lint cannot tell what it names.
       'globalThis[`setTimeout${suffix}`](fire, 50);',
+      "const setTimeout = 'setImmediate'; globalThis[setTimeout](fire, 50);",
+      "import { 'setImmediate' as immediate } from 'node:timers/promises';",
     ]) passes(file, code);
   }
 });
