@@ -210,7 +210,7 @@ test("the worker wakes itself for a retry instead of waiting for the next tick",
   assert.equal(f.timers.pendingWithin(wait), 1, "the failed attempt set its own wake-up");
   f.gateway.compact = compact;
   f.advance(wait);
-  f.timers.tick(wait);
+  await f.timers.tick(wait);
   await f.until(() => f.operation.state === "succeeded");
   assert.equal(f.sends, 1);
 });

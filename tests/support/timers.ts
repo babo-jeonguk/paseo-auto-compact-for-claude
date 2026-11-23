@@ -18,13 +18,16 @@ export function fakeTimers(onArm: () => void = () => {}) {
     // How many pending timers `tick(ms)` would run.
     pendingWithin(ms: number) { return [...pending.values()].filter(timer => timer.left <= ms).length; },
     // Moves every timer pending now on by `ms` and runs those that come due,
-    // earliest first. A timer armed by one of them waits for the next tick.
-    tick(ms: number) {
+    // earliest first. Like a real timer, a callback runs on a later turn than
+    // the code that armed it, so that code finishes first. A timer armed by one
+    // of them waits for the next tick.
+    async tick(ms: number) {
       const due: { left: number; callback: () => void }[] = [];
       for (const [handle, timer] of [...pending]) {
         timer.left -= ms;
         if (timer.left <= 0) { pending.delete(handle); due.push(timer); }
       }
+      await new Promise<void>(resolve => setImmediate(resolve));
       for (const timer of due.sort((a, b) => a.left - b.left)) timer.callback();
     },
   };

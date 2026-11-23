@@ -1294,7 +1294,7 @@ test("a Compact now that cannot be prepared ends within seconds, unsent and retr
   await f.until(() => f.timers.pendingWithin(10_000) > 0);
   // Past the deadline, the retry's pass expires the request instead of sending it.
   f.advance(10_000);
-  f.timers.tick(10_000);
+  await f.timers.tick(10_000);
   await f.until(() => f.state.operations[0]?.state === "expired");
   const operation = await s.operation("request-a");
   assert.equal(operation?.state, "expired");
@@ -1511,7 +1511,7 @@ test("an attention read that never ends stops blocking observation after a minut
     const next = s.observe({ kind: "agent", agentId: "b" });
     await settle();
     assert.deepEqual(f.counts.refreshes.filter(id => id === "b"), [], "held while a's read runs");
-    f.timers.tick(60_000); // the scheduler's single-flight bound
+    await f.timers.tick(60_000); // the scheduler's single-flight bound
     await next;
     assert.deepEqual(f.counts.refreshes.filter(id => id === "b"), ["b"], "observation resumes instead of stalling for good");
   } finally {
@@ -1735,7 +1735,7 @@ test("a listing that never ends stops blocking observation after a minute", asyn
     await settle();
     mock.timers.tick(5_000);
     await assert.rejects(first);
-    f.timers.tick(60_000); // the scheduler's single-flight bound
+    await f.timers.tick(60_000); // the scheduler's single-flight bound
     await settle();
     const second = s.observe({ kind: "agent", agentId: "a" });
     await settle();
