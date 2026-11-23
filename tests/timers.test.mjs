@@ -42,3 +42,14 @@ test('a due callback runs after the code that armed it has finished', async () =
   await armed;
   assert.deepEqual(steps, ['armer finished', 'fired']);
 });
+
+test('a timer cleared after its tick started but before it ran does not run', async () => {
+  const timers = fakeTimers();
+  const ran = [];
+  const first = timers.setTimeout(() => ran.push('first'), 10);
+  timers.setTimeout(() => ran.push('second'), 10);
+  const ticking = timers.tick(10);
+  timers.clearTimeout(first);
+  await ticking;
+  assert.deepEqual(ran, ['second']);
+});

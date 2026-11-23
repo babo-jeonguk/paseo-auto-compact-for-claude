@@ -57,13 +57,18 @@ function fixture(options: { agents?: string[] } = {}) {
     inspect: async operation => typeof evidence === "function" ? evidence(operation) : evidence,
   };
   let tail: Promise<unknown> = Promise.resolve();
+  // A held transaction is applied, then held before it returns to the worker.
+  let holdApplied: { reached: () => void; release: Promise<void> } | null = null;
   const update = <T>(change: (state: State) => T): Promise<T> => {
-    const result = tail.then(() => {
+    const result = tail.then(async () => {
       const next = structuredClone(state);
       const value = change(next);
       if (writesFail && next.operations[0].state === "succeeded") throw new Error("disk full");
       state = next;
       signal.changed();
+      const hold = holdApplied;
+      holdApplied = null;
+      if (hold) { hold.reached(); await hold.release; }
       return value;
     });
     tail = result.catch(() => {});
@@ -96,6 +101,13 @@ function fixture(options: { agents?: string[] } = {}) {
     set failTerminal(value: boolean) { writesFail = value; },
     set failReads(count: number) { readsFail = count; },
     get time() { return time; },
+    // Holds the next transaction after it is applied; `reached` resolves then.
+    holdNextUpdate() {
+      let reached!: () => void, release!: () => void;
+      const arrived = new Promise<void>(resolve => { reached = resolve; });
+      holdApplied = { reached, release: new Promise<void>(resolve => { release = resolve; }) };
+      return { reached: arrived, release };
+    },
     advance(ms: number) { time += ms; },
     recover() { recoverOperations(state, time); },
   };
@@ -213,6 +225,24 @@ test("the worker wakes itself for a retry instead of waiting for the next tick",
   await f.timers.tick(wait);
   await f.until(() => f.operation.state === "succeeded");
   assert.equal(f.sends, 1);
+});
+
+test("a worker stopped while it saves a retry arms no wake-up", async (t) => {
+  const f = fixture(), worker = f.make();
+  t.after(() => worker.stop());
+  let held!: ReturnType<typeof f.holdNextUpdate>;
+  let sending!: () => void;
+  const sent = new Promise<void>(resolve => { sending = resolve; });
+  // The fault's retry is the next transaction after the claim.
+  f.gateway.compact = async () => { held = f.holdNextUpdate(); sending(); throw new Error("disconnected"); };
+  const run = worker.reconcile();
+  await sent;
+  await held.reached;
+  assert.equal(f.operation.state, "requested", "the retry is saved");
+  worker.stop();
+  held.release();
+  await run;
+  assert.equal(f.timers.pending, 0, "a stopped worker holds no timer");
 });
 
 test("a gateway fault before the dispatch marker is retried; nothing is sent until it passes", async () => {
