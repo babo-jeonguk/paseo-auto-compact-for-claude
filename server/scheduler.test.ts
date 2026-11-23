@@ -8,6 +8,7 @@ import {
 import { createScheduler, FULL_SCAN_INTERVAL_MS, TICK_INTERVAL_MS } from "./scheduler";
 import { DELIVERY_WINDOW_MS } from "./policy";
 import { changes } from "../tests/support/changes";
+import { fakeTimers } from "../tests/support/timers";
 import type { Blocked } from "../shared/rpc";
 import { Refusal, type Gateway, type Observation, type State, type StateStore } from "./model";
 
@@ -26,8 +27,10 @@ function fixture(automatic = true) {
     reset() { this.reads = 0; this.writes = 0; this.lists = 0; this.refreshes = []; },
   };
   let listGate: Promise<void> | null = null;
-  // Stored states, sends and reads wake tests waiting for them.
+  // Stored states, sends, reads and armed timers wake tests waiting for them.
   const signal = changes();
+  // The scheduler's and its worker's timers run only when a test moves them on.
+  const timers = fakeTimers(signal.changed);
   const agents: Observation[] = [
     {
       agentId: "a",
@@ -87,6 +90,7 @@ function fixture(automatic = true) {
       gateway,
       settings: async () => config,
       now: () => time,
+      timers,
     });
   const addAgent = (id = "b") => {
     const agent = { ...agents[0], agentId: id, title: `Session ${id}`, sessionId: `native-${id}` };
@@ -112,6 +116,7 @@ function fixture(automatic = true) {
     counts,
     // Waits until the condition holds after a stored state, send or read.
     until: signal.until,
+    timers,
     // Hold agent listings (not refreshes) until released.
     holdList() {
       let release!: () => void;
@@ -1285,11 +1290,11 @@ test("a Compact now that cannot be prepared ends within seconds, unsent and retr
   f.gateway.compact = async () => { throw new Error("observer preparation timed out"); };
   const revision = f.agents[0].revision!;
   assert.equal((await s.compactNow("a", revision, "request-a")).code, "accepted");
-  // The failed attempt is stored with its retry before the deadline passes.
-  await f.until(() => f.state.operations[0]?.state === "requested" && f.state.operations[0].nextAttemptAt !== undefined);
+  // The failed attempt sets its own retry, due before the 10-second send deadline.
+  await f.until(() => f.timers.pendingWithin(10_000) > 0);
+  // Past the deadline, the retry's pass expires the request instead of sending it.
   f.advance(10_000);
-  // The pass starts the next attempt; its fault, now past the deadline, expires it.
-  await s.reconcile();
+  f.timers.tick(10_000);
   await f.until(() => f.state.operations[0]?.state === "expired");
   const operation = await s.operation("request-a");
   assert.equal(operation?.state, "expired");
@@ -1506,7 +1511,7 @@ test("an attention read that never ends stops blocking observation after a minut
     const next = s.observe({ kind: "agent", agentId: "b" });
     await settle();
     assert.deepEqual(f.counts.refreshes.filter(id => id === "b"), [], "held while a's read runs");
-    mock.timers.tick(60_000);
+    f.timers.tick(60_000); // the scheduler's single-flight bound
     await next;
     assert.deepEqual(f.counts.refreshes.filter(id => id === "b"), ["b"], "observation resumes instead of stalling for good");
   } finally {
@@ -1730,7 +1735,7 @@ test("a listing that never ends stops blocking observation after a minute", asyn
     await settle();
     mock.timers.tick(5_000);
     await assert.rejects(first);
-    mock.timers.tick(60_000);
+    f.timers.tick(60_000); // the scheduler's single-flight bound
     await settle();
     const second = s.observe({ kind: "agent", agentId: "a" });
     await settle();

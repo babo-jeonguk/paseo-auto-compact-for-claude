@@ -3,6 +3,7 @@ import { test } from "node:test";
 import { createOperationWorker, recoverOperations } from "./operations";
 import { TICK_INTERVAL_MS } from "./scheduler";
 import { changes } from "../tests/support/changes";
+import { fakeTimers } from "../tests/support/timers";
 import { DEFAULT_SETTINGS, type Settings } from "../shared/settings";
 import { Refusal, type CompactOutcome, type ExecutionContext, type Gateway, type Observation,
   type State, type StoredOperation } from "./model";
@@ -35,6 +36,8 @@ function fixture(options: { agents?: string[] } = {}) {
   // Stored states and recorded events wake tests waiting for them.
   const signal = changes();
   const record = (event: string) => { events.push(event); signal.changed(); };
+  // The worker's retry wake-ups run only when a test moves them on.
+  const timers = fakeTimers(signal.changed);
   const gateway: Gateway = {
     list: async (observe) => Object.values(observations).forEach(observation => observe(Promise.resolve(observation))),
     refresh: async id => observations[id] ?? null,
@@ -72,11 +75,12 @@ function fixture(options: { agents?: string[] } = {}) {
         if (stale) { const value = stale; stale = null; return structuredClone(value); }
         return structuredClone(state);
       }, write: async next => { state = next; signal.changed(); } },
-    update, settings, now: () => time, onError: error => errors.push(error) });
+    update, settings, now: () => time, timers, onError: error => errors.push(error) });
   return { make, gateway, errors, calls, events,
     // Waits until the condition holds after a stored state or a recorded event.
     until: signal.until,
     record,
+    timers,
     get agent() { return observations.a; },
     get operation() { return state.operations[0]; },
     operationById(id: string) {
@@ -195,7 +199,6 @@ test("a fault that clears before the send deadline still sends, however many att
 });
 
 test("the worker wakes itself for a retry instead of waiting for the next tick", async (t) => {
-  t.mock.timers.enable({ apis: ["setTimeout"] });
   const f = fixture(), worker = f.make();
   t.after(() => worker.stop());
   const compact = f.gateway.compact;
@@ -204,9 +207,10 @@ test("the worker wakes itself for a retry instead of waiting for the next tick",
   assert.equal(f.operation.state, "requested");
   const wait = f.operation.nextAttemptAt! - f.time;
   assert.ok(wait > 0 && wait < TICK_INTERVAL_MS, "the retry comes before the next scheduler tick");
+  assert.equal(f.timers.pendingWithin(wait), 1, "the failed attempt set its own wake-up");
   f.gateway.compact = compact;
   f.advance(wait);
-  t.mock.timers.tick(wait);
+  f.timers.tick(wait);
   await f.until(() => f.operation.state === "succeeded");
   assert.equal(f.sends, 1);
 });

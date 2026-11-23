@@ -83,6 +83,24 @@ test('unit tests do not wait for a condition by counting turns', () => {
   passes('server/a.ts', 'for (let i = 0; i < 100 && !done(); i++) await settle();');
 });
 
+// A mock on the shared tracker outlives a test stopped at the runner's bound,
+// whose finally never runs; the test context's mocks are restored by the runner.
+test('unit tests mock through their test context, not the shared tracker', () => {
+  for (const file of ['server/a.test.ts', 'tests/a.test.mjs', 'tests/support/a.ts']) {
+    for (const code of [
+      "mock.timers.enable({ apis: ['setTimeout'] });",
+      'mock.timers.tick(5_000);',
+      "mock.method(console, 'error');",
+    ]) flags(file, code, /CODING_STANDARDS\.md "Tests"/);
+    for (const code of [
+      "t.mock.timers.enable({ apis: ['setTimeout'] });",
+      't.mock.timers.tick(5_000);',
+      "t.mock.method(console, 'error');",
+      'const fake = mock.fn();',
+    ]) passes(file, code);
+  }
+});
+
 test('the real-time rule leaves process suites and product code alone', () => {
   for (const file of ['tests/simulation/run.mjs', 'tests/e2e/run.mjs', 'tests/simulation/a.test.mjs'])
     passes(file, 'await new Promise(resolve => setTimeout(resolve, 50));');
