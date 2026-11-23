@@ -58,10 +58,19 @@ async function fixture() {
     tokens: 500_000, idle: true, eligible: true, sessionId: "native-a", activityKey: "generation:1" };
   const gateway: Gateway = { list: async (observe) => { observe(Promise.resolve(agent)); }, refresh: async () => agent,
     compact: async () => { sends++; return { status: "completed", detail: "completed" }; } };
+  // Background work is awaited by the state it commits, not by elapsed time.
+  const waiters = new Set<{ done: (state: State) => boolean; resolve: () => void }>();
   const store = { read: disk.read, write: async (next: State) => {
     if (failCommit && !next.operations.some(op => op.id === "old")) throw new Error("disk full");
     await disk.write(next);
+    for (const waiter of waiters) if (waiter.done(next)) { waiters.delete(waiter); waiter.resolve(); }
   } };
+  // Listen before reading, so a write between the two is not missed.
+  const committed = (done: (state: State) => boolean) => new Promise<void>((resolve, reject) => {
+    const waiter = { done, resolve };
+    waiters.add(waiter);
+    disk.read().then(state => { if (done(state)) { waiters.delete(waiter); resolve(); } }, reject);
+  });
   const receipts: OperationReceipts = {
     remove: async (_agent, id) => {
       assert((await disk.read()).operations.some(op => op.id === id), "receipt must be removed before its record");
@@ -73,7 +82,7 @@ async function fixture() {
       sweeps++;
     },
   };
-  return { agent, disk, removed, errors,
+  return { agent, disk, removed, errors, committed,
     make: () => createScheduler({ store, gateway, receipts, now: () => time,
       settings: async () => ({ ...DEFAULT_SETTINGS, enabled: false }), onError: error => errors.push(error) }),
     get sends() { return sends; }, get sweeps() { return sweeps; },
@@ -132,8 +141,7 @@ test("cleanup preserves same-activity protection across restart and allows a new
     assert.equal((await s.compactNow("a", f.agent.revision, "another-id")).code, "existing");
     f.agent.activityKey = "new-generation:1";
     assert.equal((await s.compactNow("a", f.agent.revision, "fresh-id")).code, "accepted");
-    for (let i = 0; i < 100 && (await s.operation("fresh-id"))?.state !== "succeeded"; i++)
-      await new Promise(resolve => setTimeout(resolve, 5));
+    await f.committed(state => state.operations.some(op => op.id === "fresh-id" && op.state === "succeeded"));
     assert.equal((await s.operation("fresh-id"))?.state, "succeeded");
     assert.equal(f.sends, 1);
     s.stop();

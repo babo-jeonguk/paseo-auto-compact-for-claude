@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { mock, test } from "node:test";
 import { createOperationWorker, recoverOperations } from "./operations";
+import { TICK_INTERVAL_MS } from "./scheduler";
 import { DEFAULT_SETTINGS, type Settings } from "../shared/settings";
 import { Refusal, type CompactOutcome, type ExecutionContext, type Gateway, type Observation,
   type State, type StoredOperation } from "./model";
@@ -82,6 +83,7 @@ function fixture(options: { agents?: string[] } = {}) {
     hook(id: string, work: Hook | null) { if (work) hooks.set(id, work); else hooks.delete(id); },
     set failTerminal(value: boolean) { writesFail = value; },
     set failReads(count: number) { readsFail = count; },
+    get time() { return time; },
     advance(ms: number) { time += ms; },
     recover() { recoverOperations(state, time); },
   };
@@ -191,17 +193,24 @@ test("a fault that clears before the send deadline still sends, however many att
 });
 
 test("the worker wakes itself for a retry instead of waiting for the next tick", async () => {
+  mock.timers.enable({ apis: ["setTimeout"] });
   const f = fixture(), worker = f.make();
-  const compact = f.gateway.compact;
-  f.gateway.compact = async () => { throw new Error("observer preparation timed out"); };
-  await worker.reconcile();
-  assert.equal(f.operation.state, "requested");
-  f.gateway.compact = compact;
-  f.advance(2000);
-  const state = () => f.operation.state;
-  for (let i = 0; i < 40 && state() !== "succeeded"; i++) await new Promise(resolve => setTimeout(resolve, 50));
-  assert.equal(state(), "succeeded");
-  worker.stop();
+  try {
+    const compact = f.gateway.compact;
+    f.gateway.compact = async () => { throw new Error("observer preparation timed out"); };
+    await worker.reconcile();
+    assert.equal(f.operation.state, "requested");
+    const wait = f.operation.nextAttemptAt! - f.time;
+    assert.ok(wait > 0 && wait < TICK_INTERVAL_MS, "the retry comes before the next scheduler tick");
+    f.gateway.compact = compact;
+    f.advance(wait);
+    mock.timers.tick(wait);
+    await until(() => f.operation.state === "succeeded");
+    assert.equal(f.sends, 1);
+  } finally {
+    worker.stop();
+    mock.timers.reset();
+  }
 });
 
 test("a gateway fault before the dispatch marker is retried; nothing is sent until it passes", async () => {

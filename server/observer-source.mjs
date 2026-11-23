@@ -15,6 +15,9 @@ let confirming = null;
 // Only a larger step is a rollback. Must equal CLOCK_STEP_TOLERANCE_MS in
 // server/deadline.ts; it stays within the 30 s cache-deadline margin.
 const CLOCK_STEP_TOLERANCE_MS = 10_000;
+// A running observer rewrites its ledger this often, so the server can tell a
+// live launch from an ended one: it ignores a ledger a minute old.
+const HEARTBEAT_MS = 5_000;
 // Must equal QUERY_RESTARTED_REFUSAL in server/observer.ts.
 const QUERY_RESTARTED_REFUSAL = 'query_restarted';
 const QUERY_RESTARTED_REASON = 'Claude query restarted before compaction ran';
@@ -205,7 +208,7 @@ export function registerObserver(on, config) {
     state.sessionId = await $.session.id();
     await save($);
     heartbeat?.cancel();
-    heartbeat = await $.clock.every(5_000, async () => save($));
+    heartbeat = await $.clock.every(HEARTBEAT_MS, async () => save($));
     return next(e);
   });
   on('session.end', async ($, e, next) => {

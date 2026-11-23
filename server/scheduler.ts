@@ -31,6 +31,11 @@ type ReservationOutcome = { kind: "expired" | "skipped"; detail: string } |
 const TRANSIENT: readonly BlockedReason[] = ["observer_starting", "observer_unreadable"];
 type Decision = { candidate: Candidate; outcome: ReservationOutcome };
 
+// The periodic pass that fires due reservations and moves pending operations
+// on. A reservation fires at most this long after it is due, which is small
+// next to the 30 s margin kept before a cache deadline, and each pass reads only
+// the conversations that hold work.
+export const TICK_INTERVAL_MS = 10_000;
 export const FULL_SCAN_INTERVAL_MS = 60_000;
 export type ObservationScope =
   | { kind: "agent"; agentId: string }

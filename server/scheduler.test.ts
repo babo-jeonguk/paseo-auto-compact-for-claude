@@ -5,7 +5,7 @@ import {
   SettingsSchema,
   type Settings,
 } from "../shared/settings";
-import { createScheduler } from "./scheduler";
+import { createScheduler, FULL_SCAN_INTERVAL_MS, TICK_INTERVAL_MS } from "./scheduler";
 import { DELIVERY_WINDOW_MS } from "./policy";
 import type { Blocked } from "../shared/rpc";
 import { Refusal, type Gateway, type Observation, type State, type StateStore } from "./model";
@@ -817,6 +817,11 @@ test("a slow host read for one conversation does not hold up other conversations
   await pending;
 });
 
+test("the periodic pass runs every ten seconds and the full scan once a minute", () => {
+  assert.equal(TICK_INTERVAL_MS, 10_000);
+  assert.equal(FULL_SCAN_INTERVAL_MS, 60_000);
+});
+
 test("Compact now acknowledges a slow backend before the plugin RPC deadline", async () => {
   const f = fixture();
   let release!: () => void;
@@ -828,15 +833,12 @@ test("Compact now acknowledges a slow backend before the plugin RPC deadline", a
   const scheduler = f.make();
   await scheduler.ready;
 
-  const request = scheduler.compactNow("a", f.agents[0].revision!);
-  const first = await Promise.race([
-    request,
-    new Promise<"rpc-timeout">((resolve) => setTimeout(() => resolve("rpc-timeout"), 10)),
-  ]);
+  // The backend stays held until the request has answered.
+  const first = await within(scheduler.compactNow("a", f.agents[0].revision!));
   release();
   await waitForStatus(f, "completed");
 
-  if (first === "rpc-timeout")
+  if (first === null)
     assert.fail("the RPC waited for compaction instead of acknowledging the persisted running job");
   assert.equal(first.status, "running");
   assert(first.operationId);

@@ -334,13 +334,14 @@ test('Claude admits the compaction for as long as it can be observed, not only u
 
 test('a send that starts just before its deadline is still observed in full', async () => {
   // A live budget longer than the send deadline, as in production (120 s vs. what is left).
+  let time = 1_000_000;
   const host = fixture([{ type: "compaction", status: "completed", trigger: "manual" }],
-    undefined, false, undefined, { timeoutMs: 1_000 });
+    undefined, false, undefined, { timeoutMs: 1_000, now: () => time });
   const send = host.ref.send;
-  // The boundary arrives after the send deadline has passed.
-  host.ref.send = async (text, options) => { await new Promise(resolve => setTimeout(resolve, 80)); return send(text, options); };
+  // The send takes past its deadline, so the boundary arrives after it.
+  host.ref.send = async (text, options) => { time += 80; return send(text, options); };
   const result = await host.gateway.compact("a", undefined, {
-    id: "late-request", sendBy: Date.now() + 40, checkpoint: async () => {}, current: () => true,
+    id: "late-request", sendBy: time + 40, checkpoint: async () => {}, current: () => true,
   });
   assert.equal(result.status, "completed");
   assert.equal(host.sendCount(), 1);
@@ -909,12 +910,29 @@ test("a history page read across another lost live view proves nothing, not even
   }
 });
 
+// Counts an attempt's polls and wakes a waiting test on each one, so the test
+// waits for the poll it needs instead of sleeping. It fails rather than hangs
+// when the attempt ends while the test still expects it to poll.
+function pollSignal() {
+  let count = 0;
+  let wake: (() => void) | undefined;
+  return {
+    get count() { return count; },
+    poll() { count++; wake?.(); },
+    async until(done: () => boolean, attempt: Promise<unknown>, why: string) {
+      const ended = attempt.then(() => { throw new Error(why); });
+      ended.catch(() => {}); // only the race below observes it
+      while (!done()) await Promise.race([new Promise<void>(resolve => { wake = resolve; }), ended]);
+    },
+  };
+}
+
 test("after a lost live view, history is read at most once a second while completion is awaited", async () => {
   let time = Date.now();
   const native = observer({ status: "completed", detail: "Native PostCompact" })!;
-  let polls = 0;
+  const polls = pollSignal();
   const receipt = native.receipt;
-  native.receipt = (...args) => { polls++; return receipt(...args); };
+  native.receipt = (...args) => { polls.poll(); return receipt(...args); };
   const host = fixture([], undefined, false, [], { observer: native, timeoutMs: 120_000, now: () => time });
   const send = host.ref.send;
   let emit!: (message: unknown) => void;
@@ -930,13 +948,8 @@ test("after a lost live view, history is read at most once a second while comple
   const attempt = host.gateway.automatic!((await host.gateway.refresh("a"))!, undefined, {
     id: "interval", sendBy: time + 30_000, checkpoint: async () => {}, current: () => true,
   });
-  const until = async (done: () => boolean) => {
-    for (let tries = 0; !done(); tries++) {
-      assert.ok(tries < 2_000, "the attempt stopped polling");
-      await new Promise(resolve => setTimeout(resolve, 1));
-    }
-  };
-  const pollsAfter = async (count: number) => { const target = polls + count; await until(() => polls >= target); };
+  const until = (done: () => boolean) => polls.until(done, attempt, "the attempt stopped polling");
+  const pollsAfter = (count: number) => { const target = polls.count + count; return until(() => polls.count >= target); };
   try {
     await until(() => reads >= 1);
     await pollsAfter(5);
@@ -1100,10 +1113,10 @@ test("a generation change without a matching refusal stays pending until the obs
   try {
     const send = host.ref.send;
     const originalResult = obs.native.result;
-    let pollsOnNewGeneration = 0;
+    const pollsOnNewGeneration = pollSignal();
     obs.native.result = async (agentId, op) => {
       const res = await originalResult(agentId, op);
-      if (obs.ledger.generation === "gen-2") pollsOnNewGeneration++;
+      if (obs.ledger.generation === "gen-2") pollsOnNewGeneration.poll();
       return res;
     };
     host.ref.send = async (text, options) => {
@@ -1119,19 +1132,15 @@ test("a generation change without a matching refusal stays pending until the obs
       id: "gen-only", sendBy: time + 30_000, checkpoint: async () => {}, current: () => true,
     });
     void attempt.finally(() => { settled = true; });
-    const until = async (done: () => boolean) => {
-      for (let tries = 0; !done(); tries++) {
-        assert.ok(tries < 2_000, "the attempt stopped polling before the deadline");
-        await new Promise(resolve => setTimeout(resolve, 1));
-      }
-    };
-    await until(() => pollsOnNewGeneration >= 3);
+    const until = (done: () => boolean) =>
+      pollsOnNewGeneration.until(done, attempt!, "the attempt stopped polling before the deadline");
+    await until(() => pollsOnNewGeneration.count >= 3);
     assert.equal(settled, false, "a bare generation change must not exit live observation early");
     assert.equal((await obs.readRequest()).status, "prepared");
     time += 59_000;
     await obs.saveLedger();
-    const afterChange = pollsOnNewGeneration;
-    await until(() => pollsOnNewGeneration >= afterChange + 2);
+    const afterChange = pollsOnNewGeneration.count;
+    await until(() => pollsOnNewGeneration.count >= afterChange + 2);
     assert.equal(settled, false, "execution must stay pending before the live deadline");
     assert.equal((await obs.readRequest()).status, "prepared");
     time += 61_000;
