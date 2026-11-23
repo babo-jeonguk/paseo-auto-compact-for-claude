@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mock, test } from "node:test";
+import { test } from "node:test";
 import { createOperationWorker, recoverOperations } from "./operations";
 import { TICK_INTERVAL_MS } from "./scheduler";
 import { DEFAULT_SETTINGS, type Settings } from "../shared/settings";
@@ -192,25 +192,21 @@ test("a fault that clears before the send deadline still sends, however many att
   worker.stop();
 });
 
-test("the worker wakes itself for a retry instead of waiting for the next tick", async () => {
-  mock.timers.enable({ apis: ["setTimeout"] });
+test("the worker wakes itself for a retry instead of waiting for the next tick", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
   const f = fixture(), worker = f.make();
-  try {
-    const compact = f.gateway.compact;
-    f.gateway.compact = async () => { throw new Error("observer preparation timed out"); };
-    await worker.reconcile();
-    assert.equal(f.operation.state, "requested");
-    const wait = f.operation.nextAttemptAt! - f.time;
-    assert.ok(wait > 0 && wait < TICK_INTERVAL_MS, "the retry comes before the next scheduler tick");
-    f.gateway.compact = compact;
-    f.advance(wait);
-    mock.timers.tick(wait);
-    await until(() => f.operation.state === "succeeded");
-    assert.equal(f.sends, 1);
-  } finally {
-    worker.stop();
-    mock.timers.reset();
-  }
+  t.after(() => worker.stop());
+  const compact = f.gateway.compact;
+  f.gateway.compact = async () => { throw new Error("observer preparation timed out"); };
+  await worker.reconcile();
+  assert.equal(f.operation.state, "requested");
+  const wait = f.operation.nextAttemptAt! - f.time;
+  assert.ok(wait > 0 && wait < TICK_INTERVAL_MS, "the retry comes before the next scheduler tick");
+  f.gateway.compact = compact;
+  f.advance(wait);
+  t.mock.timers.tick(wait);
+  await until(() => f.operation.state === "succeeded");
+  assert.equal(f.sends, 1);
 });
 
 test("a gateway fault before the dispatch marker is retried; nothing is sent until it passes", async () => {

@@ -10,15 +10,14 @@ const typed = ["**/*.ts", "**/*.tsx"];
 
 // Unit tests run in one process with fakes; the simulation and E2E suites
 // drive real processes and keep real time. Test support modules are held to
-// the unit-test rule too, except the one that owns the failure bound.
+// the unit-test rule too.
 const unitTests = ["server/*.test.ts", "scripts/*.test.ts", "tests/*.test.mjs", "tests/support/**"];
-const failureBound = "tests/support/failure-bound.ts";
 const tests = ["**/*.test.ts", "**/*.test.mjs", "tests/**"];
 const product = ["index.server.ts", "index.client.tsx", "client/**", "server/**", "shared/**", "scripts/**"];
 
-const realTime = 'Unit tests start no real timer with a delay. Advance the injected clock or mock.timers, wait on ' +
-  'observable state such as a fake being called, and bound a wait that may never end with settledWithin from ' +
-  'tests/support/failure-bound.ts (CODING_STANDARDS.md "Tests").';
+const realTime = 'Unit tests start no real timer with a delay. Advance the injected clock or the test\'s mock timers ' +
+  'and wait on observable state such as a fake being called; the test runner bounds every test, so a wait needs ' +
+  'no timer of its own (CODING_STANDARDS.md "Tests").';
 const namedTiming = 'A timer or deadline argument is a named constant with an _MS suffix and a comment ' +
   'that says why it has that value (CODING_STANDARDS.md "Named timings").';
 const timer = "/^(setTimeout|setInterval)$/";
@@ -32,12 +31,14 @@ const literal = (call, position) =>
 export const projectRules = [
   {
     files: unitTests,
-    ignores: [failureBound],
     rules: {
       "no-restricted-syntax": ["error",
         {
-          // Any delay but 0 (the next turn), whatever the callback does.
-          selector: `CallExpression:matches([callee.name=${timer}], [callee.object.name='globalThis'][callee.property.name=${timer}])` +
+          // Any delay but 0 (the next turn), whatever the callback does, called
+          // by name or through the global object.
+          selector: `CallExpression:matches([callee.name=${timer}], ` +
+            `[callee.object.name=/^global(This)?$/]:matches([callee.property.name=${timer}], ` +
+            `[callee.property.value=${timer}], [callee.property.quasis.0.value.cooked=${timer}]))` +
             "[arguments.length>1]:not([arguments.1.value=0])",
           message: realTime,
         },
@@ -45,6 +46,11 @@ export const projectRules = [
           // Everything these modules offer but setImmediate waits in real time.
           selector: "ImportDeclaration[source.value=/^(node:)?timers(\\/promises)?$/] > " +
             ":matches(ImportSpecifier:not([imported.name='setImmediate']), ImportNamespaceSpecifier, ImportDefaultSpecifier)",
+          message: realTime,
+        },
+        {
+          // The same modules loaded at run time.
+          selector: "ImportExpression[source.value=/^(node:)?timers(\\/promises)?$/]",
           message: realTime,
         },
       ],
