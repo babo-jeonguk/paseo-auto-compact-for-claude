@@ -127,6 +127,19 @@ export function createOperationWorker(options: {
     if (finished?.evidence?.native && gateway.release)
       await bounded(gateway.release(finished), INSPECT_TIMEOUT_MS).catch(() => {});
   }
+  // One owner of this worker's retry wake-ups. A retry saved by a worker that
+  // has stopped since schedules nothing, and a newer wake-up replaces the old
+  // one so a conversation's retry is neither doubled nor delayed by another.
+  function armRetry(id: string, wait: number) {
+    if (stopped) return;
+    const previous = retries.get(id);
+    if (previous !== undefined) timers.clearTimeout(previous);
+    const timer = timers.setTimeout(() => {
+      retries.delete(id);
+      void reconcile(lastConnected).catch(onError);
+    }, wait);
+    retries.set(id, timer);
+  }
   // Every reconcile scans all pending work: conversations run independently and
   // a second call must not start an operation already running. Callers wait only
   // for runs they started; a request saved during a run is picked up by the next
@@ -262,13 +275,7 @@ export function createOperationWorker(options: {
         faults.set(id, error);
         if (next === "expired") return await finish(id, "expired");
         // This operation wakes itself for its retry; other conversations keep running.
-        const previous = retries.get(id);
-        if (previous !== undefined) timers.clearTimeout(previous);
-        const timer = timers.setTimeout(() => {
-          retries.delete(id);
-          void reconcile(lastConnected).catch(onError);
-        }, next);
-        retries.set(id, timer);
+        armRetry(id, next);
       } catch (writeError) { onError(writeError); }
     }
   }
