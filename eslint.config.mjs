@@ -8,6 +8,66 @@ import tseslint from "typescript-eslint";
 // (.mjs and the .mts fixture generator) are linted without it.
 const typed = ["**/*.ts", "**/*.tsx"];
 
+// Unit tests run in one process with fakes; the simulation and E2E suites
+// drive real processes and keep real time.
+const unitTests = ["server/*.test.ts", "scripts/*.test.ts", "tests/*.test.mjs"];
+const tests = ["**/*.test.ts", "**/*.test.mjs", "tests/**"];
+const product = ["index.server.ts", "index.client.tsx", "client/**", "server/**", "shared/**", "scripts/**"];
+
+const realTime = 'Unit tests do not sleep in real time. Advance the injected clock or mock.timers, ' +
+  'and wait on observable state such as a fake being called (CODING_STANDARDS.md "Tests").';
+const namedTiming = 'A timer or deadline argument is a named constant with an _MS suffix and a comment ' +
+  'that says why it has that value (CODING_STANDARDS.md "Named timings").';
+const timer = "/^(setTimeout|setInterval)$/";
+// The delay argument when a number is written into it, alone or inside an
+// expression; 0 (the next turn, or a lower bound) is not a duration. A function
+// in that position is a callback, as in `array.every(item => …)`.
+const number = "Literal[raw=/^[0-9]/]:not([value=0])";
+const literal = (call, position) =>
+  `${call} > :nth-child(${position}):not(:function):matches(${number}, :has(${number}))`;
+
+export const projectRules = [
+  {
+    files: unitTests,
+    rules: {
+      "no-restricted-syntax": ["error",
+        {
+          // A sleep: a delayed timer whose callback only wakes something, as
+          // `setTimeout(resolve, ms)`, `() => resolve()` or `setInterval(poll, ms)`.
+          // A timer that ends a wait with a value or an error is a bound that
+          // fires only when the test fails, and is left alone.
+          selector: `CallExpression:matches([callee.name=${timer}], [callee.object.name='globalThis'][callee.property.name=${timer}])` +
+            "[arguments.length>1]:not([arguments.1.value=0]):matches(" +
+            "[arguments.0.type='Identifier'], " +
+            "[arguments.0.body.type='CallExpression'][arguments.0.body.arguments.length=0], " +
+            "[arguments.0.body.body.length=1][arguments.0.body.body.0.expression.type='CallExpression']" +
+            "[arguments.0.body.body.0.expression.arguments.length=0])",
+          message: realTime,
+        },
+        {
+          selector: "ImportDeclaration[source.value=/^(node:)?timers\\/promises$/] > " +
+            "ImportSpecifier[imported.name=/^(setTimeout|setInterval|scheduler)$/]",
+          message: realTime,
+        },
+      ],
+    },
+  },
+  {
+    files: product,
+    ignores: tests,
+    rules: {
+      "no-restricted-syntax": ["error", {
+        selector: [
+          literal(`CallExpression:matches([callee.name=${timer}], [callee.property.name=${timer}], [callee.name='bounded'])`, 2),
+          literal("CallExpression[callee.property.name='every']", 1),
+          literal("CallExpression[callee.object.name='AbortSignal'][callee.property.name='timeout']", 1),
+        ].join(", "),
+        message: namedTiming,
+      }],
+    },
+  },
+];
+
 export default defineConfig([
   globalIgnores([
     "**/node_modules/",
@@ -76,4 +136,5 @@ export default defineConfig([
     files: ["tests/e2e/**", "tests/simulation/**"],
     languageOptions: { globals: { window: "readonly" } },
   },
+  ...projectRules,
 ]);

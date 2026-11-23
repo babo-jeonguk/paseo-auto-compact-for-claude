@@ -16,6 +16,8 @@ A rule lives in the module that owns it, and every caller asks that module. The 
 
 Every duration is a named constant with a unit suffix (`_MS`) and a comment that says why it has that value. Tests assert the agreed values. A bare number of milliseconds in logic is a finding.
 
+Lint enforces this for the delay argument of timer calls in product code (`setTimeout`, `setInterval`, `bounded`, a clock's `every`, `AbortSignal.timeout`); other durations in logic are left to review.
+
 ## Decisions apart from effects
 
 Keep decisions as pure functions that take the current time and state as input (`automaticBlock`, `sessionPollDelay`, `deadlineOf`), and keep timers, I/O and the host API at the edges. Code that reads the clock or the host inside a decision is harder to test and is a finding when a pure version is practical.
@@ -45,6 +47,8 @@ Make code work in the general case, then add special handling on top. Do not dep
 - Tests use `node:test` with `node:assert/strict`, and drive time through an injected clock rather than sleeps.
 - Wait on observable state, not on incidental counts or delays. Do not hide a failure with retries or weaker assertions.
 - A change in how the plugin talks to Paseo or Claude needs a native simulation scenario, since unit fakes share the code's assumptions.
+
+Lint enforces the first rule in the unit tests (`server/*.test.ts`, `scripts/*.test.ts`, `tests/*.test.mjs`): it rejects a sleep, meaning a delayed timer whose callback only wakes a waiter, and the timers of `node:timers/promises`. A timer that ends a wait with a value or an error is a bound that fires only when the test fails, and is allowed. The simulation and E2E suites run real processes and keep real time.
 
 ## Comments say why
 
