@@ -19,7 +19,9 @@ const flags = (file, code, standard) => {
 };
 const passes = (file, code) => assert.deepEqual(findings(file, code), [], `${file}: ${code}`);
 
-test('unit tests start no real timer with a delay outside the shared failure bound', () => {
+// The test runner bounds every unit test, so no test starts a real timer of
+// its own, not even to bound a wait.
+test('unit tests start no real timer with a delay', () => {
   for (const file of ['server/a.test.ts', 'scripts/a.test.ts', 'tests/a.test.mjs', 'tests/support/a.ts']) {
     for (const code of [
       'await new Promise(resolve => setTimeout(resolve, 50));',
@@ -29,10 +31,13 @@ test('unit tests start no real timer with a delay outside the shared failure bou
       'setInterval(() => { poll(agentId); }, 50);',
       'setTimeout(() => poll(agentId), 50);',
       'globalThis.setTimeout(resolve, 1_000);',
-      // A bound of its own, too: bounds live in tests/support/failure-bound.ts.
+      'global.setInterval(poll, 10);',
+      "globalThis['setTimeout'](resolve, 50);",
+      'globalThis[`setInterval`](poll, 10);',
       'timer = setTimeout(() => resolve(null), ms);',
       "setTimeout(() => reject(new Error('stuck')), 1_000);",
-      'setTimeout(reject, FAILURE_BOUND_MS, new Error("stuck"));',
+      "const { setTimeout: sleep } = await import('node:timers/promises');",
+      "await import('timers');",
       "import { setTimeout } from 'node:timers/promises';",
       "import { setInterval as every } from 'timers/promises';",
       "import { scheduler } from 'node:timers/promises';",
@@ -51,8 +56,6 @@ test('unit tests start no real timer with a delay outside the shared failure bou
       "import { setImmediate } from 'node:timers';",
     ]) passes(file, code);
   }
-  // The one module that owns the failure bound.
-  passes('tests/support/failure-bound.ts', 'const timer = setTimeout(() => resolve(null), FAILURE_BOUND_MS);');
 });
 
 test('the real-time rule leaves process suites and product code alone', () => {
