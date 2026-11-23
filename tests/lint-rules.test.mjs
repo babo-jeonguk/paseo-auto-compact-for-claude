@@ -25,15 +25,18 @@ test('unit tests do not sleep in real time', () => {
       'await new Promise(resolve => setTimeout(resolve, 50));',
       'const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));',
       'setInterval(poll, 10);',
+      'setInterval(poll, 50, agentId);',
+      'setTimeout(check, 50, agentId);',
       'globalThis.setTimeout(resolve, 1_000);',
       'await new Promise(resolve => setTimeout(() => resolve(), 20));',
       'await new Promise(resolve => setTimeout(() => { resolve(); }, 20));',
       "import { setTimeout } from 'node:timers/promises';",
       "import { setInterval as every } from 'timers/promises';",
       "import { scheduler } from 'node:timers/promises';",
-      "import * as timers from 'node:timers/promises';",
-      "import timers from 'timers/promises';",
     ]) flags(file, code, /CODING_STANDARDS\.md "Tests"/);
+    // The members a namespace or default import reaches are not visible to a selector.
+    for (const code of ["import * as timers from 'node:timers/promises';", "import timers from 'timers/promises';"])
+      flags(file, code, /setImmediate by name/);
     for (const code of [
       'await new Promise(resolve => setImmediate(resolve));',
       'setTimeout(resolve, 0);',
@@ -44,6 +47,7 @@ test('unit tests do not sleep in real time', () => {
       'timer = setTimeout(() => resolve(null), ms);',
       "setTimeout(() => reject(new Error('stuck')), 1_000);",
       'setTimeout(reject, FAILURE_BOUND_MS, new Error("stuck"));',
+      'setTimeout(resolve, BOUND_MS, "late");',
       "import { setImmediate } from 'node:timers/promises';",
     ]) passes(file, code);
   }

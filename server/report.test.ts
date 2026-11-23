@@ -34,3 +34,13 @@ test("the host becoming unavailable as the plugin shuts down is never reported",
     assert.deepEqual(lines, []);
   } finally { mock.timers.reset(); }
 });
+
+test("a failing teardown step after disposal is still reported unless the host is gone", () => {
+  const lines: string[] = [];
+  const reporter = createReporter(line => lines.push(line));
+  reporter.dispose();
+  reporter.teardown(new TypeError("unsubscribe broke"));
+  reporter.teardown(new Error("Daemon client closed")); // Paseo closed the API before cleanup
+  reporter.teardown(new DeadlineExceeded());
+  assert.deepEqual(lines, ["TypeError: unsubscribe broke"]);
+});
