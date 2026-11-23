@@ -137,8 +137,9 @@ export default function contribute(server: PluginServerContext) {
     clearInterval(timer);
     scheduler.stop();
     host.stop();
-    // A settings subscription may end asynchronously; report its failure
-    // like any other instead of leaving the rejection unhandled.
+    // A settings subscription may end asynchronously. Its failure is handed to
+    // the reporter, which drops anything shutdown cuts off once disposed, so
+    // the rejection is handled instead of surfacing as unhandled.
     for (const stop of stops) void Promise.resolve(stop()).catch(report);
   };
 }

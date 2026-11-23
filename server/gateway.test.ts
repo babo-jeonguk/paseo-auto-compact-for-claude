@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { bounded, OBSERVATION_MS } from "./deadline";
 import { Refusal, type OperationEvidence, type StoredOperation } from "./model";
-import { createGateway } from "./gateway";
+import { createGateway, EVIDENCE_POLL_MS } from "./gateway";
 import { createObserver, QUERY_RESTARTED_REFUSAL } from "./observer";
 import { createOperationWorker } from "./operations";
 import { createScheduler } from "./scheduler";
@@ -330,6 +330,10 @@ test('Claude admits the compaction for as long as it can be observed, not only u
     { id: 'late-admission', sendBy, checkpoint: async () => {}, current: () => true });
   assert.equal(admitted, sendBy + OBSERVATION_MS);
   assert.equal(host.sendCount(), 1);
+});
+
+test("completion evidence is checked every 50 ms after sending", () => {
+  assert.equal(EVIDENCE_POLL_MS, 50);
 });
 
 test('a send that starts just before its deadline is still observed in full', async () => {
@@ -910,9 +914,12 @@ test("a history page read across another lost live view proves nothing, not even
   }
 });
 
+// A wait that should end within a few polls of 1 ms is a failure after this.
+const POLL_WAIT_BOUND_MS = 5_000;
 // Counts an attempt's polls and wakes a waiting test on each one, so the test
 // waits for the poll it needs instead of sleeping. It fails rather than hangs
-// when the attempt ends while the test still expects it to poll.
+// when the attempt ends, or stops reaching the counted call, while the test
+// still expects it to poll.
 function pollSignal() {
   let count = 0;
   let wake: (() => void) | undefined;
@@ -921,8 +928,16 @@ function pollSignal() {
     poll() { count++; wake?.(); },
     async until(done: () => boolean, attempt: Promise<unknown>, why: string) {
       const ended = attempt.then(() => { throw new Error(why); });
-      ended.catch(() => {}); // only the race below observes it
-      while (!done()) await Promise.race([new Promise<void>(resolve => { wake = resolve; }), ended]);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const bound = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${why} (no expected poll within ${POLL_WAIT_BOUND_MS} ms)`)),
+          POLL_WAIT_BOUND_MS);
+      });
+      ended.catch(() => {}); // only the race below observes these
+      bound.catch(() => {});
+      try {
+        while (!done()) await Promise.race([new Promise<void>(resolve => { wake = resolve; }), ended, bound]);
+      } finally { clearTimeout(timer); }
     },
   };
 }

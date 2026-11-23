@@ -46,17 +46,20 @@ test('snapshot keeps testing its recorded commit while the source advances, prop
       cwd: repo, windowsHide: true, timeout: 40_000, stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...process.env, SNAPSHOT_CONTINUE: proceed },
     });
+    // Rejects on a spawn error as well as resolving on exit.
     running = once(child, 'exit');
+    running.catch(() => {}); // awaited below and in finally
     // The check prints its start through the runner, which inherits its output.
     let output = '';
-    const started = new Promise((resolve, reject) => {
+    const printed = new Promise(resolve => {
       for (const stream of [child.stdout, child.stderr]) stream.on('data', chunk => {
         output += chunk;
         if (output.includes(STARTED)) resolve();
       });
-      child.once('exit', code => reject(new Error(`the snapshot exited ${code} before its check started:\n${output}`)));
     });
-    await started;
+    await Promise.race([printed, running.then(([code]) => {
+      throw new Error(`the snapshot exited ${code} before its check started:\n${output}`);
+    })]);
     await writeFile(join(repo, 'value'), 'after');
     await git('add', 'value');
     await git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', '-c', 'commit.gpgsign=false', 'commit', '-m', 'advance original');
@@ -74,7 +77,7 @@ test('snapshot keeps testing its recorded commit while the source advances, prop
     assert.equal(await readFile(join(repo, 'node_modules/keep'), 'utf8'), 'shared dependencies');
   } finally {
     await writeFile(join(root, 'continue'), 'cleanup').catch(() => {});
-    await running?.catch(() => {});
+    await running?.catch(() => {}); // a spawn error has already failed the test
     await rm(root, { recursive: true, force: true });
   }
 });

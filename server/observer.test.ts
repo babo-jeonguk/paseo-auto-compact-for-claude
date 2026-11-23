@@ -68,7 +68,9 @@ test('observer session preparation preserves provider environment and ignores hi
 // direct GitHub installs. Listing the current build here makes a change to the
 // observer source fail the test below until its new build is added, and the
 // build it replaces then stays checked as readable.
-const READABLE_BUILDS = ['af6c6639f8c3058a73d5e982e308b69f5572fc6439a0c8fea61c1ca629ef4239',
+const READABLE_BUILDS = ['f8a02403e4f6c17e010ddda4d0385109fe8c480dfc379c9bb91d309671f87c7a',
+  '61a0e12639e417cd28f7a651c789c00e10606bf994d960276f1916914eb3e6d4',
+  'af6c6639f8c3058a73d5e982e308b69f5572fc6439a0c8fea61c1ca629ef4239',
   '8a6c0217779bc4f83c7029c8170c35da8d2ed8028622019f4a09808491dff90f',
   '7d9c570c36bcad4db9ef816c0b704c5b0d01d12c7522b215cdfbbfc160c86648',
   '9fa0456c8d59db1297e540db98993d8d23e34dbfb4a487843334926447ece70b',

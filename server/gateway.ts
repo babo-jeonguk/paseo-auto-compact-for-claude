@@ -45,7 +45,7 @@ const HISTORY_REFETCH_INTERVAL_MS = 1_000;
 // Between checks for completion evidence after sending. A check reads the
 // observer's local files and remembered live events, so polling often costs
 // little and notices completion soon after Claude reports it.
-const EVIDENCE_POLL_MS = 50;
+export const EVIDENCE_POLL_MS = 50;
 export function createGateway(options: {
   observer?: Observer; now?: () => number; timeoutMs?: number; pollMs?: number; dispatchTimeoutMs?: number; cleanupTimeoutMs?: number;
 } = {}) {
