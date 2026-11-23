@@ -76,8 +76,8 @@ const ManifestSchema = z.object({ launchId: z.string().uuid(), build: z.string()
 // Ledgers and receipts are small; anything larger is not one of ours.
 const MAX_FILE_BYTES = 32_768;
 // The input-counting, command-guard, cancellation, clock-step and restart-refusal
-// fixes keep the same ledger and reservation contract. Keep already-open sessions
-// observable until reopen.
+// fixes keep the same ledger and reservation contract, as do comment-only edits.
+// Keep already-open sessions observable until reopen.
 const compatibleBuilds = new Set([observerAsset.version,
   'f8a02403e4f6c17e010ddda4d0385109fe8c480dfc379c9bb91d309671f87c7a',
   '61a0e12639e417cd28f7a651c789c00e10606bf994d960276f1916914eb3e6d4',
@@ -89,7 +89,9 @@ const compatibleBuilds = new Set([observerAsset.version,
   // v1.2.1
   '134e83d3751cca2f86c2ccda713162c7e739827df129e2020ab88a039c564e63',
   // main after #23 (query-restart refusal), installed by direct GitHub updates
-  '35dc721b4f7cd02d1618f04fb9b9f856513ba21d07dc6abcac291911d94e8509']);
+  '35dc721b4f7cd02d1618f04fb9b9f856513ba21d07dc6abcac291911d94e8509',
+  // v1.2.2
+  '61b60834478e92325dc73fdb2b9235805997f990fe5ab8664bfef7ccc8f06d61']);
 
 // What a placeholder ledger means. Session open writes `{}` and the observer
 // replaces it on its first write, which it makes at session start and during

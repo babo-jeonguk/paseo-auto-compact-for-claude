@@ -35,7 +35,7 @@ export function onHostReconnected(listener: () => void): () => void {
 export function hostReconnected(): void {
   failuresBySession.clear();
   for (const listener of reconnectListeners) {
-    try { listener(); } catch {} // one broken listener must not stop the rest
+    try { listener(); } catch { /* one broken listener must not stop the rest */ }
   }
 }
 
@@ -50,7 +50,7 @@ export function sessionFailures(key: string): { count(): number; record(event: P
       else failuresBySession.set(key, next);
       if (event === "success" && previous > 0)
         for (const listener of recoveryListeners) {
-          try { listener(); } catch {} // one broken listener must not stop the rest
+          try { listener(); } catch { /* one broken listener must not stop the rest */ }
         }
     },
   };

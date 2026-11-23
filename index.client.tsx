@@ -11,7 +11,7 @@ export default function contribute(client: PluginClientContext) {
   });
   const stopConversations = installConversationControls(client);
   return async () => {
-    await stopConversations();
+    stopConversations();
     await stopSettings();
   };
 }

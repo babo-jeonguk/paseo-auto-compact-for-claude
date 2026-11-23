@@ -334,7 +334,7 @@ test("undo skip preserves the original time and executes only at that time", asy
   assert.equal(skipped.dueAt, null);
   assert.equal(skipped.undoSkip?.dueAt, original);
   assert.equal(skipped.enabled, true);
-  assert.equal(await s.undoSkip("a", skipped.revision!, skipped.undoSkip!.id), true);
+  assert.equal(await s.undoSkip("a", skipped.revision!, skipped.undoSkip.id), true);
   assert.equal((await s.session("a"))!.dueAt, original);
   assert.equal((await s.session("a"))!.undoSkip, null);
   assert.equal(f.calls, 0);

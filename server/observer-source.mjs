@@ -59,13 +59,16 @@ async function cachePolicy($) {
     if (settings.promptCacheTtl === '5m' || settings.promptCacheTtl === '1h')
       return { ttl: settings.promptCacheTtl, source: 'settings' };
     if (await $.env.get('ENABLE_PROMPT_CACHING_1H') === '1') return { ttl: '1h', source: 'environment' };
-  } catch {}
+  } catch {
+    // An unreadable setting is not a policy: fall back to the default
+    // assumption rather than blocking the reservation.
+  }
   return { ttl: null, source: 'default' };
 }
 
 async function admit($, trigger) {
   let request;
-  try { request = JSON.parse(await $.fs.read(configuration.request)); } catch {}
+  try { request = JSON.parse(await $.fs.read(configuration.request)); } catch { /* a missing or half-written request is no request */ }
   const now = await $.clock.now();
   // Unrequested/manual/CLI compaction is observed but cannot complete an
   // automatic operation. The host also pins the public send's message/turn id.

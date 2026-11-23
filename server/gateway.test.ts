@@ -226,8 +226,9 @@ test('automatic public dispatch requires both its own boundary and matching nati
 
 // Another user message seen live after the send, in its own turn or in the
 // command's, followed by what Claude and the host report for the command.
-async function overlap({ receipt = { status: 'completed', detail: 'Native PostCompact' } as Receipt | null,
-  outcome = { kind: 'completed' } as unknown, events = [] as Array<{ turnId: string; item: unknown }>, timeoutMs = 1_000 } = {}) {
+interface OverlapOptions { receipt?: Receipt | null; outcome?: unknown; events?: Array<{ turnId: string; item: unknown }>; timeoutMs?: number }
+async function overlap({ receipt = { status: 'completed', detail: 'Native PostCompact' },
+  outcome = { kind: 'completed' }, events = [], timeoutMs = 1_000 }: OverlapOptions = {}) {
   const host = fixture([], outcome, false, [], { observer: observer(receipt), timeoutMs });
   const send = host.ref.send;
   let emit!: (message: unknown) => void;
@@ -803,10 +804,16 @@ const BOUNDARY_ITEM = { type: "compaction", status: "completed", trigger: "manua
 const LOST_VIEW = ["subscription_restored", "replacement", "error"] as const;
 type HistoryEntry = { turnId: string | null; item: unknown };
 const BOUNDARY = { type: "compaction", status: "completed", trigger: "manual" };
-async function lostView(lost: typeof LOST_VIEW[number], { live = [] as readonly unknown[], before = [] as readonly unknown[],
-  history = ((id: string) => [command(id), { turnId: "compact-1", item: BOUNDARY }]) as (id: string, lose: () => void) => HistoryEntry[],
-  receipt = { status: "completed", detail: "Native PostCompact" } as { status: "completed" | "unknown"; detail: string } | null,
-  timeoutMs = 1_000, now = Date.now as () => number } = {}) {
+interface LostViewOptions {
+  live?: readonly unknown[]; before?: readonly unknown[];
+  history?: (id: string, lose: () => void) => HistoryEntry[];
+  receipt?: { status: "completed" | "unknown"; detail: string } | null;
+  timeoutMs?: number; now?: () => number;
+}
+async function lostView(lost: typeof LOST_VIEW[number], { live = [], before = [],
+  history = (id: string) => [command(id), { turnId: "compact-1", item: BOUNDARY }],
+  receipt = { status: "completed", detail: "Native PostCompact" },
+  timeoutMs = 1_000, now = Date.now }: LostViewOptions = {}) {
   const host = fixture([], undefined, false, [...before], { observer: observer(receipt), timeoutMs, now });
   const send = host.ref.send;
   let emit!: (message: unknown) => void;
@@ -1028,7 +1035,7 @@ async function realObserverFixture(now = () => Date.now()) {
 
 test("live observation reports a confirmed query-restart refusal promptly for both Compact now and automatic compaction", async () => {
   for (const kind of ["manual", "automatic"] as const) {
-    let time = 1_000_000;
+    const time = 1_000_000;
     const obs = await realObserverFixture(() => time);
     try {
       const host = fixture([], undefined, false, [], {
@@ -1141,7 +1148,7 @@ test("a generation change without a matching refusal stays pending until the obs
 });
 
 test("stopping the plugin after dispatch preserves request.json so a query-restart refusal remains recoverable", async () => {
-  let time = 1_000_000;
+  const time = 1_000_000;
   const obs = await realObserverFixture(() => time);
   try {
     const host = fixture([], undefined, false, [], { observer: obs.native, now: () => time, timeoutMs: 120_000, pollMs: 1 });
@@ -1176,7 +1183,7 @@ test("stopping the plugin after dispatch preserves request.json so a query-resta
     };
     const recovered = await restarted.gateway.inspect!(stored);
     assert.equal(recovered?.status, "failed");
-    assert.match(recovered!.detail, /query restarted/i);
+    assert.match(recovered.detail, /query restarted/i);
     assert.equal(restarted.sendCount(), 0);
     restarted.stop();
   } finally { await obs.close(); }
@@ -1200,7 +1207,7 @@ test("recovery accepts a confirmed query-restart refusal within the deadline and
     });
     const recovered = await host.gateway.inspect!(operation);
     assert.equal(recovered?.status, "failed");
-    assert.match(recovered!.detail, /query restarted/i);
+    assert.match(recovered.detail, /query restarted/i);
 
     // Late receipt past the observation deadline is ignored.
     await obs.writeReceipt(native.id, {

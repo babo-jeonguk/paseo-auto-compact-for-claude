@@ -125,13 +125,13 @@ test("cleanup preserves same-activity protection across restart and allows a new
     assert.deepEqual((await f.disk.read()).disabled, ["a"]);
     // Paseo can advance the host timestamp for /compact itself.
     f.agent.revision = new Date(2000).toISOString();
-    const result = await s.compactNow("a", f.agent.revision!, "new-id");
+    const result = await s.compactNow("a", f.agent.revision, "new-id");
     assert.equal(result.code, "existing"); assert.equal(result.operationId, null);
     await s.observedTurn(f.agent); await s.tick(); assert.equal(f.sends, 0);
     s.stop(); s = f.make(); await s.ready;
-    assert.equal((await s.compactNow("a", f.agent.revision!, "another-id")).code, "existing");
+    assert.equal((await s.compactNow("a", f.agent.revision, "another-id")).code, "existing");
     f.agent.activityKey = "new-generation:1";
-    assert.equal((await s.compactNow("a", f.agent.revision!, "fresh-id")).code, "accepted");
+    assert.equal((await s.compactNow("a", f.agent.revision, "fresh-id")).code, "accepted");
     for (let i = 0; i < 100 && (await s.operation("fresh-id"))?.state !== "succeeded"; i++)
       await new Promise(resolve => setTimeout(resolve, 5));
     assert.equal((await s.operation("fresh-id"))?.state, "succeeded");

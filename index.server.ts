@@ -137,6 +137,8 @@ export default function contribute(server: PluginServerContext) {
     clearInterval(timer);
     scheduler.stop();
     host.stop();
-    for (const stop of stops) stop();
+    // A settings subscription may end asynchronously; report its failure
+    // like any other instead of leaving the rejection unhandled.
+    for (const stop of stops) void Promise.resolve(stop()).catch(report);
   };
 }

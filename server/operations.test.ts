@@ -173,7 +173,7 @@ test("faults before the dispatch marker are retried with persisted backoff until
   while (f.operation.state === "requested") { f.advance(30_500); await worker.reconcile(); }
   assert.equal(f.operation.state, "expired");
   assert.equal(f.operation.result?.code, "expired_before_dispatch");
-  assert.ok(f.operation.attempt! > 3, "the send deadline, not a count, bounds the retries");
+  assert.ok(f.operation.attempt > 3, "the send deadline, not a count, bounds the retries");
   assert.equal(f.sends, 0);
   assert.deepEqual(f.errors.map(String), ["Error: disconnected"], "only the fault that ended the request is reported");
   worker.stop();
@@ -249,7 +249,7 @@ test("a refusal ends the attempt without retry and records that nothing was sent
     await worker.reconcile();
     assert.equal(f.operation.state, "failed", reason);
     assert.equal(f.operation.result?.code, "failed_before_dispatch", reason);
-    assert.match(f.operation.result!.message, new RegExp(reason), reason);
+    assert.match(f.operation.result.message, new RegExp(reason), reason);
     assert.equal(f.operation.evidence?.dispatchStartedAt, undefined, reason);
     assert.equal(f.errors.length, 0, "a refusal is not reported as a fault");
   }
@@ -577,7 +577,7 @@ test("a confirmed query-restart refusal finishes as failed_after_dispatch after 
     await f.make().reconcile();
     assert.equal(f.operation.state, "failed", kind);
     assert.equal(f.operation.result?.code, "failed_after_dispatch", kind);
-    assert.match(f.operation.result!.message, /query restarted/i, kind);
+    assert.match(f.operation.result.message, /query restarted/i, kind);
     assert.equal(f.sends, 0, `${kind}: reconciliation must not send again`);
     assert.deepEqual(released, [`${f.operation.id}:failed`], kind);
   }

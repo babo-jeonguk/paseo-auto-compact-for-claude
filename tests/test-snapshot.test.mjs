@@ -46,7 +46,7 @@ test('snapshot keeps testing its recorded commit while the source advances, prop
     }).then(result => ({ result }), error => ({ error }));
     let started = false;
     for (let i = 0; i < 1000; i++) {
-      try { await readFile(ready); started = true; break; } catch {}
+      try { await readFile(ready); started = true; break; } catch { /* not written yet */ }
       await setTimeout(20);
     }
     assert(started, 'the snapshot starts its check');

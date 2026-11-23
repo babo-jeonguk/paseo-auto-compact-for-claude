@@ -42,7 +42,7 @@ const report = { startedAt: new Date().toISOString(), result: 'running', host: p
   model: 'synthetic-loopback; no paid model requests', root };
 const checks = [];
 const check = (name, fn) => checks.push({ name, run: fn });
-let fixture, model, proxy, emulator, stopped = false;
+let fixture, model, proxy, emulator;
 
 // ---- emulator and adb -------------------------------------------------------------------------
 const tool = (...path) => join(sdk, ...path);
@@ -77,7 +77,7 @@ async function stopEmulator() {
   if (!emulator) return;
   await adb(['emu', 'kill'], 30_000).catch(() => {});
   await waitFor(() => emulator.exitCode !== null || emulator.signalCode !== null, 'emulator exit', 30_000).catch(() => {});
-  try { process.kill(-emulator.pid, 'SIGKILL'); } catch {}
+  try { process.kill(-emulator.pid, 'SIGKILL'); } catch { /* already exited */ }
   emulator = undefined;
 }
 
@@ -272,13 +272,10 @@ try {
   console.error(report.error); process.exitCode = 1;
 } finally {
   report.requests = model?.count ?? 0;
-  if (!stopped) {
-    stopped = true;
-    try {
-      await stopEmulator(); await model?.close(); await fixture?.close();
-      if (proxy?.listening) await new Promise(done => proxy.close(done));
-    } catch (error) { report.cleanupError = String(error); report.result = 'failed'; process.exitCode = 1; }
-  }
+  try {
+    await stopEmulator(); await model?.close(); await fixture?.close();
+    if (proxy?.listening) await new Promise(done => proxy.close(done));
+  } catch (error) { report.cleanupError = String(error); report.result = 'failed'; process.exitCode = 1; }
   if (report.result === 'passed') {
     try { await fixture.remove(); delete report.root; }
     catch (error) { report.cleanupError = String(error); report.result = 'failed'; process.exitCode = 1; }

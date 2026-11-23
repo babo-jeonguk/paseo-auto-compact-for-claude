@@ -40,7 +40,7 @@ function fixture(env = {}, settings = {}) {
   const usage = { input_tokens: 100, cache_read_input_tokens: 100, cache_creation_input_tokens: 0 };
   const step = async (turnId = 'user-1') => {
     const generator = hooks.get('turn.step')($, { turnId }, async function* () { return { usage }; });
-    while (!(await generator.next()).done) {}
+    while (!(await generator.next()).done) { /* drain the step */ }
   };
   // Paseo's /compact runs as a command around Claude's compaction and hooks.
   const compact = (inner = async () => {}) => event('command.run', { command: 'compact', args: '' },
@@ -76,7 +76,7 @@ function fixture(env = {}, settings = {}) {
         }
         return { usage: reported };
       });
-      while (!(await generator.next()).done) {}
+      while (!(await generator.next()).done) { /* drain the step */ }
       await event('turn.complete', { turnId: 'user-1', isAborted: false, reason: 'answer' });
     },
   };

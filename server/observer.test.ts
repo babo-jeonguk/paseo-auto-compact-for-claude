@@ -75,7 +75,9 @@ test('the compatible pre-fix observer stays readable during rollout; unknown bui
       // v1.2.1
       '134e83d3751cca2f86c2ccda713162c7e739827df129e2020ab88a039c564e63',
       // main after #23 (query-restart refusal), installed by direct GitHub updates
-      '35dc721b4f7cd02d1618f04fb9b9f856513ba21d07dc6abcac291911d94e8509']) {
+      '35dc721b4f7cd02d1618f04fb9b9f856513ba21d07dc6abcac291911d94e8509',
+      // v1.2.2
+      '61b60834478e92325dc73fdb2b9235805997f990fe5ab8664bfef7ccc8f06d61']) {
       await writeFile(manifestPath, JSON.stringify({ ...f.manifest, build }));
       assert(await f.observer.read('a'));
       f.ledger.pendingInputs = 1; await f.save();
@@ -389,7 +391,7 @@ test('a confirmed query-restart refusal is accepted by both receipt and result; 
     await writeFile(path, JSON.stringify(validRefusal));
     const fromReceipt = await f.observer.receipt('a', operation);
     assert.equal(fromReceipt?.status, 'failed');
-    assert.match(fromReceipt!.detail, /query restarted/i);
+    assert.match(fromReceipt.detail, /query restarted/i);
     assert.equal(fromReceipt?.observedAt, 1_000_050);
 
     // The same rule applies to live ledger reads when the new generation writes compact.
@@ -403,7 +405,7 @@ test('a confirmed query-restart refusal is accepted by both receipt and result; 
     await f.save();
     const fromLedger = await f.observer.result('a', operation);
     assert.equal(fromLedger?.status, 'failed');
-    assert.match(fromLedger!.detail, /query restarted/i);
+    assert.match(fromLedger.detail, /query restarted/i);
 
     // Reject ambiguous, unrelated, generic cancellation, or foreign-generation completion records.
     const rejected: Array<[string, Record<string, unknown>]> = [

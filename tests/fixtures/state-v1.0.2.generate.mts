@@ -14,9 +14,8 @@ const agent = (id: string, n: number) => ({ agentId: id, title: id, workspace: "
   revision: new Date(time - n * 1000).toISOString(), tokens: 250_000, eligible: true, idle: true,
   sessionId: `native-${id}`, activityKey: `launch-${id}:generation-1:${n}` });
 const agents = new Map<string, ReturnType<typeof agent>>();
-let hang: Promise<never> | null = null;
 const outcomes = new Map<string, { status: "completed" | "failed" | "unknown"; detail: string }>();
-const run = async (id: string) => { if (id === "interrupted") return hang = new Promise<never>(() => {});
+const run = async (id: string) => { if (id === "interrupted") return new Promise<never>(() => {});
   return outcomes.get(id) ?? { status: "completed", detail: "Compaction completed in the same Claude session" }; };
 const gateway = { list: async () => [...agents.values()], refresh: async (id: string) => agents.get(id) ?? null,
   compact: (id: string) => run(id), automatic: (a: { agentId: string }) => run(a.agentId), readiness: async () => null };
