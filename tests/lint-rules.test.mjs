@@ -38,6 +38,7 @@ test('unit tests start no real timer with a delay', () => {
       "setTimeout(() => reject(new Error('stuck')), 1_000);",
       "const { setTimeout: sleep } = await import('node:timers/promises');",
       "await import('timers');",
+      'await import(`node:timers/promises`);',
       "import { setTimeout } from 'node:timers/promises';",
       "import { setInterval as every } from 'timers/promises';",
       "import { scheduler } from 'node:timers/promises';",
@@ -54,6 +55,8 @@ test('unit tests start no real timer with a delay', () => {
       'mock.timers.tick(5_000);',
       "import { setImmediate } from 'node:timers/promises';",
       "import { setImmediate } from 'node:timers';",
+      // A key built at run time is left to review: lint cannot tell what it names.
+      'globalThis[`setTimeout${suffix}`](fire, 50);',
     ]) passes(file, code);
   }
 });
