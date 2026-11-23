@@ -37,7 +37,7 @@ test('missing TTL uses a disclosed one-hour default; settings and actual transcr
     const path = join(dir, 'session.jsonl'), read = createCacheReader();
     const fallback = await read(request, path, 'session', now, now);
     assert.equal(fallback?.source, 'default'); assert.equal(fallback?.ttlMinutes, 60);
-    for (const delay of [50, 55]) assert(fallback!.deadline > now + delay * 60_000 + 30_000);
+    for (const delay of [50, 55]) assert(fallback.deadline > now + delay * 60_000 + 30_000);
     await writeFile(path, row(0, 10));
     const observed = await read(request, path, 'session', now, now);
     assert.equal(observed?.source, 'transcript'); assert.equal(observed?.ttlMinutes, 60);

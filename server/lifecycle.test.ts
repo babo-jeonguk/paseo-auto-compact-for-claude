@@ -35,7 +35,7 @@ function fixture(modern: boolean) {
       return register(this, "addHook", name, handler);
     } : undefined,
   };
-  const hooks = createLifecycleHooks(server as unknown as Parameters<typeof createLifecycleHooks>[0]);
+  const hooks = createLifecycleHooks(server);
   return { calls, server, hooks, invoke: (at: number, payload: unknown) => Reflect.apply(calls[at].handler, undefined, [payload, context]) };
 }
 
@@ -84,7 +84,7 @@ test("a new-hook rejection propagates without registering or executing a legacy 
 test("a new-hook registration failure is not retried through the legacy API", () => {
   const f = fixture(true), error = new Error("host rejected registration");
   f.server.addHook = () => { throw error; };
-  const hooks = createLifecycleHooks(f.server as unknown as Parameters<typeof createLifecycleHooks>[0]);
+  const hooks = createLifecycleHooks(f.server);
   assert.throws(() => hooks.on("agent.turn.before", () => {}), candidate => candidate === error);
   assert.deepEqual(f.calls, []);
 });
@@ -92,7 +92,7 @@ test("a new-hook registration failure is not retried through the legacy API", ()
 test("a non-function addHook property uses the legacy API and void open results stay void", async () => {
   const f = fixture(false);
   Object.assign(f.server, { addHook: "not a capability" });
-  const hooks = createLifecycleHooks(f.server as unknown as Parameters<typeof createLifecycleHooks>[0]);
+  const hooks = createLifecycleHooks(f.server);
   hooks.beforeSessionOpen(() => {});
   assert.equal(await f.invoke(0, { request }), undefined);
   assert.equal(f.calls[0].kind, "before");

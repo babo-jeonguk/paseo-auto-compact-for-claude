@@ -102,11 +102,11 @@ export async function startFixture({ root, plugin, cliPackage, appVersion, binar
           'daemon', 'stop', '--home', home, '--timeout', '30'],
         { env: environment, timeout: 40_000, windowsHide: true });
       } else {
-        try { process.kill(-pid, 'SIGKILL'); } catch {}
+        try { process.kill(-pid, 'SIGKILL'); } catch { /* already exited */ }
       }
       await waitFor(() => daemon.exitCode !== null || daemon.signalCode !== null,
         'test daemon restart shutdown', graceful ? 30_000 : 5000);
-      try { process.kill(-pid, 'SIGKILL'); } catch {}
+      try { process.kill(-pid, 'SIGKILL'); } catch { /* already exited */ }
       daemon = undefined;
       return;
     }
@@ -114,9 +114,9 @@ export async function startFixture({ root, plugin, cliPackage, appVersion, binar
       await promisify(execFile)(join(process.env.SystemRoot ?? 'C:\\Windows', 'System32/taskkill.exe'),
         ['/PID', String(pid), '/T', '/F'], { windowsHide: true, timeout: 15_000 }).catch(() => {});
     } else {
-      try { process.kill(-pid, 'SIGTERM'); } catch {}
+      try { process.kill(-pid, 'SIGTERM'); } catch { /* already exited */ }
       await waitFor(() => daemon.exitCode !== null || daemon.signalCode !== null, 'test daemon shutdown', 4000).catch(() => {});
-      try { process.kill(-pid, 'SIGKILL'); } catch {}
+      try { process.kill(-pid, 'SIGKILL'); } catch { /* already exited */ }
     }
     daemon = undefined;
   }

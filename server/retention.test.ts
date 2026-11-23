@@ -8,6 +8,7 @@ import { createScheduler } from "./scheduler";
 import { createStore } from "./store";
 import { DEFAULT_SETTINGS } from "../shared/settings";
 import type { Gateway, Observation, State, StoredOperation } from "./model";
+import { changes } from "../tests/support/changes";
 
 const now = HISTORY_RETENTION_MS + 1000;
 const operation = (id: string, state: StoredOperation["state"] = "succeeded", updatedAt = 1000): StoredOperation => ({
@@ -58,10 +59,16 @@ async function fixture() {
     tokens: 500_000, idle: true, eligible: true, sessionId: "native-a", activityKey: "generation:1" };
   const gateway: Gateway = { list: async (observe) => { observe(Promise.resolve(agent)); }, refresh: async () => agent,
     compact: async () => { sends++; return { status: "completed", detail: "completed" }; } };
+  // Background work is awaited by the state it commits, not by elapsed time.
+  const signal = changes();
+  let stored = state;
   const store = { read: disk.read, write: async (next: State) => {
     if (failCommit && !next.operations.some(op => op.id === "old")) throw new Error("disk full");
     await disk.write(next);
+    stored = structuredClone(next);
+    signal.changed();
   } };
+  const committed = (done: (state: State) => boolean) => signal.until(() => done(stored));
   const receipts: OperationReceipts = {
     remove: async (_agent, id) => {
       assert((await disk.read()).operations.some(op => op.id === id), "receipt must be removed before its record");
@@ -73,7 +80,7 @@ async function fixture() {
       sweeps++;
     },
   };
-  return { agent, disk, removed, errors,
+  return { agent, disk, removed, errors, committed,
     make: () => createScheduler({ store, gateway, receipts, now: () => time,
       settings: async () => ({ ...DEFAULT_SETTINGS, enabled: false }), onError: error => errors.push(error) }),
     get sends() { return sends; }, get sweeps() { return sweeps; },
@@ -117,25 +124,25 @@ test("offline ticks retry removal failures; successful sweeps run hourly and tol
   } finally { await f.close(); }
 });
 
-test("cleanup preserves same-activity protection across restart and allows a new native generation", async () => {
+test("cleanup preserves same-activity protection across restart and allows a new native generation", async (t) => {
   const f = await fixture();
-  try {
-    let s = f.make(); await s.ready;
-    assert.equal(await s.operation("old"), null);
-    assert.deepEqual((await f.disk.read()).disabled, ["a"]);
-    // Paseo can advance the host timestamp for /compact itself.
-    f.agent.revision = new Date(2000).toISOString();
-    const result = await s.compactNow("a", f.agent.revision!, "new-id");
-    assert.equal(result.code, "existing"); assert.equal(result.operationId, null);
-    await s.observedTurn(f.agent); await s.tick(); assert.equal(f.sends, 0);
-    s.stop(); s = f.make(); await s.ready;
-    assert.equal((await s.compactNow("a", f.agent.revision!, "another-id")).code, "existing");
-    f.agent.activityKey = "new-generation:1";
-    assert.equal((await s.compactNow("a", f.agent.revision!, "fresh-id")).code, "accepted");
-    for (let i = 0; i < 100 && (await s.operation("fresh-id"))?.state !== "succeeded"; i++)
-      await new Promise(resolve => setTimeout(resolve, 5));
-    assert.equal((await s.operation("fresh-id"))?.state, "succeeded");
-    assert.equal(f.sends, 1);
-    s.stop();
-  } finally { await f.close(); }
+  let s = f.make();
+  // Runs even if the test stops early, at a failed assertion or at the test
+  // runner's bound: the scheduler's timers stop before the folder is removed.
+  t.after(async () => { s.stop(); await f.close(); });
+  await s.ready;
+  assert.equal(await s.operation("old"), null);
+  assert.deepEqual((await f.disk.read()).disabled, ["a"]);
+  // Paseo can advance the host timestamp for /compact itself.
+  f.agent.revision = new Date(2000).toISOString();
+  const result = await s.compactNow("a", f.agent.revision, "new-id");
+  assert.equal(result.code, "existing"); assert.equal(result.operationId, null);
+  await s.observedTurn(f.agent); await s.tick(); assert.equal(f.sends, 0);
+  s.stop(); s = f.make(); await s.ready;
+  assert.equal((await s.compactNow("a", f.agent.revision, "another-id")).code, "existing");
+  f.agent.activityKey = "new-generation:1";
+  assert.equal((await s.compactNow("a", f.agent.revision, "fresh-id")).code, "accepted");
+  await f.committed(state => state.operations.some(op => op.id === "fresh-id" && op.state === "succeeded"));
+  assert.equal((await s.operation("fresh-id"))?.state, "succeeded");
+  assert.equal(f.sends, 1);
 });

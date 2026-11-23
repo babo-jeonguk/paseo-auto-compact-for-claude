@@ -25,6 +25,11 @@ export function createReporter(log: (message: string) => void, graceMs = REPORT_
       timer.unref?.();
       waiting.add(timer);
     },
+    // A failing step of cleanup itself, which can settle after dispose. The
+    // host having closed its API then is expected; anything else is a defect.
+    teardown(error: unknown) {
+      if (!hostUnavailable(error)) log(String(error));
+    },
     dispose() {
       disposed = true;
       for (const timer of waiting) clearTimeout(timer);

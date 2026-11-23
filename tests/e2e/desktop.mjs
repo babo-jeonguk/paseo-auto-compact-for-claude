@@ -39,7 +39,7 @@ const report = { startedAt: new Date().toISOString(), result: 'running', platfor
   model: 'synthetic-loopback; no paid model requests', root };
 const checks = [];
 const check = (name, fn) => checks.push({ name, run: fn });
-let fixture, model, proxy, appProxy, playwright, desktop, stopped = false;
+let fixture, model, proxy, appProxy, playwright, desktop;
 
 // ---- desktop app ----------------------------------------------------------------------------------
 const freePort = () => new Promise(done => { const s = createNetServer().listen(0, '127.0.0.1', () => {
@@ -53,9 +53,9 @@ async function killTree(pid) {
     await run(join(process.env.SystemRoot ?? 'C:\\Windows', 'System32/taskkill.exe'), ['/PID', String(pid), '/T', '/F'],
       { windowsHide: true, timeout: 15_000 }).catch(() => {});
   } else {
-    try { process.kill(-pid, 'SIGTERM'); } catch { try { process.kill(pid, 'SIGTERM'); } catch {} }
+    try { process.kill(-pid, 'SIGTERM'); } catch { try { process.kill(pid, 'SIGTERM'); } catch { /* already exited */ } }
     await waitFor(() => !alive(pid), 'process exit', 8_000).catch(() => {});
-    try { process.kill(-pid, 'SIGKILL'); } catch { try { process.kill(pid, 'SIGKILL'); } catch {} }
+    try { process.kill(-pid, 'SIGKILL'); } catch { try { process.kill(pid, 'SIGKILL'); } catch { /* already exited */ } }
   }
   await waitFor(() => !alive(pid), `process ${pid} exit`, 15_000).catch(() => {});
 }
@@ -301,13 +301,10 @@ try {
   console.error(report.error); process.exitCode = 1;
 } finally {
   report.requests = model?.count ?? 0;
-  if (!stopped) {
-    stopped = true;
-    try {
-      await model?.close(); await fixture?.close(); await desktop?.shutdown();
-      for (const server of [proxy, appProxy]) if (server?.listening) await new Promise(done => server.close(done));
-    } catch (error) { report.cleanupError = String(error); report.result = 'failed'; process.exitCode = 1; }
-  }
+  try {
+    await model?.close(); await fixture?.close(); await desktop?.shutdown();
+    for (const server of [proxy, appProxy]) if (server?.listening) await new Promise(done => server.close(done));
+  } catch (error) { report.cleanupError = String(error); report.result = 'failed'; process.exitCode = 1; }
   if (report.result === 'passed') {
     try { await fixture.remove(); delete report.root; }
     catch (error) { report.cleanupError = String(error); report.result = 'failed'; process.exitCode = 1; }

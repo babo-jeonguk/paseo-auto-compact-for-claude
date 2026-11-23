@@ -41,7 +41,7 @@ try {
  const blocked = await lifecycleFixture.rpc('now',{agentId:id, revision:beforeRow.revision, target:beforeRow.target, operationId});
  assert.equal(blocked.status, 'blocked'); assert.equal(blocked.operation, null);
  const timeline = await lifecycleFixture.timeline(id);
- let receipt = null; try { receipt = await lifecycleFixture.receipt(id, operationId); } catch {}
+ let receipt = null; try { receipt = await lifecycleFixture.receipt(id, operationId); } catch { /* no receipt is a valid outcome to report */ }
  const unchanged = await lifecycleFixture.ledger(id);
  console.log('reload refused', JSON.stringify({old,afterReload,unchanged,session,requestDelta:model.count-before,blocked,receipt,timeline}));
  assert.match(blocked.detail, /Session must resume after plugin reload; send a message before compacting/);

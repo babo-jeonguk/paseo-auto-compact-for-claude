@@ -42,6 +42,10 @@ const CHECKPOINT_INTERVAL_MS = 5_000;
 // is awaited: a 200-entry page on every 50 ms poll would load the host for
 // nothing, and a second is small next to the two-minute live observation.
 const HISTORY_REFETCH_INTERVAL_MS = 1_000;
+// Between checks for completion evidence after sending. A check reads the
+// observer's local files and remembered live events, so polling often costs
+// little and notices completion soon after Claude reports it.
+export const EVIDENCE_POLL_MS = 50;
 export function createGateway(options: {
   observer?: Observer; now?: () => number; timeoutMs?: number; pollMs?: number; dispatchTimeoutMs?: number; cleanupTimeoutMs?: number;
 } = {}) {
@@ -280,7 +284,7 @@ export function createGateway(options: {
           // next poll proves the command's turn and boundary again from history.
           if (losses === at) return { status: "completed", detail: "Compaction completed in the same Claude session" };
         }
-        await wait(new Promise(resolve => setTimeout(resolve, options.pollMs ?? 50)));
+        await wait(new Promise(resolve => setTimeout(resolve, options.pollMs ?? EVIDENCE_POLL_MS)));
       }
       return { status: "unknown", detail: "Compaction completion unconfirmed; no automatic retry" };
     } catch (error) {

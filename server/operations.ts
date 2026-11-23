@@ -4,7 +4,8 @@ import { finishedState, operationRowStatus, operationPending, type CompactOperat
 import { Refusal, readable, unchanged, type CompactOutcome, type Gateway, type State, type StateStore,
   type StoredOperation } from "./model";
 import type { Settings } from "../shared/settings";
-import { bounded, deadlineOf, INSPECT_TIMEOUT_MS, OBSERVATION_MS, readWithin } from "./deadline";
+import { bounded, deadlineOf, INSPECT_TIMEOUT_MS, OBSERVATION_MS, readWithin, systemTimers,
+  type Timers } from "./deadline";
 import { automaticBlock } from "./policy";
 
 export function inputFingerprint(agentId: string, revision: string, target?: CompactTarget) {
@@ -82,9 +83,11 @@ export function createOperationWorker(options: {
   gateway: Gateway;
   settings(): Promise<Settings | null>;
   now(): number;
+  timers?: Timers;
   onError(error: unknown): void;
 }) {
   const { store, update, gateway, settings, now, onError } = options;
+  const timers = options.timers ?? systemTimers;
   const owner = randomUUID();
   // Outcomes whose terminal write failed; they are written again, never re-earned.
   const outcomes = new Map<string, Ending>();
@@ -96,7 +99,7 @@ export function createOperationWorker(options: {
   const active = new Map<string, Promise<void>>();
   // One retry wake-up per operation: another conversation's fault cannot cancel
   // or delay this operation's retry.
-  const retries = new Map<string, ReturnType<typeof setTimeout>>();
+  const retries = new Map<string, unknown>();
   // Pending work this worker claimed and still holds.
   const held = (operation: StoredOperation | undefined): operation is StoredOperation =>
     !stopped && !!operation && operationPending(operation) && operation.owner === owner;
@@ -123,6 +126,19 @@ export function createOperationWorker(options: {
     if (finished && ending === "expired" && fault !== undefined) onError(fault);
     if (finished?.evidence?.native && gateway.release)
       await bounded(gateway.release(finished), INSPECT_TIMEOUT_MS).catch(() => {});
+  }
+  // One owner of this worker's retry wake-ups. A retry saved by a worker that
+  // has stopped since schedules nothing, and a newer wake-up replaces the old
+  // one so a conversation's retry is neither doubled nor delayed by another.
+  function armRetry(id: string, wait: number) {
+    if (stopped) return;
+    const previous = retries.get(id);
+    if (previous !== undefined) timers.clearTimeout(previous);
+    const timer = timers.setTimeout(() => {
+      retries.delete(id);
+      void reconcile(lastConnected).catch(onError);
+    }, wait);
+    retries.set(id, timer);
   }
   // Every reconcile scans all pending work: conversations run independently and
   // a second call must not start an operation already running. Callers wait only
@@ -259,20 +275,13 @@ export function createOperationWorker(options: {
         faults.set(id, error);
         if (next === "expired") return await finish(id, "expired");
         // This operation wakes itself for its retry; other conversations keep running.
-        const previous = retries.get(id);
-        if (previous) clearTimeout(previous);
-        const timer = setTimeout(() => {
-          retries.delete(id);
-          void reconcile(lastConnected).catch(onError);
-        }, next);
-        timer.unref?.();
-        retries.set(id, timer);
+        armRetry(id, next);
       } catch (writeError) { onError(writeError); }
     }
   }
   return { reconcile, stop() {
     stopped = true;
-    for (const timer of retries.values()) clearTimeout(timer);
+    for (const timer of retries.values()) timers.clearTimeout(timer);
     retries.clear();
   } };
 }

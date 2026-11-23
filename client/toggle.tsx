@@ -15,7 +15,7 @@ function isDark(color: string): boolean {
   const hex = /^#([0-9a-f]{6})$/i.exec(color)?.[1];
   if (!hex) return false;
   const [r, g, b] = [0, 2, 4].map((offset) => parseInt(hex.slice(offset, offset + 2), 16) / 255);
-  return 0.2126 * r! + 0.7152 * g! + 0.0722 * b! < 0.5;
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b < 0.5;
 }
 
 function useReducedMotion(): boolean {

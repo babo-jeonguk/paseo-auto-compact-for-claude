@@ -42,7 +42,7 @@ async function fetchTags(): Promise<DistTags> {
   } finally {
     clearTimeout(timer);
   }
-  const tag = (name: string) => (typeof body[name] === "string" ? (body[name] as string) : undefined);
+  const tag = (name: string) => (typeof body[name] === "string" ? body[name] : undefined);
   return { latest: tag("latest"), beta: tag("beta") };
 }
 

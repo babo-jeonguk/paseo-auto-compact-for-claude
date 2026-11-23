@@ -27,6 +27,23 @@ export const LIVE_OBSERVATION_MS = 120_000;
 // Releasing the native request and the subscription after a call.
 export const CLEANUP_TIMEOUT_MS = 1_000;
 
+// Timers the scheduler and operation worker schedule through. Handles stay
+// opaque so a caller can supply a fake implementation.
+export type Timers = {
+  setTimeout(callback: () => void, ms: number): unknown;
+  clearTimeout(handle: unknown): void;
+};
+
+// The system default unrefs its timers so a pending wake-up never keeps the process alive.
+export const systemTimers: Timers = {
+  setTimeout(callback, milliseconds) {
+    const timer = setTimeout(callback, milliseconds);
+    timer.unref?.();
+    return timer;
+  },
+  clearTimeout(handle) { clearTimeout(handle as ReturnType<typeof setTimeout>); },
+};
+
 // The deadline that applies to the operation's current phase.
 export const deadlineOf = (operation: Pick<StoredOperation, "sendBy" | "evidence">) =>
   operation.evidence?.dispatchStartedAt !== undefined

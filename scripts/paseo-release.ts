@@ -51,11 +51,11 @@ export function compareVersions(left: string, right: string): number {
   const a = parseVersion(left);
   const b = parseVersion(right);
   for (let index = 0; index < 3; index += 1) {
-    if (a.core[index] !== b.core[index]) return a.core[index]! > b.core[index]! ? 1 : -1;
+    if (a.core[index] !== b.core[index]) return a.core[index] > b.core[index] ? 1 : -1;
   }
   if (!a.pre.length || !b.pre.length) return a.pre.length === b.pre.length ? 0 : a.pre.length ? -1 : 1;
   for (let index = 0; index < Math.min(a.pre.length, b.pre.length); index += 1) {
-    const order = compareIdentifiers(a.pre[index]!, b.pre[index]!);
+    const order = compareIdentifiers(a.pre[index], b.pre[index]);
     if (order) return order;
   }
   return Math.sign(a.pre.length - b.pre.length);
@@ -109,7 +109,7 @@ export function readIssue(number: number, texts: string[]): WatchIssue | null {
   for (const text of texts) {
     for (const match of text.matchAll(MARKER)) {
       line ??= match[1];
-      versions.push(match[2]!);
+      versions.push(match[2]);
     }
   }
   return line ? { number, line, versions } : null;

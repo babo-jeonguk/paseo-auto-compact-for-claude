@@ -88,7 +88,7 @@ test("an issue is read back from the markers its own posts carry", () => {
   assert.match(body, /test:simulation:0\.17/);
   assert.match(issueTitle("0.17"), /0\.17/);
   const comments = [commentBody("0.17.0-beta.2", owner), "Looks fine on my side.", commentBody("0.17.0", undefined)];
-  assert.doesNotMatch(comments[2]!, /@/);
+  assert.doesNotMatch(comments[2], /@/);
   assert.deepEqual(readIssue(41, [body, ...comments]), {
     number: 41,
     line: "0.17",

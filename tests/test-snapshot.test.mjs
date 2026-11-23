@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { promisify } from 'node:util';
 import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { setTimeout } from 'node:timers/promises';
+
+const STARTED = 'snapshot check started';
 
 test('snapshot keeps testing its recorded commit while the source advances, propagates failure and removes its worktree', async () => {
   const root = await mkdtemp(join(tmpdir(), 'compact-snapshot-test-'));
@@ -25,7 +27,7 @@ test('snapshot keeps testing its recorded commit while the source advances, prop
     await writeFile(join(repo, 'check.mjs'), `
       import { readFile, writeFile, access } from 'node:fs/promises';
       import { setTimeout } from 'node:timers/promises';
-      await writeFile(process.env.SNAPSHOT_READY, 'ready');
+      console.log('${STARTED}');
       let ready = false;
       for (let i = 0; i < 1000; i++) {
         try { await access(process.env.SNAPSHOT_CONTINUE); ready = true; break; } catch {}
@@ -39,23 +41,31 @@ test('snapshot keeps testing its recorded commit while the source advances, prop
     await git('add', '.');
     await git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', '-c', 'commit.gpgsign=false', 'commit', '-m', 'initial');
     const revision = (await git('rev-parse', 'HEAD')).stdout.trim();
-    const ready = join(root, 'ready'), proceed = join(root, 'continue');
-    running = promisify(execFile)(process.execPath, ['scripts/test-snapshot.mjs'], {
-      cwd: repo, windowsHide: true, timeout: 40_000,
-      env: { ...process.env, SNAPSHOT_READY: ready, SNAPSHOT_CONTINUE: proceed },
-    }).then(result => ({ result }), error => ({ error }));
-    let started = false;
-    for (let i = 0; i < 1000; i++) {
-      try { await readFile(ready); started = true; break; } catch {}
-      await setTimeout(20);
-    }
-    assert(started, 'the snapshot starts its check');
+    const proceed = join(root, 'continue');
+    const child = spawn(process.execPath, ['scripts/test-snapshot.mjs'], {
+      cwd: repo, windowsHide: true, timeout: 40_000, stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, SNAPSHOT_CONTINUE: proceed },
+    });
+    // Rejects on a spawn error as well as resolving on exit.
+    running = once(child, 'exit');
+    running.catch(() => {}); // awaited below and in finally
+    // The check prints its start through the runner, which inherits its output.
+    let output = '';
+    const printed = new Promise(resolve => {
+      for (const stream of [child.stdout, child.stderr]) stream.on('data', chunk => {
+        output += chunk;
+        if (output.includes(STARTED)) resolve();
+      });
+    });
+    await Promise.race([printed, running.then(([code]) => {
+      throw new Error(`the snapshot exited ${code} before its check started:\n${output}`);
+    })]);
     await writeFile(join(repo, 'value'), 'after');
     await git('add', 'value');
     await git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', '-c', 'commit.gpgsign=false', 'commit', '-m', 'advance original');
     await writeFile(proceed, 'continue');
-    const { error } = await running;
-    assert.equal(error?.code, 1, 'the wrapper must fail when a snapshot check fails');
+    const [code] = await running;
+    assert.equal(code, 1, `the wrapper must fail when a snapshot check fails:\n${output}`);
     const reports = join(repo, 'test-results/snapshots');
     const [directory] = await readdir(reports);
     const report = JSON.parse(await readFile(join(reports, directory, 'snapshot.json'), 'utf8'));
@@ -67,7 +77,7 @@ test('snapshot keeps testing its recorded commit while the source advances, prop
     assert.equal(await readFile(join(repo, 'node_modules/keep'), 'utf8'), 'shared dependencies');
   } finally {
     await writeFile(join(root, 'continue'), 'cleanup').catch(() => {});
-    await running;
+    await running?.catch(() => {}); // a spawn error has already failed the test
     await rm(root, { recursive: true, force: true });
   }
 });

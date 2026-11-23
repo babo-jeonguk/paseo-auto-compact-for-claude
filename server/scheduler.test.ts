@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
-import { mock, test } from "node:test";
+import { test } from "node:test";
 import {
   DEFAULT_SETTINGS,
   SettingsSchema,
   type Settings,
 } from "../shared/settings";
-import { createScheduler } from "./scheduler";
+import { createScheduler, FULL_SCAN_INTERVAL_MS, TICK_INTERVAL_MS } from "./scheduler";
 import { DELIVERY_WINDOW_MS } from "./policy";
+import { changes } from "../tests/support/changes";
+import { fakeTimers } from "../tests/support/timers";
 import type { Blocked } from "../shared/rpc";
 import { Refusal, type Gateway, type Observation, type State, type StateStore } from "./model";
 
@@ -25,6 +27,10 @@ function fixture(automatic = true) {
     reset() { this.reads = 0; this.writes = 0; this.lists = 0; this.refreshes = []; },
   };
   let listGate: Promise<void> | null = null;
+  // Stored states, sends, reads and armed timers wake tests waiting for them.
+  const signal = changes();
+  // The scheduler's and its worker's timers run only when a test moves them on.
+  const timers = fakeTimers(signal.changed);
   const agents: Observation[] = [
     {
       agentId: "a",
@@ -46,16 +52,19 @@ function fixture(automatic = true) {
     write: async (next) => {
       counts.writes++;
       state = structuredClone(next);
+      signal.changed();
     },
   };
   const compact: Gateway["compact"] = async (agentId) => {
     calls++;
     sent.push(agentId);
+    signal.changed();
     await compactHolds.get(agentId)?.();
     return { status: "completed", detail: "same session, completed boundary" };
   };
   const refresh: Gateway["refresh"] = async (id) => {
     counts.refreshes.push(id);
+    signal.changed();
     await refreshHolds.get(id)?.();
     return structuredClone(agents.find((a) => a.agentId === id) ?? null);
   };
@@ -81,6 +90,7 @@ function fixture(automatic = true) {
       gateway,
       settings: async () => config,
       now: () => time,
+      timers,
     });
   const addAgent = (id = "b") => {
     const agent = { ...agents[0], agentId: id, title: `Session ${id}`, sessionId: `native-${id}` };
@@ -104,6 +114,9 @@ function fixture(automatic = true) {
       listedHolds.set(agentId, hold);
     },
     counts,
+    // Waits until the condition holds after a stored state, send or read.
+    until: signal.until,
+    timers,
     // Hold agent listings (not refreshes) until released.
     holdList() {
       let release!: () => void;
@@ -140,29 +153,11 @@ async function waitForStatus(f: ReturnType<typeof fixture>, status: State["jobs"
   await waitForAgentStatus(f, agentId, status);
 }
 
-async function waitForAgentStatus(f: ReturnType<typeof fixture>, agentId: string,
+function waitForAgentStatus(f: ReturnType<typeof fixture>, agentId: string,
   status: State["jobs"][number]["status"]) {
-  for (let attempt = 0; attempt < 100; attempt++) {
-    if (f.state.jobs.find((job) => job.agentId === agentId)?.status === status) return;
-    await new Promise<void>((resolve) => setImmediate(resolve));
-  }
-  assert.fail(`Timed out waiting for ${agentId} ${status}; current status is ${
-    f.state.jobs.find((job) => job.agentId === agentId)?.status}`);
+  return f.until(() => f.state.jobs.find((job) => job.agentId === agentId)?.status === status);
 }
 
-// Resolve to null if work is still pending after ms; the test then fails on the
-// missing progress instead of hanging on a queue that should not be held.
-async function within<T>(work: Promise<T>, ms = 250): Promise<T | null> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<null>((resolve) => {
-    timer = setTimeout(() => resolve(null), ms);
-  });
-  try {
-    return await Promise.race([work, timeout]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
 
 test("defaults remain 200,000 tokens and 55 minutes; invalid settings rejected", () => {
   assert.equal(DEFAULT_SETTINGS.threshold, 200_000);
@@ -334,7 +329,7 @@ test("undo skip preserves the original time and executes only at that time", asy
   assert.equal(skipped.dueAt, null);
   assert.equal(skipped.undoSkip?.dueAt, original);
   assert.equal(skipped.enabled, true);
-  assert.equal(await s.undoSkip("a", skipped.revision!, skipped.undoSkip!.id), true);
+  assert.equal(await s.undoSkip("a", skipped.revision!, skipped.undoSkip.id), true);
   assert.equal((await s.session("a"))!.dueAt, original);
   assert.equal((await s.session("a"))!.undoSkip, null);
   assert.equal(f.calls, 0);
@@ -578,8 +573,7 @@ test("ambiguous in-flight restart and failed compact never retry automatically",
   };
   f.advance(55 * 60_000);
   void s.tick();
-  while (f.state.operations[0]?.evidence?.dispatchStartedAt === undefined)
-    await new Promise<void>(resolve => setImmediate(resolve));
+  await f.until(() => f.state.operations[0]?.evidence?.dispatchStartedAt !== undefined);
   s.stop();
   s = f.make();
   await s.ready;
@@ -725,14 +719,14 @@ test("an earlier intake cannot use a stale read after a newer request is saved",
   const first = s.compactNow("a", revision, "request-a");
   await start;
   const secondRequest = s.compactNow("a", revision, "request-b");
-  const second = await within(secondRequest);
+  const secondResult = await secondRequest;
   release();
-  const secondResult = second ?? await secondRequest;
   const firstResult = await first;
   assert.equal(secondResult.code, "accepted");
   assert.equal(firstResult.code, "existing");
   assert.equal(firstResult.operationId, "request-b");
   assert.equal(f.state.operations.length, 1);
+  await waitForStatus(f, "completed"); // the accepted request is sent after it answers
   assert.deepEqual(f.sent, ["a"]);
 });
 
@@ -755,14 +749,14 @@ test("concurrent duplicate submissions return one operation and send once", asyn
   const first = s.compactNow("a", revision, "request-a");
   await start;
   const secondRequest = s.compactNow("a", revision, "request-a");
-  const second = await within(secondRequest);
+  const secondResult = await secondRequest;
   release();
-  const secondResult = second ?? await secondRequest;
   const firstResult = await first;
   assert.equal(secondResult.code, "accepted");
   assert.equal(firstResult.code, "existing");
   assert.equal(firstResult.operationId, secondResult.operationId);
   assert.equal(f.state.operations.length, 1);
+  await waitForStatus(f, "completed"); // the accepted request is sent after it answers
   assert.deepEqual(f.sent, ["a"]);
 });
 
@@ -804,10 +798,9 @@ test("a slow host read for one conversation does not hold up other conversations
     s.operation("missing"),
     s.compactNow("b", f.agents[1].revision!),
   ]);
-  const early = await within(work.then(() => true));
-  release();
+  // Resolves while a's host read is held.
   const [session, changed, missing, compact] = await work;
-  assert.equal(early, true, "other conversations resolve while a's host read is held");
+  release();
   assert.equal(session?.agentId, "b");
   assert.equal(changed, true);
   assert.equal(missing, null);
@@ -815,6 +808,11 @@ test("a slow host read for one conversation does not hold up other conversations
   await waitForAgentStatus(f, "b", "completed");
   assert.equal(f.sent.filter((agentId) => agentId === "b").length, 1);
   await pending;
+});
+
+test("the periodic pass runs every ten seconds and the full scan once a minute", () => {
+  assert.equal(TICK_INTERVAL_MS, 10_000);
+  assert.equal(FULL_SCAN_INTERVAL_MS, 60_000);
 });
 
 test("Compact now acknowledges a slow backend before the plugin RPC deadline", async () => {
@@ -828,16 +826,11 @@ test("Compact now acknowledges a slow backend before the plugin RPC deadline", a
   const scheduler = f.make();
   await scheduler.ready;
 
-  const request = scheduler.compactNow("a", f.agents[0].revision!);
-  const first = await Promise.race([
-    request,
-    new Promise<"rpc-timeout">((resolve) => setTimeout(() => resolve("rpc-timeout"), 10)),
-  ]);
+  // The backend stays held until the request has answered.
+  const first = await scheduler.compactNow("a", f.agents[0].revision!);
   release();
   await waitForStatus(f, "completed");
 
-  if (first === "rpc-timeout")
-    assert.fail("the RPC waited for compaction instead of acknowledging the persisted running job");
   assert.equal(first.status, "running");
   assert(first.operationId);
   assert.match(first.operationId, /^[0-9a-f-]{36}$/);
@@ -1010,16 +1003,19 @@ test("lost acknowledgement retries return the same operation before live eligibi
   const f = fixture(), s = f.make();
   await s.ready;
   let release!: () => void;
+  // Resolves when the code under test reaches the held step.
+  let reached!: () => void;
+  const reaching = new Promise<void>(resolve => { reached = resolve; });
   let sends = 0;
   f.gateway.compact = async () => {
     sends++;
-    await new Promise<void>(resolve => { release = resolve; });
+    await new Promise<void>(resolve => { release = resolve; reached(); });
     return { status: "completed", detail: "Completed" };
   };
   const revision = f.agents[0].revision!;
   const target = { sessionId: "native-a", activityKey: null };
   const accepted = await s.compactNow("a", revision, "request-a", target);
-  while (!release) await new Promise<void>(resolve => setImmediate(resolve));
+  await reaching;
   f.agents[0].idle = false;
   f.config = null;
   f.gateway.refresh = async () => { throw new Error("duplicate must not refresh"); };
@@ -1067,12 +1063,15 @@ test("new requests reject stale native identity even when host revision is uncha
 test("operation completion survives reservation replacement and remains queryable without the agent", async () => {
   const f = fixture(), s = f.make(); await s.ready;
   let release!: () => void;
+  // Resolves when the code under test reaches the held step.
+  let reached!: () => void;
+  const reaching = new Promise<void>(resolve => { reached = resolve; });
   f.gateway.compact = async () => {
-    await new Promise<void>(resolve => { release = resolve; });
+    await new Promise<void>(resolve => { release = resolve; reached(); });
     return { status: "completed", detail: "Completed" };
   };
   await s.compactNow("a", f.agents[0].revision!, "request-a");
-  while (!release) await new Promise<void>(resolve => setImmediate(resolve));
+  await reaching;
   f.advance(1000);
   f.agents[0].revision = new Date(f.time).toISOString();
   await s.observedTurn(f.agents[0]);
@@ -1080,8 +1079,7 @@ test("operation completion survives reservation replacement and remains queryabl
   assert.equal((await s.session("a"))?.activeOperation?.id, "request-a");
   assert.equal((await s.session("a"))?.status, "running");
   release();
-  for (let i = 0; i < 100 && (await s.operation("request-a"))?.state === "dispatching"; i++)
-    await new Promise<void>(resolve => setImmediate(resolve));
+  await f.until(() => f.state.operations.find((op) => op.id === "request-a")?.state !== "dispatching");
   assert.equal((await s.operation("request-a"))?.state, "succeeded");
   assert.equal(f.state.jobs[0].status, "scheduled");
   assert.equal((await s.session("a"))?.latestOperation?.id, "request-a");
@@ -1106,14 +1104,17 @@ test("failed acceptance persistence never sends and the same submission can be r
 test("restart observes a dispatched operation and an old worker cannot overwrite recovery", async () => {
   const f = fixture(), first = f.make(); await first.ready;
   let release!: () => void;
+  // Resolves when the code under test reaches the held step.
+  let reached!: () => void;
+  const reaching = new Promise<void>(resolve => { reached = resolve; });
   f.gateway.compact = async (_id, _agent, execution) => {
     await execution!.checkpoint({ dispatchStartedAt: f.time });
-    await new Promise<void>(resolve => { release = resolve; });
+    await new Promise<void>(resolve => { release = resolve; reached(); });
     return { status: "completed", detail: "Late completion" };
   };
   const revision = f.agents[0].revision!;
   await first.compactNow("a", revision, "request-a");
-  while (!release) await new Promise<void>(resolve => setImmediate(resolve));
+  await reaching;
   first.stop();
   const second = f.make(); await second.ready;
   assert.equal((await second.compactNow("a", revision, "request-a")).operation?.state, "observing");
@@ -1187,13 +1188,16 @@ test("automatic dispatch never repeats an activity, even one whose attempt sent 
 test("every write derives the jobs' attempt fields from their operations", async () => {
   const f = fixture(), s = f.make(); await s.ready;
   let release!: () => void;
+  // Resolves when the code under test reaches the held step.
+  let reached!: () => void;
+  const reaching = new Promise<void>(resolve => { reached = resolve; });
   f.gateway.compact = async (_id, _agent, execution) => {
     await execution!.checkpoint({ dispatchStartedAt: f.time });
-    await new Promise<void>(resolve => { release = resolve; });
+    await new Promise<void>(resolve => { release = resolve; reached(); });
     return { status: "completed", detail: "Completed" };
   };
   await s.compactNow("a", f.agents[0].revision!, "request-a");
-  while (!release) await new Promise<void>(resolve => setImmediate(resolve));
+  await reaching;
   assert.equal(f.state.jobs[0].status, "running");
   assert.equal(f.state.jobs[0].attemptedAt, f.state.operations[0].createdAt);
   release();
@@ -1229,13 +1233,16 @@ test("a Compact now request arriving during a worker pass starts without waiting
   // A pass already in progress read the state just before the request was saved.
   const read = f.store.read;
   let release!: () => void, gated = false;
+  // Resolves when the code under test reaches the held step.
+  let reached!: () => void;
+  const reaching = new Promise<void>(resolve => { reached = resolve; });
   f.store.read = async () => {
     const value = await read();
-    if (!gated) { gated = true; await new Promise<void>(resolve => { release = resolve; }); }
+    if (!gated) { gated = true; await new Promise<void>(resolve => { release = resolve; reached(); }); }
     return value;
   };
   const pass = s.reconcile();
-  while (!release) await new Promise<void>(resolve => setImmediate(resolve));
+  await reaching;
   assert.equal((await s.compactNow("a", f.agents[0].revision!, "request-a")).code, "accepted");
   release();
   await pass;
@@ -1262,9 +1269,12 @@ test("a scheduler stopped mid-request cannot put back state a newer instance rep
   const f = fixture(), first = f.make(); await first.ready;
   const refresh = f.gateway.refresh;
   let release!: () => void;
-  f.gateway.refresh = async id => { await new Promise<void>(resolve => { release = resolve; }); return refresh(id); };
+  // Resolves when the code under test reaches the held step.
+  let reached!: () => void;
+  const reaching = new Promise<void>(resolve => { reached = resolve; });
+  f.gateway.refresh = async id => { await new Promise<void>(resolve => { release = resolve; reached(); }); return refresh(id); };
   const stale = first.compactNow("a", f.agents[0].revision!, "request-old");
-  while (!release) await new Promise<void>(resolve => setImmediate(resolve));
+  await reaching;
   first.stop();
   f.gateway.refresh = refresh;
   const second = f.make(); await second.ready;
@@ -1277,16 +1287,15 @@ test("a scheduler stopped mid-request cannot put back state a newer instance rep
 test("a Compact now that cannot be prepared ends within seconds, unsent and retryable", async () => {
   const f = fixture(), s = f.make(); await s.ready;
   const compact = f.gateway.compact;
-  let attempts = 0;
-  f.gateway.compact = async () => { attempts++; throw new Error("observer preparation timed out"); };
+  f.gateway.compact = async () => { throw new Error("observer preparation timed out"); };
   const revision = f.agents[0].revision!;
   assert.equal((await s.compactNow("a", revision, "request-a")).code, "accepted");
-  for (let i = 0; i < 100 && attempts === 0; i++) await new Promise<void>(resolve => setImmediate(resolve));
+  // The failed attempt sets its own retry, due before the 10-second send deadline.
+  await f.until(() => f.timers.pendingWithin(10_000) > 0);
+  // Past the deadline, the retry's pass expires the request instead of sending it.
   f.advance(10_000);
-  for (let i = 0; i < 100 && (await s.operation("request-a"))?.state !== "expired"; i++) {
-    await s.reconcile();
-    await new Promise<void>(resolve => setImmediate(resolve));
-  }
+  await f.timers.tick(10_000);
+  await f.until(() => f.state.operations[0]?.state === "expired");
   const operation = await s.operation("request-a");
   assert.equal(operation?.state, "expired");
   assert.equal(operation?.result?.code, "expired_before_dispatch");
@@ -1426,7 +1435,7 @@ test("periodic observation also watches a conversation with a pending operation"
   // The worker may read b too; nothing else is read.
   assert.deepEqual([...new Set(f.counts.refreshes)], ["b"]);
   release();
-  for (let attempt = 0; attempt < 100 && f.state.operations[0]?.state !== "succeeded"; attempt++) await settle();
+  await f.until(() => f.state.operations[0]?.state === "succeeded");
   assert.equal(f.state.operations[0]?.state, "succeeded");
 });
 
@@ -1447,7 +1456,7 @@ test("over a minute of ten-second passes with one reservation held, the director
     "each attention pass reads only the conversation needing attention");
 });
 
-test("an attention pass applies one conversation's newer reply although another's read times out", async () => {
+test("an attention pass applies one conversation's newer reply although another's read times out", async (t) => {
   const f = fixture();
   f.agents.splice(0, 1, nativeAgent(f, "a"), nativeAgent(f, "b"));
   const s = f.make();
@@ -1460,11 +1469,11 @@ test("an attention pass applies one conversation's newer reply although another'
   // b replied again while both still hold a reservation.
   f.advance(10_000);
   f.agents[1] = nativeAgent(f, "b", "2");
-  mock.timers.enable({ apis: ["setTimeout"] });
+  t.mock.timers.enable({ apis: ["setTimeout"] });
   try {
     const pass = s.observe({ kind: "periodic" });
     await settle();
-    mock.timers.tick(5_000);
+    t.mock.timers.tick(5_000);
     await assert.rejects(pass, "a's timeout is still reported");
     assert.equal(f.state.jobs.find(job => job.agentId === "b")?.activityKey, "launch:b:2",
       "b's newer reply is applied in the same pass");
@@ -1480,11 +1489,10 @@ test("an attention pass applies one conversation's newer reply although another'
     assert.deepEqual(f.counts.refreshes.filter(id => id === "b"), ["b", "b"]);
   } finally {
     releaseA?.();
-    mock.timers.reset();
   }
 });
 
-test("an attention read that never ends stops blocking observation after a minute", async () => {
+test("an attention read that never ends stops blocking observation after a minute", async (t) => {
   const f = fixture();
   f.agents.splice(0, 1, nativeAgent(f, "a"));
   const s = f.make();
@@ -1492,36 +1500,32 @@ test("an attention read that never ends stops blocking observation after a minut
   await s.observe({ kind: "periodic" });
   f.holdRefresh("a", () => new Promise<void>(() => {}));
   f.advance(10_000);
-  mock.timers.enable({ apis: ["setTimeout"] });
-  try {
-    const pass = s.observe({ kind: "periodic" });
-    await settle();
-    mock.timers.tick(5_000);
-    await assert.rejects(pass);
-    f.addAgent("b");
-    const next = s.observe({ kind: "agent", agentId: "b" });
-    await settle();
-    assert.deepEqual(f.counts.refreshes.filter(id => id === "b"), [], "held while a's read runs");
-    mock.timers.tick(60_000);
-    await next;
-    assert.deepEqual(f.counts.refreshes.filter(id => id === "b"), ["b"], "observation resumes instead of stalling for good");
-  } finally {
-    mock.timers.reset();
-  }
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const pass = s.observe({ kind: "periodic" });
+  await settle();
+  t.mock.timers.tick(5_000);
+  await assert.rejects(pass);
+  f.addAgent("b");
+  const next = s.observe({ kind: "agent", agentId: "b" });
+  await settle();
+  assert.deepEqual(f.counts.refreshes.filter(id => id === "b"), [], "held while a's read runs");
+  await f.timers.tick(60_000); // the scheduler's single-flight bound
+  await next;
+  assert.deepEqual(f.counts.refreshes.filter(id => id === "b"), ["b"], "observation resumes instead of stalling for good");
 });
 
-test("a full scan reserves one listed conversation's finished reply although another's observation times out", async () => {
+test("a full scan reserves one listed conversation's finished reply although another's observation times out", async (t) => {
   const f = fixture();
   f.agents.splice(0, 1, nativeAgent(f, "a"), nativeAgent(f, "b"));
   let releaseA!: () => void;
   f.holdListed("a", () => new Promise<void>(resolve => { releaseA = resolve; }));
   const s = f.make();
   await s.ready;
-  mock.timers.enable({ apis: ["setTimeout"] });
+  t.mock.timers.enable({ apis: ["setTimeout"] });
   try {
     const scan = s.observe({ kind: "full" });
     await settle();
-    mock.timers.tick(5_000);
+    t.mock.timers.tick(5_000);
     await assert.rejects(scan, "a's timeout is still reported");
     assert.deepEqual(reserved(f), ["b"], "b's reservation is created by the scan");
     // a's observation is not cancelled: the next observation waits for it.
@@ -1533,7 +1537,6 @@ test("a full scan reserves one listed conversation's finished reply although ano
     assert.deepEqual(f.counts.refreshes, ["b"]);
   } finally {
     releaseA?.();
-    mock.timers.reset();
   }
 });
 
@@ -1693,40 +1696,36 @@ test("a scan read before a session's new generation cannot replace its skipped r
   assert.equal(f.calls, 0, "a skipped reply is never compacted");
 });
 
-test("a scan that times out keeps observation single-flight until its listing actually ends", async () => {
+test("a scan that times out keeps observation single-flight until its listing actually ends", async (t) => {
   const f = fixture();
   const s = f.make();
   await s.ready;
-  mock.timers.enable({ apis: ["setTimeout"] });
-  try {
-    const release = f.holdList();
-    const first = s.observe({ kind: "full" });
-    await settle();
-    mock.timers.tick(5_000);
-    await assert.rejects(first);
-    const second = s.observe({ kind: "full" });
-    await settle();
-    assert.equal(f.counts.lists, 1, "no second listing while the first is still running");
-    release();
-    await second;
-    assert.equal(f.counts.lists, 2, "the queued scan runs once the listing ends");
-  } finally {
-    mock.timers.reset();
-  }
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const release = f.holdList();
+  const first = s.observe({ kind: "full" });
+  await settle();
+  t.mock.timers.tick(5_000);
+  await assert.rejects(first);
+  const second = s.observe({ kind: "full" });
+  await settle();
+  assert.equal(f.counts.lists, 1, "no second listing while the first is still running");
+  release();
+  await second;
+  assert.equal(f.counts.lists, 2, "the queued scan runs once the listing ends");
 });
 
-test("a listing that never ends stops blocking observation after a minute", async () => {
+test("a listing that never ends stops blocking observation after a minute", async (t) => {
   const f = fixture();
   const s = f.make();
   await s.ready;
-  mock.timers.enable({ apis: ["setTimeout"] });
+  t.mock.timers.enable({ apis: ["setTimeout"] });
   const release = f.holdList();
   try {
     const first = s.observe({ kind: "full" });
     await settle();
-    mock.timers.tick(5_000);
+    t.mock.timers.tick(5_000);
     await assert.rejects(first);
-    mock.timers.tick(60_000);
+    await f.timers.tick(60_000); // the scheduler's single-flight bound
     await settle();
     const second = s.observe({ kind: "agent", agentId: "a" });
     await settle();
@@ -1734,7 +1733,6 @@ test("a listing that never ends stops blocking observation after a minute", asyn
     await second;
   } finally {
     release();
-    mock.timers.reset();
   }
 });
 
@@ -1784,8 +1782,7 @@ test("two conversations due in the same tick are both reserved and sent independ
   const tick = s.tick();
   await start;
   try {
-    for (let i = 0; i < 100 && !f.sent.includes("b"); i++)
-      await new Promise<void>((resolve) => setImmediate(resolve));
+    await f.until(() => f.sent.includes("b"));
     assert.deepEqual([...f.sent].sort(), ["a", "b"], "both are sent in that tick");
     assert.equal(f.state.operations.length, 2, "both are reserved in that tick");
     assert.deepEqual(
@@ -1819,9 +1816,8 @@ test("a conversation compacting does not stop a later tick from reserving anothe
   await s.observedTurn(f.agents[1]);
   f.advance(55 * 60_000);
   const second = s.tick();
-  const settled = await within(second);
+  await second; // without waiting for a
   try {
-    assert.notEqual(settled, null, "the second tick resolves without waiting for a");
     assert.deepEqual(f.sent, ["a", "b"]);
     assert.equal(f.state.jobs.find((job) => job.agentId === "b")?.status, "completed");
     assert.equal(f.state.jobs.find((job) => job.agentId === "a")?.status, "running");
@@ -1854,8 +1850,7 @@ test("a slow inspection of one conversation does not delay another conversation'
   const tick = s.tick();
   await start;
   try {
-    for (let i = 0; i < 100 && !f.sent.includes("b"); i++)
-      await new Promise<void>((resolve) => setImmediate(resolve));
+    await f.until(() => f.sent.includes("b"));
     assert.deepEqual(f.sent, ["b"], "b is sent while a's inspection is still held");
     await waitForAgentStatus(f, "b", "completed");
     assert.equal(f.state.jobs.find((job) => job.agentId === "b")?.status, "completed");
@@ -1898,9 +1893,8 @@ test("a later tick skips only the conversation being inspected and reserves anot
   f.state.jobs.find((job) => job.agentId === "b")!.endedAt = f.time - 55 * 60_000;
   const inspected = refreshes;
   const second = s.tick();
-  const settled = await within(second);
+  await second; // while a's inspection is held
   try {
-    assert.notEqual(settled, null, "the second tick resolves while a's inspection is held");
     assert.equal(refreshes, inspected, "the held conversation is not inspected again");
     assert.deepEqual(f.sent, ["b"], "b is sent while a's inspection is held");
     assert.equal(f.state.jobs.find((job) => job.agentId === "b")?.status, "completed");
@@ -1955,8 +1949,7 @@ test("a due automatic reservation is not added while Compact now is pending", as
   const manual = s.compactNow("a", f.agents[0].revision!);
   await start;
   try {
-    const tick = s.tick();
-    assert.notEqual(await within(tick), null, "the tick does not wait for the manual send");
+    await s.tick(); // without waiting for the manual send
     assert.equal(f.state.operations.length, 1);
     assert.equal(f.state.operations[0].kind, "manual");
     assert.deepEqual(f.sent, ["a"]);
@@ -2089,11 +2082,10 @@ test("a slow host read in a tick does not hold up other conversations' state cha
   const tick = s.tick();
   await start;
   const work = Promise.all([s.toggle("b", false), s.operation("missing")]);
-  const early = await within(work.then(() => true));
+  // Resolves while a's host read is held.
+  const [changed, missing] = await work;
   release();
   await tick;
-  const [changed, missing] = await work;
-  assert.equal(early, true, "other conversations resolve while a's host read is held");
   assert.equal(changed, true);
   assert.equal(missing, null);
   assert.deepEqual(f.state.disabled, ["b"]);
@@ -2119,7 +2111,7 @@ test("one conversation's failed refresh does not drop another conversation's fin
   assert.deepEqual(reserved(f), ["b"], "b's finished reply is reserved without waiting for a full scan");
 });
 
-test("a refresh that hangs past the deadline does not drop another conversation's finished reply", async () => {
+test("a refresh that hangs past the deadline does not drop another conversation's finished reply", async (t) => {
   const f = fixture();
   f.agents.splice(0, 1);
   const s = f.make();
@@ -2127,7 +2119,7 @@ test("a refresh that hangs past the deadline does not drop another conversation'
   let releaseA!: () => void;
   f.holdRefresh("a", () => new Promise<void>(resolve => { releaseA = resolve; }));
   const release = f.holdList();
-  mock.timers.enable({ apis: ["setTimeout"] });
+  t.mock.timers.enable({ apis: ["setTimeout"] });
   try {
     // A full scan that read no conversation is still running...
     const full = s.observe({ kind: "full" });
@@ -2138,7 +2130,7 @@ test("a refresh that hangs past the deadline does not drop another conversation'
     release();
     await full;
     await settle();
-    mock.timers.tick(5_000);
+    t.mock.timers.tick(5_000);
     await assert.rejects(merged[1], "the timeout is still reported");
     assert.deepEqual(reserved(f), ["b"], "b's finished reply is reserved although a's read is still running");
     const again = s.observe({ kind: "agent", agentId: "b" });
@@ -2149,7 +2141,6 @@ test("a refresh that hangs past the deadline does not drop another conversation'
     await again;
   } finally {
     releaseA?.();
-    mock.timers.reset();
   }
 });
 

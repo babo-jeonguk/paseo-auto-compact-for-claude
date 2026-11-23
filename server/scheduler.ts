@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { bounded, INSPECT_TIMEOUT_MS, SEND_DEADLINE_MS } from "./deadline";
+import { bounded, INSPECT_TIMEOUT_MS, SEND_DEADLINE_MS, systemTimers, type Timers } from "./deadline";
 import type { Settings } from "../shared/settings";
 import { knownBlockedReason, operationPending, operationRowStatus, SESSION_RESUME_REQUIRED, type Blocked, type BlockedReason,
   type CompactTarget, type Row } from "../shared/rpc";
@@ -31,6 +31,11 @@ type ReservationOutcome = { kind: "expired" | "skipped"; detail: string } |
 const TRANSIENT: readonly BlockedReason[] = ["observer_starting", "observer_unreadable"];
 type Decision = { candidate: Candidate; outcome: ReservationOutcome };
 
+// The periodic pass that fires due reservations and moves pending operations
+// on. Its interval adds at most this much to when a due reservation is
+// considered, small next to the 30 s margin kept before a cache deadline;
+// host reads within the pass can add more.
+export const TICK_INTERVAL_MS = 10_000;
 export const FULL_SCAN_INTERVAL_MS = 60_000;
 export type ObservationScope =
   | { kind: "agent"; agentId: string }
@@ -93,8 +98,10 @@ export function createScheduler(options: {
   now?: () => number;
   onError?: (error: unknown) => void;
   receipts?: OperationReceipts;
+  timers?: Timers;
 }) {
   const { gateway } = options;
+  const timers = options.timers ?? systemTimers;
   let stopped = false;
   // Every write passes through syncJobs, the only writer of jobs' attempt fields.
   // A stopped scheduler cannot write: it would put back state that a newer
@@ -134,7 +141,7 @@ export function createScheduler(options: {
   };
   let planStartedAt = 0;
   let hostWork: Promise<unknown> = Promise.resolve();
-  let hostTimer: ReturnType<typeof setTimeout> | undefined;
+  let hostTimer: unknown;
   type Plan = { full: boolean; attention: boolean; agentIds: Set<string> };
   const newPlan = (): Plan => ({ full: false, attention: false, agentIds: new Set() });
   let pending: { plan: Plan; promise: Promise<void>; resolve(): void; reject(error: unknown): void } | null = null;
@@ -216,7 +223,7 @@ export function createScheduler(options: {
     if (failures.length) throw failures[0];
   }
   function release() {
-    if (hostTimer) { clearTimeout(hostTimer); hostTimer = undefined; }
+    if (hostTimer !== undefined) { timers.clearTimeout(hostTimer); hostTimer = undefined; }
     observing = false;
     const next = pending;
     pending = null;
@@ -231,7 +238,7 @@ export function createScheduler(options: {
     let released = false;
     const once = () => { if (released) return; released = true; release(); };
     hostWork.then(once, once);
-    hostTimer = setTimeout(once,
+    hostTimer = timers.setTimeout(once,
       Math.max(0, planStartedAt + FULL_SCAN_INTERVAL_MS - now()));
   }
   function start(plan: Plan) {
@@ -292,7 +299,7 @@ export function createScheduler(options: {
       nextCleanupAt = result.backlog ? -Infinity : at + HISTORY_SWEEP_INTERVAL_MS;
     } catch (error) { onError(error); }
   }
-  const worker = createOperationWorker({ store, gateway, settings, now, onError,
+  const worker = createOperationWorker({ store, gateway, settings, now, onError, timers,
     // A transaction that changes nothing writes nothing.
     update: change => serialize(async () => {
       const state = await store.read(), before = JSON.stringify(state);
@@ -577,7 +584,7 @@ export function createScheduler(options: {
     reconcile: worker.reconcile,
     stop() {
       stopped = true;
-      if (hostTimer) { clearTimeout(hostTimer); hostTimer = undefined; }
+      if (hostTimer !== undefined) { timers.clearTimeout(hostTimer); hostTimer = undefined; }
       release();
       worker.stop();
     },

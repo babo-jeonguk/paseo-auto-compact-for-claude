@@ -1,6 +1,6 @@
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { createGateway } from "./server/gateway";
-import { createScheduler } from "./server/scheduler";
+import { createScheduler, TICK_INTERVAL_MS } from "./server/scheduler";
 import { createCachedStore, createStore } from "./server/store";
 import { createObserver } from "./server/observer";
 import { createReporter } from "./server/report";
@@ -131,12 +131,14 @@ export default function contribute(server: PluginServerContext) {
     // Operation recovery must progress even when native discovery fails/hangs.
     void scheduler.tick(host.connected()).catch(report);
     if (host.connected()) void scheduler.observe({ kind: "periodic" }).catch(report);
-  }, 10_000);
+  }, TICK_INTERVAL_MS);
   return () => {
     reporter.dispose();
     clearInterval(timer);
     scheduler.stop();
     host.stop();
-    for (const stop of stops) stop();
+    // A settings subscription may end asynchronously, after the reporter is
+    // disposed; a defect in it is still logged.
+    for (const stop of stops) void Promise.resolve(stop()).catch(reporter.teardown);
   };
 }

@@ -16,6 +16,8 @@ A rule lives in the module that owns it, and every caller asks that module. The 
 
 Every duration is a named constant with a unit suffix (`_MS`) and a comment that says why it has that value. Tests assert the agreed values. A bare number of milliseconds in logic is a finding.
 
+Lint enforces this for the delay argument of timer calls in product code (`setTimeout`, `setInterval`, `bounded`, a clock's `every`, `AbortSignal.timeout`); other durations in logic are left to review.
+
 ## Decisions apart from effects
 
 Keep decisions as pure functions that take the current time and state as input (`automaticBlock`, `sessionPollDelay`, `deadlineOf`), and keep timers, I/O and the host API at the edges. Code that reads the clock or the host inside a decision is harder to test and is a finding when a pure version is practical.
@@ -43,8 +45,16 @@ Make code work in the general case, then add special handling on top. Do not dep
 ## Tests
 
 - Tests use `node:test` with `node:assert/strict`, and drive time through an injected clock rather than sleeps.
-- Wait on observable state, not on incidental counts or delays. Do not hide a failure with retries or weaker assertions.
-- A change in how the plugin talks to Paseo or Claude needs a native simulation scenario, since unit fakes share the code's assumptions.
+- Wait on observable state or a ready line, not on sleeps or incidental counts. A fake that records state or calls wakes the tests waiting on it when it changes (`changes()` in `tests/support/changes.ts`), and a held step resolves a promise when the code under test reaches it. Find what you wait for by what the action newly created, not by text that was already there.
+- Do not hide a failure with retries or weaker assertions. Prefer one deterministic race test and one real integration test over many repetitions.
+- Isolate inherited environment variables, ports and temporary folders.
+- Feed fakes of external programs real captured output and its variations. Unit fakes still share the code's assumptions, so a change in how the plugin talks to Paseo or Claude needs a native simulation scenario.
+
+The test runner bounds every unit test (`--test-timeout` in `package.json`), so a test awaits what it expects directly and a broken one fails at that bound instead of hanging. A test adds no bound of its own to a wait: no timer, no deadline helper wrapped around the call, no count of loop turns. Such a bound duplicates the runner's, fails on a slower machine, and can satisfy an assertion the code under test should have met. Timers in a test belong to the code under test; a test that needs one of its own calls the injected clock (`clock.setTimeout`). The scheduler and the operation worker take their timers with the clock (`timers`, beside `now`); their tests pass `fakeTimers()` from `tests/support/timers.ts`, wait for a timer to be armed through the change signal, and move it on with `tick()`, which runs due callbacks on a later turn as real timers do. A real process a test starts still gets its own time limit (the spawn `timeout`), since the runner fails the test but does not stop the process.
+
+A test stopped at the runner's bound never reaches its own `finally`. So a test turns on fake timers through its context (`t.mock.timers`), which the runner restores, never on the shared `mock` tracker, and registers the cleanup of anything that would outlive the test (a running timer, process or server, a temporary folder) with `t.after()` right after it acquires it. Releasing a promise the test is holding is a step of the test, not cleanup: a pending promise does not keep the process alive.
+
+Lint enforces this in the unit tests (`server/*.test.ts`, `scripts/*.test.ts`, `tests/*.test.mjs`) and their support modules (`tests/support/`). It rejects a real timer with a delay, whatever its callback does, anything from `node:timers` or `node:timers/promises` but `setImmediate`, a counted `for` loop that awaits while it also stops on a condition, and the shared `mock` tracker's timers, methods, accessors and modules. It sees timers called by name or on the global object with a written key, and those modules imported or loaded by a written name. A timer reached through another name, a key built at run time, a deadline helper wrapped around a call, or a `while` loop with its own counter is left to review. The simulation and E2E suites run real processes and keep real time.
 
 ## Comments say why
 
@@ -52,4 +62,4 @@ Comments explain why code is the way it is: the host behavior it works around, t
 
 ## Generated and checked files
 
-`server/observer-assets.generated.ts` is generated from `server/observer-source.mjs` by `npm run build:observer`; edit the source, never the generated file. Text files use LF line endings on every OS.
+`server/observer-assets.generated.ts` is generated from `server/observer-source.mjs` by `npm run build:observer`; edit the source, never the generated file. Any edit to the source makes a new observer build, and sessions opened before the update keep running the old one. `server/observer.test.ts` fails until the new build is added to `READABLE_BUILDS`; the build it replaces stays in `compatibleBuilds` in `server/observer.ts` unless the ledger contract changed. Text files use LF line endings on every OS.

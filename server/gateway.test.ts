@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
-import { mock, test } from "node:test";
+import { test } from "node:test";
 import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { bounded, OBSERVATION_MS } from "./deadline";
+import { OBSERVATION_MS } from "./deadline";
 import { Refusal, type OperationEvidence, type StoredOperation } from "./model";
-import { createGateway } from "./gateway";
+import { createGateway, EVIDENCE_POLL_MS } from "./gateway";
 import { createObserver, QUERY_RESTARTED_REFUSAL } from "./observer";
 import { createOperationWorker } from "./operations";
 import { createScheduler } from "./scheduler";
@@ -226,8 +226,9 @@ test('automatic public dispatch requires both its own boundary and matching nati
 
 // Another user message seen live after the send, in its own turn or in the
 // command's, followed by what Claude and the host report for the command.
-async function overlap({ receipt = { status: 'completed', detail: 'Native PostCompact' } as Receipt | null,
-  outcome = { kind: 'completed' } as unknown, events = [] as Array<{ turnId: string; item: unknown }>, timeoutMs = 1_000 } = {}) {
+interface OverlapOptions { receipt?: Receipt | null; outcome?: unknown; events?: Array<{ turnId: string; item: unknown }>; timeoutMs?: number }
+async function overlap({ receipt = { status: 'completed', detail: 'Native PostCompact' },
+  outcome = { kind: 'completed' }, events = [], timeoutMs = 1_000 }: OverlapOptions = {}) {
   const host = fixture([], outcome, false, [], { observer: observer(receipt), timeoutMs });
   const send = host.ref.send;
   let emit!: (message: unknown) => void;
@@ -331,15 +332,20 @@ test('Claude admits the compaction for as long as it can be observed, not only u
   assert.equal(host.sendCount(), 1);
 });
 
+test("completion evidence is checked every 50 ms after sending", () => {
+  assert.equal(EVIDENCE_POLL_MS, 50);
+});
+
 test('a send that starts just before its deadline is still observed in full', async () => {
   // A live budget longer than the send deadline, as in production (120 s vs. what is left).
+  let time = 1_000_000;
   const host = fixture([{ type: "compaction", status: "completed", trigger: "manual" }],
-    undefined, false, undefined, { timeoutMs: 1_000 });
+    undefined, false, undefined, { timeoutMs: 1_000, now: () => time });
   const send = host.ref.send;
-  // The boundary arrives after the send deadline has passed.
-  host.ref.send = async (text, options) => { await new Promise(resolve => setTimeout(resolve, 80)); return send(text, options); };
+  // The send takes past its deadline, so the boundary arrives after it.
+  host.ref.send = async (text, options) => { time += 80; return send(text, options); };
   const result = await host.gateway.compact("a", undefined, {
-    id: "late-request", sendBy: Date.now() + 40, checkpoint: async () => {}, current: () => true,
+    id: "late-request", sendBy: time + 40, checkpoint: async () => {}, current: () => true,
   });
   assert.equal(result.status, "completed");
   assert.equal(host.sendCount(), 1);
@@ -461,12 +467,12 @@ test("every external gateway wait is bounded, including send and release", async
     }
     // A wait that expires before sending is a fault for the worker to retry.
     if (stalled === "subscribe" || stalled === "refresh") {
-      await assert.rejects(bounded(host.gateway.compact("a", undefined, { id: "stalled", sendBy: Date.now() + 50,
-        checkpoint: async () => {}, current: () => true }), 2_000), /deadline/i, stalled);
+      await assert.rejects(host.gateway.compact("a", undefined, { id: "stalled", sendBy: Date.now() + 50,
+        checkpoint: async () => {}, current: () => true }), /deadline/i, stalled);
       assert.equal(host.sendCount(), 0, stalled);
       continue;
     }
-    const result = await bounded(host.gateway.compact("a"), 2_000);
+    const result = await host.gateway.compact("a");
     assert.equal(result.status, stalled === "release" ? "completed" : "unknown", stalled);
     assert.equal(host.ownTurn("a", "compact-1"), false);
     host.stop();
@@ -702,7 +708,7 @@ test("a scan whose later listing page fails stays single-flight until reads star
   }
 });
 
-test("a listed conversation's read is bounded from when it starts, not from when paging ends", async () => {
+test("a listed conversation's read is bounded from when it starts, not from when paging ends", async (t) => {
   let releasePage!: () => void;
   const page = new Promise<void>(resolve => { releasePage = resolve; });
   let releaseA!: () => void;
@@ -714,31 +720,31 @@ test("a listed conversation's read is bounded from when it starts, not from when
     holdPage: start => start === 1 ? page : undefined,
   });
   const { scheduler, listing, reserved } = directoryScheduler(dir.host);
-  mock.timers.enable({ apis: ["setTimeout"] });
+  // Runs even if the test stops early, at a failed assertion or at the test
+  // runner's bound.
+  t.after(() => { scheduler.stop(); dir.host.stop(); });
+  t.mock.timers.enable({ apis: ["setTimeout"] });
   try {
     await scheduler.ready;
     let settled: unknown = "pending";
     // Read through a call: an assertion must not narrow it for later checks.
     const outcome = () => settled;
     const scan = scheduler.observe({ kind: "full" });
-    scan.then(() => { settled = "resolved"; }, error => { settled = error; });
+    const ended = scan.then(() => { settled = "resolved"; }, error => { settled = error; });
     await readingA;
     assert.deepEqual(dir.reads, ["a"], "a's read starts with the first page");
     // Paging takes four of the five seconds; a's read never ends.
-    mock.timers.tick(4_000);
+    t.mock.timers.tick(4_000);
     releasePage();
     await listing();
     assert.equal(outcome(), "pending", "a's read is not timed out when paging ends");
-    mock.timers.tick(1_000);
-    for (let step = 0; step < 20 && outcome() === "pending"; step++) await turn();
+    t.mock.timers.tick(1_000);
+    await ended;
     assert.ok(outcome() instanceof Error, "a's read timed out five seconds after it started");
     assert.deepEqual(reserved(), ["b", "c"], "every other listed reply is still reserved");
   } finally {
     releasePage();
     releaseA();
-    mock.timers.reset();
-    scheduler.stop();
-    dir.host.stop();
   }
 });
 
@@ -803,10 +809,16 @@ const BOUNDARY_ITEM = { type: "compaction", status: "completed", trigger: "manua
 const LOST_VIEW = ["subscription_restored", "replacement", "error"] as const;
 type HistoryEntry = { turnId: string | null; item: unknown };
 const BOUNDARY = { type: "compaction", status: "completed", trigger: "manual" };
-async function lostView(lost: typeof LOST_VIEW[number], { live = [] as readonly unknown[], before = [] as readonly unknown[],
-  history = ((id: string) => [command(id), { turnId: "compact-1", item: BOUNDARY }]) as (id: string, lose: () => void) => HistoryEntry[],
-  receipt = { status: "completed", detail: "Native PostCompact" } as { status: "completed" | "unknown"; detail: string } | null,
-  timeoutMs = 1_000, now = Date.now as () => number } = {}) {
+interface LostViewOptions {
+  live?: readonly unknown[]; before?: readonly unknown[];
+  history?: (id: string, lose: () => void) => HistoryEntry[];
+  receipt?: { status: "completed" | "unknown"; detail: string } | null;
+  timeoutMs?: number; now?: () => number;
+}
+async function lostView(lost: typeof LOST_VIEW[number], { live = [], before = [],
+  history = (id: string) => [command(id), { turnId: "compact-1", item: BOUNDARY }],
+  receipt = { status: "completed", detail: "Native PostCompact" },
+  timeoutMs = 1_000, now = Date.now }: LostViewOptions = {}) {
   const host = fixture([], undefined, false, [...before], { observer: observer(receipt), timeoutMs, now });
   const send = host.ref.send;
   let emit!: (message: unknown) => void;
@@ -902,12 +914,30 @@ test("a history page read across another lost live view proves nothing, not even
   }
 });
 
-test("after a lost live view, history is read at most once a second while completion is awaited", async () => {
+// Counts an attempt's polls and wakes a waiting test on each one, so the test
+// waits for the poll it needs instead of sleeping. It fails at once when the
+// attempt ends while the test still expects it to poll; an attempt that stops
+// reaching the counted call fails at the test runner's bound.
+function pollSignal() {
+  let count = 0;
+  let wake: (() => void) | undefined;
+  return {
+    get count() { return count; },
+    poll() { count++; wake?.(); },
+    async until(done: () => boolean, attempt: Promise<unknown>, why: string) {
+      const ended = attempt.then(() => { throw new Error(why); });
+      ended.catch(() => {}); // only the race below observes it
+      while (!done()) await Promise.race([new Promise<void>(resolve => { wake = resolve; }), ended]);
+    },
+  };
+}
+
+test("after a lost live view, history is read at most once a second while completion is awaited", async (t) => {
   let time = Date.now();
   const native = observer({ status: "completed", detail: "Native PostCompact" })!;
-  let polls = 0;
+  const polls = pollSignal();
   const receipt = native.receipt;
-  native.receipt = (...args) => { polls++; return receipt(...args); };
+  native.receipt = (...args) => { polls.poll(); return receipt(...args); };
   const host = fixture([], undefined, false, [], { observer: native, timeoutMs: 120_000, now: () => time });
   const send = host.ref.send;
   let emit!: (message: unknown) => void;
@@ -923,27 +953,22 @@ test("after a lost live view, history is read at most once a second while comple
   const attempt = host.gateway.automatic!((await host.gateway.refresh("a"))!, undefined, {
     id: "interval", sendBy: time + 30_000, checkpoint: async () => {}, current: () => true,
   });
-  const until = async (done: () => boolean) => {
-    for (let tries = 0; !done(); tries++) {
-      assert.ok(tries < 2_000, "the attempt stopped polling");
-      await new Promise(resolve => setTimeout(resolve, 1));
-    }
-  };
-  const pollsAfter = async (count: number) => { const target = polls + count; await until(() => polls >= target); };
-  try {
-    await until(() => reads >= 1);
-    await pollsAfter(5);
-    assert.equal(reads, 1, "no second read within the same instant");
-    time += 999;
-    await pollsAfter(5);
-    assert.equal(reads, 1, "no second read before a second has passed");
-    time += 1;
-    await until(() => reads >= 2);
-    assert.equal(reads, 2, "one more read once a second has passed");
-  } finally {
-    time += 120_000; // past the live deadline, so the attempt ends even if an assertion failed
-    assert.equal((await attempt).status, "unknown");
-  }
+  // Past the live deadline, so the attempt ends even if the test stops early,
+  // at a failed assertion or at the test runner's bound.
+  t.after(() => { time += 120_000; });
+  const until = (done: () => boolean) => polls.until(done, attempt, "the attempt stopped polling");
+  const pollsAfter = (count: number) => { const target = polls.count + count; return until(() => polls.count >= target); };
+  await until(() => reads >= 1);
+  await pollsAfter(5);
+  assert.equal(reads, 1, "no second read within the same instant");
+  time += 999;
+  await pollsAfter(5);
+  assert.equal(reads, 1, "no second read before a second has passed");
+  time += 1;
+  await until(() => reads >= 2);
+  assert.equal(reads, 2, "one more read once a second has passed");
+  time += 120_000;
+  assert.equal((await attempt).status, "unknown");
   assert.equal(host.sendCount(), 1);
 });
 
@@ -1028,7 +1053,7 @@ async function realObserverFixture(now = () => Date.now()) {
 
 test("live observation reports a confirmed query-restart refusal promptly for both Compact now and automatic compaction", async () => {
   for (const kind of ["manual", "automatic"] as const) {
-    let time = 1_000_000;
+    const time = 1_000_000;
     const obs = await realObserverFixture(() => time);
     try {
       const host = fixture([], undefined, false, [], {
@@ -1083,65 +1108,63 @@ test("live observation reports a confirmed query-restart refusal promptly for bo
   }
 });
 
-test("a generation change without a matching refusal stays pending until the observation deadline", async () => {
+test("a generation change without a matching refusal stays pending until the observation deadline", async (t) => {
   let time = 1_000_000;
   const obs = await realObserverFixture(() => time);
   const host = fixture([], undefined, false, [], {
     observer: obs.native, now: () => time, timeoutMs: 120_000, pollMs: 1,
   });
   let attempt: Promise<import("./model").CompactOutcome> | undefined;
-  try {
-    const send = host.ref.send;
-    const originalResult = obs.native.result;
-    let pollsOnNewGeneration = 0;
-    obs.native.result = async (agentId, op) => {
-      const res = await originalResult(agentId, op);
-      if (obs.ledger.generation === "gen-2") pollsOnNewGeneration++;
-      return res;
-    };
-    host.ref.send = async (text, options) => {
-      await send(text, options);
-      obs.ledger.generation = "gen-2";
-      obs.ledger.revision = 0;
-      obs.ledger.compact = null;
-      await obs.saveLedger();
-    };
-    const agent = (await host.gateway.refresh("a"))!;
-    let settled = false;
-    attempt = host.gateway.compact("a", agent, {
-      id: "gen-only", sendBy: time + 30_000, checkpoint: async () => {}, current: () => true,
-    });
-    void attempt.finally(() => { settled = true; });
-    const until = async (done: () => boolean) => {
-      for (let tries = 0; !done(); tries++) {
-        assert.ok(tries < 2_000, "the attempt stopped polling before the deadline");
-        await new Promise(resolve => setTimeout(resolve, 1));
-      }
-    };
-    await until(() => pollsOnNewGeneration >= 3);
-    assert.equal(settled, false, "a bare generation change must not exit live observation early");
-    assert.equal((await obs.readRequest()).status, "prepared");
-    time += 59_000;
-    await obs.saveLedger();
-    const afterChange = pollsOnNewGeneration;
-    await until(() => pollsOnNewGeneration >= afterChange + 2);
-    assert.equal(settled, false, "execution must stay pending before the live deadline");
-    assert.equal((await obs.readRequest()).status, "prepared");
-    time += 61_000;
-    const outcome = await attempt;
-    assert.equal(outcome.status, "unknown");
-    assert.equal(host.sendCount(), 1);
-    assert.equal((await obs.readRequest()).status, "cancelled");
-  } finally {
+  // Runs even if the test stops early, at a failed assertion or at the test
+  // runner's bound: past the deadline the attempt ends, then the host and the
+  // observer stop.
+  t.after(async () => {
     time += 120_000;
-    await attempt?.catch(() => {});
+    void attempt?.catch(() => {});
     host.stop();
     await obs.close();
-  }
+  });
+  const send = host.ref.send;
+  const originalResult = obs.native.result;
+  const pollsOnNewGeneration = pollSignal();
+  obs.native.result = async (agentId, op) => {
+    const res = await originalResult(agentId, op);
+    if (obs.ledger.generation === "gen-2") pollsOnNewGeneration.poll();
+    return res;
+  };
+  host.ref.send = async (text, options) => {
+    await send(text, options);
+    obs.ledger.generation = "gen-2";
+    obs.ledger.revision = 0;
+    obs.ledger.compact = null;
+    await obs.saveLedger();
+  };
+  const agent = (await host.gateway.refresh("a"))!;
+  let settled = false;
+  attempt = host.gateway.compact("a", agent, {
+    id: "gen-only", sendBy: time + 30_000, checkpoint: async () => {}, current: () => true,
+  });
+  void attempt.finally(() => { settled = true; });
+  const until = (done: () => boolean) =>
+    pollsOnNewGeneration.until(done, attempt, "the attempt stopped polling before the deadline");
+  await until(() => pollsOnNewGeneration.count >= 3);
+  assert.equal(settled, false, "a bare generation change must not exit live observation early");
+  assert.equal((await obs.readRequest()).status, "prepared");
+  time += 59_000;
+  await obs.saveLedger();
+  const afterChange = pollsOnNewGeneration.count;
+  await until(() => pollsOnNewGeneration.count >= afterChange + 2);
+  assert.equal(settled, false, "execution must stay pending before the live deadline");
+  assert.equal((await obs.readRequest()).status, "prepared");
+  time += 61_000;
+  const outcome = await attempt;
+  assert.equal(outcome.status, "unknown");
+  assert.equal(host.sendCount(), 1);
+  assert.equal((await obs.readRequest()).status, "cancelled");
 });
 
 test("stopping the plugin after dispatch preserves request.json so a query-restart refusal remains recoverable", async () => {
-  let time = 1_000_000;
+  const time = 1_000_000;
   const obs = await realObserverFixture(() => time);
   try {
     const host = fixture([], undefined, false, [], { observer: obs.native, now: () => time, timeoutMs: 120_000, pollMs: 1 });
@@ -1176,7 +1199,7 @@ test("stopping the plugin after dispatch preserves request.json so a query-resta
     };
     const recovered = await restarted.gateway.inspect!(stored);
     assert.equal(recovered?.status, "failed");
-    assert.match(recovered!.detail, /query restarted/i);
+    assert.match(recovered.detail, /query restarted/i);
     assert.equal(restarted.sendCount(), 0);
     restarted.stop();
   } finally { await obs.close(); }
@@ -1200,7 +1223,7 @@ test("recovery accepts a confirmed query-restart refusal within the deadline and
     });
     const recovered = await host.gateway.inspect!(operation);
     assert.equal(recovered?.status, "failed");
-    assert.match(recovered!.detail, /query restarted/i);
+    assert.match(recovered.detail, /query restarted/i);
 
     // Late receipt past the observation deadline is ignored.
     await obs.writeReceipt(native.id, {

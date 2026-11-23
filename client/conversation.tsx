@@ -80,7 +80,7 @@ export function useConversation(hostId: string, agentId: string) {
   const fresh = !query.isError && query.dataUpdatedAt > 0 && now - query.dataUpdatedAt < STATUS_FRESH_MS;
   const ready = fresh && !!row && settings.status === "ready";
   const previous = useRef<Presentation | null>(null);
-  const current = ready ? sessionPresentation(row!, settings.values, now) : null;
+  const current = ready ? sessionPresentation(row, settings.values, now) : null;
   if (current) {
     previous.current = current;
     pendingSince.current = null;
@@ -340,7 +340,7 @@ export function ConversationControls({
           {button("Confirm compact", () => action.mutate({ kind: "compact", revision: confirmRevision }), disabled)}
           {button("Cancel", () => setConfirmRevision(null), state.mutations > 0)}
         </View>
-      </View> : button("Compact now", () => setConfirmRevision(row!.revision!),
+      </View> : button("Compact now", () => setConfirmRevision(row!.revision),
         disabled || !row?.revision || row.status === "busy", "Minimize2")}
       </View>
       {status === "Check compact" || query.isError || !ready && !query.isPending || lookupExpired
