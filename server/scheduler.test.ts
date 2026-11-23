@@ -6,6 +6,8 @@ import {
   type Settings,
 } from "../shared/settings";
 import { createScheduler, FULL_SCAN_INTERVAL_MS, TICK_INTERVAL_MS } from "./scheduler";
+// Null when work that should not be held is still pending, so the test fails instead of hanging.
+import { settledWithin } from "../tests/support/failure-bound";
 import { DELIVERY_WINDOW_MS } from "./policy";
 import type { Blocked } from "../shared/rpc";
 import { Refusal, type Gateway, type Observation, type State, type StateStore } from "./model";
@@ -150,19 +152,6 @@ async function waitForAgentStatus(f: ReturnType<typeof fixture>, agentId: string
     f.state.jobs.find((job) => job.agentId === agentId)?.status}`);
 }
 
-// Resolve to null if work is still pending after ms; the test then fails on the
-// missing progress instead of hanging on a queue that should not be held.
-async function within<T>(work: Promise<T>, ms = 250): Promise<T | null> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<null>((resolve) => {
-    timer = setTimeout(() => resolve(null), ms);
-  });
-  try {
-    return await Promise.race([work, timeout]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
 
 test("defaults remain 200,000 tokens and 55 minutes; invalid settings rejected", () => {
   assert.equal(DEFAULT_SETTINGS.threshold, 200_000);
@@ -725,7 +714,7 @@ test("an earlier intake cannot use a stale read after a newer request is saved",
   const first = s.compactNow("a", revision, "request-a");
   await start;
   const secondRequest = s.compactNow("a", revision, "request-b");
-  const second = await within(secondRequest);
+  const second = await settledWithin(secondRequest);
   release();
   const secondResult = second ?? await secondRequest;
   const firstResult = await first;
@@ -755,7 +744,7 @@ test("concurrent duplicate submissions return one operation and send once", asyn
   const first = s.compactNow("a", revision, "request-a");
   await start;
   const secondRequest = s.compactNow("a", revision, "request-a");
-  const second = await within(secondRequest);
+  const second = await settledWithin(secondRequest);
   release();
   const secondResult = second ?? await secondRequest;
   const firstResult = await first;
@@ -804,7 +793,7 @@ test("a slow host read for one conversation does not hold up other conversations
     s.operation("missing"),
     s.compactNow("b", f.agents[1].revision!),
   ]);
-  const early = await within(work.then(() => true));
+  const early = await settledWithin(work.then(() => true));
   release();
   const [session, changed, missing, compact] = await work;
   assert.equal(early, true, "other conversations resolve while a's host read is held");
@@ -834,7 +823,7 @@ test("Compact now acknowledges a slow backend before the plugin RPC deadline", a
   await scheduler.ready;
 
   // The backend stays held until the request has answered.
-  const first = await within(scheduler.compactNow("a", f.agents[0].revision!));
+  const first = await settledWithin(scheduler.compactNow("a", f.agents[0].revision!));
   release();
   await waitForStatus(f, "completed");
 
@@ -1821,7 +1810,7 @@ test("a conversation compacting does not stop a later tick from reserving anothe
   await s.observedTurn(f.agents[1]);
   f.advance(55 * 60_000);
   const second = s.tick();
-  const settled = await within(second);
+  const settled = await settledWithin(second);
   try {
     assert.notEqual(settled, null, "the second tick resolves without waiting for a");
     assert.deepEqual(f.sent, ["a", "b"]);
@@ -1900,7 +1889,7 @@ test("a later tick skips only the conversation being inspected and reserves anot
   f.state.jobs.find((job) => job.agentId === "b")!.endedAt = f.time - 55 * 60_000;
   const inspected = refreshes;
   const second = s.tick();
-  const settled = await within(second);
+  const settled = await settledWithin(second);
   try {
     assert.notEqual(settled, null, "the second tick resolves while a's inspection is held");
     assert.equal(refreshes, inspected, "the held conversation is not inspected again");
@@ -1958,7 +1947,7 @@ test("a due automatic reservation is not added while Compact now is pending", as
   await start;
   try {
     const tick = s.tick();
-    assert.notEqual(await within(tick), null, "the tick does not wait for the manual send");
+    assert.notEqual(await settledWithin(tick), null, "the tick does not wait for the manual send");
     assert.equal(f.state.operations.length, 1);
     assert.equal(f.state.operations[0].kind, "manual");
     assert.deepEqual(f.sent, ["a"]);
@@ -2091,7 +2080,7 @@ test("a slow host read in a tick does not hold up other conversations' state cha
   const tick = s.tick();
   await start;
   const work = Promise.all([s.toggle("b", false), s.operation("missing")]);
-  const early = await within(work.then(() => true));
+  const early = await settledWithin(work.then(() => true));
   release();
   await tick;
   const [changed, missing] = await work;

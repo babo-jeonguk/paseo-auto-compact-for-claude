@@ -48,7 +48,7 @@ Make code work in the general case, then add special handling on top. Do not dep
 - Wait on observable state, not on incidental counts or delays. Do not hide a failure with retries or weaker assertions.
 - A change in how the plugin talks to Paseo or Claude needs a native simulation scenario, since unit fakes share the code's assumptions.
 
-Lint enforces the first rule in the unit tests (`server/*.test.ts`, `scripts/*.test.ts`, `tests/*.test.mjs`): it rejects a sleep, meaning a delayed timer whose callback only wakes a waiter, and the timers of `node:timers/promises`. A timer that ends a wait with a value or an error is a bound that fires only when the test fails, and is allowed. The simulation and E2E suites run real processes and keep real time.
+Lint enforces the first rule in the unit tests (`server/*.test.ts`, `scripts/*.test.ts`, `tests/*.test.mjs`) and their support modules (`tests/support/`): no real timer with a delay, whatever its callback does, and nothing from `node:timers` or `node:timers/promises` but `setImmediate`. A wait that may never end is bounded with `settledWithin` from `tests/support/failure-bound.ts`, the one place a unit test starts a real timer, so that a broken test fails instead of hanging. The simulation and E2E suites run real processes and keep real time.
 
 ## Comments say why
 

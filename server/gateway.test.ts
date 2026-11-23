@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { bounded, OBSERVATION_MS } from "./deadline";
 import { Refusal, type OperationEvidence, type StoredOperation } from "./model";
 import { createGateway, EVIDENCE_POLL_MS } from "./gateway";
+import { FAILURE_BOUND_MS, settledWithin } from "../tests/support/failure-bound";
 import { createObserver, QUERY_RESTARTED_REFUSAL } from "./observer";
 import { createOperationWorker } from "./operations";
 import { createScheduler } from "./scheduler";
@@ -914,8 +915,6 @@ test("a history page read across another lost live view proves nothing, not even
   }
 });
 
-// A wait that should end within a few polls of 1 ms is a failure after this.
-const POLL_WAIT_BOUND_MS = 5_000;
 // Counts an attempt's polls and wakes a waiting test on each one, so the test
 // waits for the poll it needs instead of sleeping. It fails rather than hangs
 // when the attempt ends, or stops reaching the counted call, while the test
@@ -928,16 +927,12 @@ function pollSignal() {
     poll() { count++; wake?.(); },
     async until(done: () => boolean, attempt: Promise<unknown>, why: string) {
       const ended = attempt.then(() => { throw new Error(why); });
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      const bound = new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`${why} (no expected poll within ${POLL_WAIT_BOUND_MS} ms)`)),
-          POLL_WAIT_BOUND_MS);
-      });
-      ended.catch(() => {}); // only the race below observes these
-      bound.catch(() => {});
-      try {
-        while (!done()) await Promise.race([new Promise<void>(resolve => { wake = resolve; }), ended, bound]);
-      } finally { clearTimeout(timer); }
+      ended.catch(() => {}); // only the race below observes it
+      const reached = (async () => {
+        while (!done()) await Promise.race([new Promise<void>(resolve => { wake = resolve; }), ended]);
+        return true;
+      })();
+      if (await settledWithin(reached) === null) throw new Error(`${why} (no expected poll within ${FAILURE_BOUND_MS} ms)`);
     },
   };
 }

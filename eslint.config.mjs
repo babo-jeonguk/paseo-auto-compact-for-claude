@@ -9,13 +9,16 @@ import tseslint from "typescript-eslint";
 const typed = ["**/*.ts", "**/*.tsx"];
 
 // Unit tests run in one process with fakes; the simulation and E2E suites
-// drive real processes and keep real time.
-const unitTests = ["server/*.test.ts", "scripts/*.test.ts", "tests/*.test.mjs"];
+// drive real processes and keep real time. Test support modules are held to
+// the unit-test rule too, except the one that owns the failure bound.
+const unitTests = ["server/*.test.ts", "scripts/*.test.ts", "tests/*.test.mjs", "tests/support/**"];
+const failureBound = "tests/support/failure-bound.ts";
 const tests = ["**/*.test.ts", "**/*.test.mjs", "tests/**"];
 const product = ["index.server.ts", "index.client.tsx", "client/**", "server/**", "shared/**", "scripts/**"];
 
-const realTime = 'Unit tests do not sleep in real time. Advance the injected clock or mock.timers, ' +
-  'and wait on observable state such as a fake being called (CODING_STANDARDS.md "Tests").';
+const realTime = 'Unit tests start no real timer with a delay. Advance the injected clock or mock.timers, wait on ' +
+  'observable state such as a fake being called, and bound a wait that may never end with settledWithin from ' +
+  'tests/support/failure-bound.ts (CODING_STANDARDS.md "Tests").';
 const namedTiming = 'A timer or deadline argument is a named constant with an _MS suffix and a comment ' +
   'that says why it has that value (CODING_STANDARDS.md "Named timings").';
 const timer = "/^(setTimeout|setInterval)$/";
@@ -29,33 +32,20 @@ const literal = (call, position) =>
 export const projectRules = [
   {
     files: unitTests,
+    ignores: [failureBound],
     rules: {
       "no-restricted-syntax": ["error",
         {
-          // A sleep: a delayed timer whose callback only wakes something, as
-          // `setTimeout(resolve, ms)`, `() => resolve()` or `setInterval(poll, ms, id)`.
-          // A timer that ends a wait with a value or an error, including
-          // `setTimeout(reject, ms, error)`, is a bound that fires only when
-          // the test fails, and is left alone.
+          // Any delay but 0 (the next turn), whatever the callback does.
           selector: `CallExpression:matches([callee.name=${timer}], [callee.object.name='globalThis'][callee.property.name=${timer}])` +
-            "[arguments.length>1]:not([arguments.1.value=0]):matches(" +
-            "[arguments.0.type='Identifier']:not([arguments.0.name=/^(resolve|reject)$/][arguments.length>2]), " +
-            "[arguments.0.body.type='CallExpression'][arguments.0.body.arguments.length=0], " +
-            "[arguments.0.body.body.length=1][arguments.0.body.body.0.expression.type='CallExpression']" +
-            "[arguments.0.body.body.0.expression.arguments.length=0])",
+            "[arguments.length>1]:not([arguments.1.value=0])",
           message: realTime,
         },
         {
-          selector: "ImportDeclaration[source.value=/^(node:)?timers\\/promises$/] > " +
-            "ImportSpecifier[imported.name=/^(setTimeout|setInterval|scheduler)$/]",
+          // Everything these modules offer but setImmediate waits in real time.
+          selector: "ImportDeclaration[source.value=/^(node:)?timers(\\/promises)?$/] > " +
+            ":matches(ImportSpecifier:not([imported.name='setImmediate']), ImportNamespaceSpecifier, ImportDefaultSpecifier)",
           message: realTime,
-        },
-        {
-          // Which members the whole module is used for is not visible here.
-          selector: "ImportDeclaration[source.value=/^(node:)?timers\\/promises$/] > " +
-            ":matches(ImportNamespaceSpecifier, ImportDefaultSpecifier)",
-          message: "Import setImmediate by name from node:timers/promises; its other timers sleep in real time " +
-            '(CODING_STANDARDS.md "Tests").',
         },
       ],
     },

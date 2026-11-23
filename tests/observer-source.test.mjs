@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { registerObserver } from '../server/observer-source.mjs';
+import { settledWithin } from './support/failure-bound.ts';
 
 function fixture(env = {}, settings = {}) {
   let time = 1_000_000, contextTokens = 100_000, usageGate = null, afterUsage = null, clockGate = null, usageFailures = 0;
@@ -510,8 +511,7 @@ test('with classic hooks skipped, a context reading that never settles holds nei
   const f = fixture(); await f.start(); await f.ordinary(); f.request();
   let release;
   const returned = f.compact(async () => { release = f.holdUsage(); });
-  const timeout = new Promise(resolve => setTimeout(() => resolve('blocked'), 1_000));
-  assert.notEqual(await Promise.race([returned.then(() => 'returned'), timeout]), 'blocked', 'the command returns');
+  assert.equal(await settledWithin(returned.then(() => 'returned')), 'returned', 'the command returns');
   for (let i = 0; i < 19; i++) void f.tick(); // each tick's reading stays pending
   assert.equal(f.ledger().compact.status, 'running');
   void f.tick();
