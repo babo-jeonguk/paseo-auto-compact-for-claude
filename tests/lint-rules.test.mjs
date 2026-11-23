@@ -19,38 +19,40 @@ const flags = (file, code, standard) => {
 };
 const passes = (file, code) => assert.deepEqual(findings(file, code), [], `${file}: ${code}`);
 
-test('unit tests do not sleep in real time', () => {
-  for (const file of ['server/a.test.ts', 'scripts/a.test.ts', 'tests/a.test.mjs']) {
+test('unit tests start no real timer with a delay outside the shared failure bound', () => {
+  for (const file of ['server/a.test.ts', 'scripts/a.test.ts', 'tests/a.test.mjs', 'tests/support/a.ts']) {
     for (const code of [
       'await new Promise(resolve => setTimeout(resolve, 50));',
       'const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));',
       'setInterval(poll, 10);',
-      'setInterval(poll, 50, agentId);',
-      'setTimeout(check, 50, agentId);',
+      'setInterval(() => poll(agentId), 50);',
+      'setInterval(() => { poll(agentId); }, 50);',
+      'setTimeout(() => poll(agentId), 50);',
       'globalThis.setTimeout(resolve, 1_000);',
-      'await new Promise(resolve => setTimeout(() => resolve(), 20));',
-      'await new Promise(resolve => setTimeout(() => { resolve(); }, 20));',
+      // A bound of its own, too: bounds live in tests/support/failure-bound.ts.
+      'timer = setTimeout(() => resolve(null), ms);',
+      "setTimeout(() => reject(new Error('stuck')), 1_000);",
+      'setTimeout(reject, FAILURE_BOUND_MS, new Error("stuck"));',
       "import { setTimeout } from 'node:timers/promises';",
       "import { setInterval as every } from 'timers/promises';",
       "import { scheduler } from 'node:timers/promises';",
+      "import * as timers from 'node:timers/promises';",
+      "import timers from 'timers/promises';",
+      "import { setTimeout } from 'node:timers';",
+      "import * as timers from 'node:timers';",
     ]) flags(file, code, /CODING_STANDARDS\.md "Tests"/);
-    // The members a namespace or default import reaches are not visible to a selector.
-    for (const code of ["import * as timers from 'node:timers/promises';", "import timers from 'timers/promises';"])
-      flags(file, code, /setImmediate by name/);
     for (const code of [
       'await new Promise(resolve => setImmediate(resolve));',
       'setTimeout(resolve, 0);',
       'setTimeout(resolve);',
       'clock.setTimeout(fire, 5_000);',
       'mock.timers.tick(5_000);',
-      // A bound that ends a wait with a value only fires when the test fails.
-      'timer = setTimeout(() => resolve(null), ms);',
-      "setTimeout(() => reject(new Error('stuck')), 1_000);",
-      'setTimeout(reject, FAILURE_BOUND_MS, new Error("stuck"));',
-      'setTimeout(resolve, BOUND_MS, "late");',
       "import { setImmediate } from 'node:timers/promises';",
+      "import { setImmediate } from 'node:timers';",
     ]) passes(file, code);
   }
+  // The one module that owns the failure bound.
+  passes('tests/support/failure-bound.ts', 'const timer = setTimeout(() => resolve(null), FAILURE_BOUND_MS);');
 });
 
 test('the real-time rule leaves process suites and product code alone', () => {
