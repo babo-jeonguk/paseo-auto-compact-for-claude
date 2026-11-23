@@ -21,8 +21,8 @@ const namedTiming = 'A timer or deadline argument is a named constant with an _M
 const timer = "/^(setTimeout|setInterval)$/";
 // The delay argument when a number is written into it, alone or inside an
 // expression; 0 (the next turn, or a lower bound) is not a duration. A function
-// in that position is a callback, as in `array.every(item => …)`.
-const number = "Literal[raw=/^[0-9]/]:not([value=0])";
+// in that position is a callback; `every` is a timer only on a clock.
+const number = "Literal[raw=/^\\.?[0-9]/]:not([value=0])";
 const literal = (call, position) =>
   `${call} > :nth-child(${position}):not(:function):matches(${number}, :has(${number}))`;
 
@@ -34,19 +34,22 @@ export const projectRules = [
         {
           // A sleep: a delayed timer whose callback only wakes something, as
           // `setTimeout(resolve, ms)`, `() => resolve()` or `setInterval(poll, ms)`.
-          // A timer that ends a wait with a value or an error is a bound that
-          // fires only when the test fails, and is left alone.
+          // A timer that ends a wait with a value or an error, including one
+          // passed as an extra argument, is a bound that fires only when the
+          // test fails, and is left alone.
           selector: `CallExpression:matches([callee.name=${timer}], [callee.object.name='globalThis'][callee.property.name=${timer}])` +
             "[arguments.length>1]:not([arguments.1.value=0]):matches(" +
-            "[arguments.0.type='Identifier'], " +
+            "[arguments.0.type='Identifier'][arguments.length=2], " +
             "[arguments.0.body.type='CallExpression'][arguments.0.body.arguments.length=0], " +
             "[arguments.0.body.body.length=1][arguments.0.body.body.0.expression.type='CallExpression']" +
             "[arguments.0.body.body.0.expression.arguments.length=0])",
           message: realTime,
         },
         {
+          // The whole module under another name reaches the same timers.
           selector: "ImportDeclaration[source.value=/^(node:)?timers\\/promises$/] > " +
-            "ImportSpecifier[imported.name=/^(setTimeout|setInterval|scheduler)$/]",
+            ":matches(ImportSpecifier[imported.name=/^(setTimeout|setInterval|scheduler)$/], " +
+            "ImportNamespaceSpecifier, ImportDefaultSpecifier)",
           message: realTime,
         },
       ],
@@ -59,7 +62,8 @@ export const projectRules = [
       "no-restricted-syntax": ["error", {
         selector: [
           literal(`CallExpression:matches([callee.name=${timer}], [callee.property.name=${timer}], [callee.name='bounded'])`, 2),
-          literal("CallExpression[callee.property.name='every']", 1),
+          literal("CallExpression[callee.property.name='every']:matches([callee.object.name='clock'], " +
+            "[callee.object.property.name='clock'])", 1),
           literal("CallExpression[callee.object.name='AbortSignal'][callee.property.name='timeout']", 1),
         ].join(", "),
         message: namedTiming,
