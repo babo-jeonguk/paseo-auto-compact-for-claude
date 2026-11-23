@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mock, test } from "node:test";
+import { test } from "node:test";
 import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -708,7 +708,7 @@ test("a scan whose later listing page fails stays single-flight until reads star
   }
 });
 
-test("a listed conversation's read is bounded from when it starts, not from when paging ends", async () => {
+test("a listed conversation's read is bounded from when it starts, not from when paging ends", async (t) => {
   let releasePage!: () => void;
   const page = new Promise<void>(resolve => { releasePage = resolve; });
   let releaseA!: () => void;
@@ -720,7 +720,10 @@ test("a listed conversation's read is bounded from when it starts, not from when
     holdPage: start => start === 1 ? page : undefined,
   });
   const { scheduler, listing, reserved } = directoryScheduler(dir.host);
-  mock.timers.enable({ apis: ["setTimeout"] });
+  // Runs even if the test stops early, at a failed assertion or at the test
+  // runner's bound.
+  t.after(() => { scheduler.stop(); dir.host.stop(); });
+  t.mock.timers.enable({ apis: ["setTimeout"] });
   try {
     await scheduler.ready;
     let settled: unknown = "pending";
@@ -731,20 +734,17 @@ test("a listed conversation's read is bounded from when it starts, not from when
     await readingA;
     assert.deepEqual(dir.reads, ["a"], "a's read starts with the first page");
     // Paging takes four of the five seconds; a's read never ends.
-    mock.timers.tick(4_000);
+    t.mock.timers.tick(4_000);
     releasePage();
     await listing();
     assert.equal(outcome(), "pending", "a's read is not timed out when paging ends");
-    mock.timers.tick(1_000);
+    t.mock.timers.tick(1_000);
     await ended;
     assert.ok(outcome() instanceof Error, "a's read timed out five seconds after it started");
     assert.deepEqual(reserved(), ["b", "c"], "every other listed reply is still reserved");
   } finally {
     releasePage();
     releaseA();
-    mock.timers.reset();
-    scheduler.stop();
-    dir.host.stop();
   }
 });
 

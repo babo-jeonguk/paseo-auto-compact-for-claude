@@ -52,7 +52,7 @@ test('unit tests start no real timer with a delay', () => {
       'setTimeout(resolve, 0);',
       'setTimeout(resolve);',
       'clock.setTimeout(fire, 5_000);',
-      'mock.timers.tick(5_000);',
+      't.mock.timers.tick(5_000);',
       "import { setImmediate } from 'node:timers/promises';",
       "import { setImmediate } from 'node:timers';",
       // A key built at run time is left to review: lint cannot tell what it names.

@@ -21,6 +21,9 @@ const realTime = 'Unit tests start no real timer with a delay. Advance the injec
 const countedWait = 'A unit test waits for a condition through a signal, not by counting loop turns: wait on the fake\'s ' +
   'change (changes() in tests/support/changes.ts) or on the promise of the step itself; the test runner bounds the ' +
   'wait (CODING_STANDARDS.md "Tests").';
+const contextMock = 'A unit test mocks through its test context (t.mock), which the runner restores even when the ' +
+  'test stops at its bound and its finally never runs; a mock on the shared tracker would outlive it ' +
+  '(CODING_STANDARDS.md "Tests").';
 const namedTiming = 'A timer or deadline argument is a named constant with an _MS suffix and a comment ' +
   'that says why it has that value (CODING_STANDARDS.md "Named timings").';
 const timer = "/^(setTimeout|setInterval)$/";
@@ -63,6 +66,12 @@ export const projectRules = [
           selector: "ForStatement:has(AwaitExpression):matches([test.type='LogicalExpression'], " +
             ":has(BreakStatement), :has(ReturnStatement))",
           message: countedWait,
+        },
+        {
+          // The shared tracker's mocks that patch state other tests also see.
+          // mock.fn() makes a standalone function and patches nothing.
+          selector: "MemberExpression[object.name='mock'][property.name=/^(timers|method|getter|setter|property|module)$/]",
+          message: contextMock,
         },
         {
           // The same modules loaded at run time, named by a string or a

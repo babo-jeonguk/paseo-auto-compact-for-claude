@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mock, test } from "node:test";
+import { test } from "node:test";
 import {
   DEFAULT_SETTINGS,
   SettingsSchema,
@@ -1456,7 +1456,7 @@ test("over a minute of ten-second passes with one reservation held, the director
     "each attention pass reads only the conversation needing attention");
 });
 
-test("an attention pass applies one conversation's newer reply although another's read times out", async () => {
+test("an attention pass applies one conversation's newer reply although another's read times out", async (t) => {
   const f = fixture();
   f.agents.splice(0, 1, nativeAgent(f, "a"), nativeAgent(f, "b"));
   const s = f.make();
@@ -1469,11 +1469,11 @@ test("an attention pass applies one conversation's newer reply although another'
   // b replied again while both still hold a reservation.
   f.advance(10_000);
   f.agents[1] = nativeAgent(f, "b", "2");
-  mock.timers.enable({ apis: ["setTimeout"] });
+  t.mock.timers.enable({ apis: ["setTimeout"] });
   try {
     const pass = s.observe({ kind: "periodic" });
     await settle();
-    mock.timers.tick(5_000);
+    t.mock.timers.tick(5_000);
     await assert.rejects(pass, "a's timeout is still reported");
     assert.equal(f.state.jobs.find(job => job.agentId === "b")?.activityKey, "launch:b:2",
       "b's newer reply is applied in the same pass");
@@ -1489,11 +1489,10 @@ test("an attention pass applies one conversation's newer reply although another'
     assert.deepEqual(f.counts.refreshes.filter(id => id === "b"), ["b", "b"]);
   } finally {
     releaseA?.();
-    mock.timers.reset();
   }
 });
 
-test("an attention read that never ends stops blocking observation after a minute", async () => {
+test("an attention read that never ends stops blocking observation after a minute", async (t) => {
   const f = fixture();
   f.agents.splice(0, 1, nativeAgent(f, "a"));
   const s = f.make();
@@ -1501,36 +1500,32 @@ test("an attention read that never ends stops blocking observation after a minut
   await s.observe({ kind: "periodic" });
   f.holdRefresh("a", () => new Promise<void>(() => {}));
   f.advance(10_000);
-  mock.timers.enable({ apis: ["setTimeout"] });
-  try {
-    const pass = s.observe({ kind: "periodic" });
-    await settle();
-    mock.timers.tick(5_000);
-    await assert.rejects(pass);
-    f.addAgent("b");
-    const next = s.observe({ kind: "agent", agentId: "b" });
-    await settle();
-    assert.deepEqual(f.counts.refreshes.filter(id => id === "b"), [], "held while a's read runs");
-    await f.timers.tick(60_000); // the scheduler's single-flight bound
-    await next;
-    assert.deepEqual(f.counts.refreshes.filter(id => id === "b"), ["b"], "observation resumes instead of stalling for good");
-  } finally {
-    mock.timers.reset();
-  }
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const pass = s.observe({ kind: "periodic" });
+  await settle();
+  t.mock.timers.tick(5_000);
+  await assert.rejects(pass);
+  f.addAgent("b");
+  const next = s.observe({ kind: "agent", agentId: "b" });
+  await settle();
+  assert.deepEqual(f.counts.refreshes.filter(id => id === "b"), [], "held while a's read runs");
+  await f.timers.tick(60_000); // the scheduler's single-flight bound
+  await next;
+  assert.deepEqual(f.counts.refreshes.filter(id => id === "b"), ["b"], "observation resumes instead of stalling for good");
 });
 
-test("a full scan reserves one listed conversation's finished reply although another's observation times out", async () => {
+test("a full scan reserves one listed conversation's finished reply although another's observation times out", async (t) => {
   const f = fixture();
   f.agents.splice(0, 1, nativeAgent(f, "a"), nativeAgent(f, "b"));
   let releaseA!: () => void;
   f.holdListed("a", () => new Promise<void>(resolve => { releaseA = resolve; }));
   const s = f.make();
   await s.ready;
-  mock.timers.enable({ apis: ["setTimeout"] });
+  t.mock.timers.enable({ apis: ["setTimeout"] });
   try {
     const scan = s.observe({ kind: "full" });
     await settle();
-    mock.timers.tick(5_000);
+    t.mock.timers.tick(5_000);
     await assert.rejects(scan, "a's timeout is still reported");
     assert.deepEqual(reserved(f), ["b"], "b's reservation is created by the scan");
     // a's observation is not cancelled: the next observation waits for it.
@@ -1542,7 +1537,6 @@ test("a full scan reserves one listed conversation's finished reply although ano
     assert.deepEqual(f.counts.refreshes, ["b"]);
   } finally {
     releaseA?.();
-    mock.timers.reset();
   }
 });
 
@@ -1702,38 +1696,34 @@ test("a scan read before a session's new generation cannot replace its skipped r
   assert.equal(f.calls, 0, "a skipped reply is never compacted");
 });
 
-test("a scan that times out keeps observation single-flight until its listing actually ends", async () => {
+test("a scan that times out keeps observation single-flight until its listing actually ends", async (t) => {
   const f = fixture();
   const s = f.make();
   await s.ready;
-  mock.timers.enable({ apis: ["setTimeout"] });
-  try {
-    const release = f.holdList();
-    const first = s.observe({ kind: "full" });
-    await settle();
-    mock.timers.tick(5_000);
-    await assert.rejects(first);
-    const second = s.observe({ kind: "full" });
-    await settle();
-    assert.equal(f.counts.lists, 1, "no second listing while the first is still running");
-    release();
-    await second;
-    assert.equal(f.counts.lists, 2, "the queued scan runs once the listing ends");
-  } finally {
-    mock.timers.reset();
-  }
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const release = f.holdList();
+  const first = s.observe({ kind: "full" });
+  await settle();
+  t.mock.timers.tick(5_000);
+  await assert.rejects(first);
+  const second = s.observe({ kind: "full" });
+  await settle();
+  assert.equal(f.counts.lists, 1, "no second listing while the first is still running");
+  release();
+  await second;
+  assert.equal(f.counts.lists, 2, "the queued scan runs once the listing ends");
 });
 
-test("a listing that never ends stops blocking observation after a minute", async () => {
+test("a listing that never ends stops blocking observation after a minute", async (t) => {
   const f = fixture();
   const s = f.make();
   await s.ready;
-  mock.timers.enable({ apis: ["setTimeout"] });
+  t.mock.timers.enable({ apis: ["setTimeout"] });
   const release = f.holdList();
   try {
     const first = s.observe({ kind: "full" });
     await settle();
-    mock.timers.tick(5_000);
+    t.mock.timers.tick(5_000);
     await assert.rejects(first);
     await f.timers.tick(60_000); // the scheduler's single-flight bound
     await settle();
@@ -1743,7 +1733,6 @@ test("a listing that never ends stops blocking observation after a minute", asyn
     await second;
   } finally {
     release();
-    mock.timers.reset();
   }
 });
 
@@ -2122,7 +2111,7 @@ test("one conversation's failed refresh does not drop another conversation's fin
   assert.deepEqual(reserved(f), ["b"], "b's finished reply is reserved without waiting for a full scan");
 });
 
-test("a refresh that hangs past the deadline does not drop another conversation's finished reply", async () => {
+test("a refresh that hangs past the deadline does not drop another conversation's finished reply", async (t) => {
   const f = fixture();
   f.agents.splice(0, 1);
   const s = f.make();
@@ -2130,7 +2119,7 @@ test("a refresh that hangs past the deadline does not drop another conversation'
   let releaseA!: () => void;
   f.holdRefresh("a", () => new Promise<void>(resolve => { releaseA = resolve; }));
   const release = f.holdList();
-  mock.timers.enable({ apis: ["setTimeout"] });
+  t.mock.timers.enable({ apis: ["setTimeout"] });
   try {
     // A full scan that read no conversation is still running...
     const full = s.observe({ kind: "full" });
@@ -2141,7 +2130,7 @@ test("a refresh that hangs past the deadline does not drop another conversation'
     release();
     await full;
     await settle();
-    mock.timers.tick(5_000);
+    t.mock.timers.tick(5_000);
     await assert.rejects(merged[1], "the timeout is still reported");
     assert.deepEqual(reserved(f), ["b"], "b's finished reply is reserved although a's read is still running");
     const again = s.observe({ kind: "agent", agentId: "b" });
@@ -2152,7 +2141,6 @@ test("a refresh that hangs past the deadline does not drop another conversation'
     await again;
   } finally {
     releaseA?.();
-    mock.timers.reset();
   }
 });
 
