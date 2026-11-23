@@ -5,6 +5,7 @@ import { join, delimiter } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createObserver, QUERY_RESTARTED_REFUSAL } from './observer';
 import { CLOCK_STEP_TOLERANCE_MS } from './deadline';
+import { observerAsset } from './observer-assets.generated';
 import type { PluginSessionOpenRequest } from '@getpaseo/plugin/server';
 import type { Observation, StoredOperation } from './model';
 
@@ -63,21 +64,35 @@ test('observer session preparation preserves provider environment and ignores hi
   } finally { await f.close(); }
 });
 
+// Observer builds that open sessions may still run: releases, and main for
+// direct GitHub installs. Listing the current build here makes a change to the
+// observer source fail the test below until its new build is added, and the
+// build it replaces then stays checked as readable.
+const READABLE_BUILDS = ['af6c6639f8c3058a73d5e982e308b69f5572fc6439a0c8fea61c1ca629ef4239',
+  '8a6c0217779bc4f83c7029c8170c35da8d2ed8028622019f4a09808491dff90f',
+  '7d9c570c36bcad4db9ef816c0b704c5b0d01d12c7522b215cdfbbfc160c86648',
+  '9fa0456c8d59db1297e540db98993d8d23e34dbfb4a487843334926447ece70b',
+  'ece7bf8ce5445aedb974f30472983b78c7358b8feea99d15c1ef2369d88a26e4',
+  // v1.2.1
+  '134e83d3751cca2f86c2ccda713162c7e739827df129e2020ab88a039c564e63',
+  // main after #23 (query-restart refusal), installed by direct GitHub updates
+  '35dc721b4f7cd02d1618f04fb9b9f856513ba21d07dc6abcac291911d94e8509',
+  // v1.2.2
+  '61b60834478e92325dc73fdb2b9235805997f990fe5ab8664bfef7ccc8f06d61',
+  // main after the lint cleanup: why-comments and a named heartbeat only
+  '4ab2a02a0d279eb0db390fa1462b83db78aa1dea74c8e12af7f07174eb7789b5'];
+
+test('the current observer build is listed, so the build it replaces stays checked', () => {
+  assert(READABLE_BUILDS.includes(observerAsset.version),
+    `The observer source changed. Add its build ${observerAsset.version} to READABLE_BUILDS, and keep ` +
+    'the build it replaces in compatibleBuilds in server/observer.ts unless the ledger contract changed.');
+});
+
 test('the compatible pre-fix observer stays readable during rollout; unknown builds stay rejected', async () => {
   const f = await fixture();
   try {
     const manifestPath = join(f.parent, 'current.json');
-    for (const build of ['af6c6639f8c3058a73d5e982e308b69f5572fc6439a0c8fea61c1ca629ef4239',
-      '8a6c0217779bc4f83c7029c8170c35da8d2ed8028622019f4a09808491dff90f',
-      '7d9c570c36bcad4db9ef816c0b704c5b0d01d12c7522b215cdfbbfc160c86648',
-      '9fa0456c8d59db1297e540db98993d8d23e34dbfb4a487843334926447ece70b',
-      'ece7bf8ce5445aedb974f30472983b78c7358b8feea99d15c1ef2369d88a26e4',
-      // v1.2.1
-      '134e83d3751cca2f86c2ccda713162c7e739827df129e2020ab88a039c564e63',
-      // main after #23 (query-restart refusal), installed by direct GitHub updates
-      '35dc721b4f7cd02d1618f04fb9b9f856513ba21d07dc6abcac291911d94e8509',
-      // v1.2.2
-      '61b60834478e92325dc73fdb2b9235805997f990fe5ab8664bfef7ccc8f06d61']) {
+    for (const build of READABLE_BUILDS) {
       await writeFile(manifestPath, JSON.stringify({ ...f.manifest, build }));
       assert(await f.observer.read('a'));
       f.ledger.pendingInputs = 1; await f.save();

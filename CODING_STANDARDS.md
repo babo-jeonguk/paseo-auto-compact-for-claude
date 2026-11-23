@@ -56,4 +56,4 @@ Comments explain why code is the way it is: the host behavior it works around, t
 
 ## Generated and checked files
 
-`server/observer-assets.generated.ts` is generated from `server/observer-source.mjs` by `npm run build:observer`; edit the source, never the generated file. Text files use LF line endings on every OS.
+`server/observer-assets.generated.ts` is generated from `server/observer-source.mjs` by `npm run build:observer`; edit the source, never the generated file. Any edit to the source makes a new observer build, and sessions opened before the update keep running the old one. `server/observer.test.ts` fails until the new build is added to `READABLE_BUILDS`; the build it replaces stays in `compatibleBuilds` in `server/observer.ts` unless the ledger contract changed. Text files use LF line endings on every OS.
