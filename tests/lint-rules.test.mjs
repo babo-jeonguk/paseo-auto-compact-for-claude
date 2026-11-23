@@ -31,6 +31,8 @@ test('unit tests do not sleep in real time', () => {
       "import { setTimeout } from 'node:timers/promises';",
       "import { setInterval as every } from 'timers/promises';",
       "import { scheduler } from 'node:timers/promises';",
+      "import * as timers from 'node:timers/promises';",
+      "import timers from 'timers/promises';",
     ]) flags(file, code, /CODING_STANDARDS\.md "Tests"/);
     for (const code of [
       'await new Promise(resolve => setImmediate(resolve));',
@@ -41,6 +43,7 @@ test('unit tests do not sleep in real time', () => {
       // A bound that ends a wait with a value only fires when the test fails.
       'timer = setTimeout(() => resolve(null), ms);',
       "setTimeout(() => reject(new Error('stuck')), 1_000);",
+      'setTimeout(reject, FAILURE_BOUND_MS, new Error("stuck"));',
       "import { setImmediate } from 'node:timers/promises';",
     ]) passes(file, code);
   }
@@ -63,6 +66,8 @@ test('product timer and deadline arguments are named constants', () => {
       'bounded(work, 5_000);',
       'await $.clock.every(5_000, save);',
       'AbortSignal.timeout(15_000);',
+      'setTimeout(fire, .5);',
+      'clock.every(500, read);',
     ]) flags(file, code, /CODING_STANDARDS\.md "Named timings"/);
     for (const code of [
       'setTimeout(fire, POLL_MS);',
@@ -71,6 +76,7 @@ test('product timer and deadline arguments are named constants', () => {
       'bounded(work, Math.min(INSPECT_TIMEOUT_MS, deadline - now));',
       'clock.every(HEARTBEAT_MS, save);',
       'items.every(item => item.size > 1000);',
+      'items.every(hasAtLeast(1000));',
       'AbortSignal.timeout(REGISTRY_TIMEOUT_MS);',
     ]) passes(file, code);
   }
