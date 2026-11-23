@@ -8,9 +8,10 @@ cd paseo-auto-compact-for-claude
 npm ci --ignore-scripts
 npm run build:observer
 npm run check
+npm run lint
 ```
 
-`check` verifies the embedded observer source, TypeScript, scheduling, file persistence, conversation controls and execution tests. Run `build:observer` after changing `server/observer-source.mjs`. The fast CI matrix runs these checks on Linux, macOS and Windows against each Paseo SDK version listed in `.github/workflows/check.yml`. The package keeps SDK 0.12 pinned as the minimum compile-time contract. Separate native simulation jobs exercise real Claude with each Paseo version in that workflow's simulation matrix on Linux and Windows.
+`check` verifies the embedded observer source, TypeScript, scheduling, file persistence, conversation controls and execution tests. `lint` runs ESLint with type information over the code, tests and suites; `eslint.config.mjs` states why each rule it turns off or adjusts is set that way. It fails on any warning, a disable comment needs a reason after `--`, and a disable comment that no longer suppresses anything is an error. CI runs it once, in its own job, rather than in every SDK and OS combination. Run `build:observer` after changing `server/observer-source.mjs`. The fast CI matrix runs these checks on Linux, macOS and Windows against each Paseo SDK version listed in `.github/workflows/check.yml`. The package keeps SDK 0.12 pinned as the minimum compile-time contract. Separate native simulation jobs exercise real Claude with each Paseo version in that workflow's simulation matrix on Linux and Windows.
 
 The `Paseo release` workflow checks npm every day at 18:00 KST. The first beta or release of a Paseo line newer than the newest `@getpaseo/cli` in `tests/simulation/package.json` opens one `paseo-release` issue for that line, mentioning the repository owner; later betas of the line and its `.0` release are comments on that issue, and patch releases are ignored. The baseline is the simulation, not the SDK pin, because the pin stays at the 0.12 minimum contract. The pull request that adds the line to the simulation closes the issue. `node --import tsx scripts/watch-paseo-release.ts --dry-run` prints what it would post.
 
@@ -59,11 +60,12 @@ Distribution uses the public GitHub repository and GitHub Releases. `private: tr
 
 Text files use LF line endings on every OS. Keep `.gitattributes` in the checkout: the embedded observer's source hash and generated-file check must remain identical on Windows.
 
-During an edit, run the relevant test first, then `npm run test:update` (the fast observer, TypeScript and unit checks):
+During an edit, run the relevant test first, then `npm run test:update` (the fast observer, TypeScript and unit checks) and `npm run lint`:
 
 ```sh
 npm run test:focused -- server/cache.test.ts
 npm run test:update
+npm run lint
 ```
 
 After committing, use a disposable detached worktree for native validation. The runner records the exact commit and keeps results in `test-results/snapshots/<sha>-<timestamp>/`. Editing or pushing your original checkout does not change the files being tested.

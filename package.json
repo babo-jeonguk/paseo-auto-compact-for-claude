@@ -14,6 +14,7 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
+    "lint": "eslint --max-warnings 0 . && echo ESLint found no problems",
     "test": "node --import tsx --test --test-isolation=none server/*.test.ts scripts/*.test.ts tests/*.test.mjs",
     "check": "npm run check:observer && npm run typecheck && npm test",
     "prepack": "npm run build:observer && npm run check",
@@ -39,16 +40,21 @@
     "test:simulation:0.17": "node --no-maglev tests/simulation/run.mjs --paseo 0.17.1"
   },
   "devDependencies": {
+    "@eslint-community/eslint-plugin-eslint-comments": "^4.8.1",
+    "@eslint/js": "^10.0.1",
     "@getpaseo/client": "0.12.0",
     "@getpaseo/plugin": "0.12.0",
     "@getpaseo/protocol": "0.12.0",
     "@tanstack/react-query": "^5.90.11",
     "@types/node": "^22.20.4",
     "@types/react": "~19.2.0",
+    "eslint": "^10.15.0",
+    "globals": "^17.14.0",
     "react": "19.1.0",
     "react-native": "0.81.5",
     "tsx": "^4.20.0",
     "typescript": "^5.9.3",
+    "typescript-eslint": "^8.73.0",
     "zod": "^4.4.3"
   },
   "files": [
