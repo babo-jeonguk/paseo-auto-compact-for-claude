@@ -35,10 +35,13 @@ export const projectRules = [
       "no-restricted-syntax": ["error",
         {
           // Any delay but 0 (the next turn), whatever the callback does, called
-          // by name or through the global object.
+          // by name or through the global object with a written key. A timer
+          // reached through another name or a key built at run time is left
+          // to review: a selector cannot tell what it names.
           selector: `CallExpression:matches([callee.name=${timer}], ` +
             `[callee.object.name=/^global(This)?$/]:matches([callee.property.name=${timer}], ` +
-            `[callee.property.value=${timer}], [callee.property.quasis.0.value.cooked=${timer}]))` +
+            `[callee.property.value=${timer}], ` +
+            `[callee.property.expressions.length=0][callee.property.quasis.0.value.cooked=${timer}]))` +
             "[arguments.length>1]:not([arguments.1.value=0])",
           message: realTime,
         },
@@ -49,8 +52,10 @@ export const projectRules = [
           message: realTime,
         },
         {
-          // The same modules loaded at run time.
-          selector: "ImportExpression[source.value=/^(node:)?timers(\\/promises)?$/]",
+          // The same modules loaded at run time, named by a string or a
+          // template without interpolation.
+          selector: "ImportExpression:matches([source.value=/^(node:)?timers(\\/promises)?$/], " +
+            "[source.expressions.length=0][source.quasis.0.value.cooked=/^(node:)?timers(\\/promises)?$/])",
           message: realTime,
         },
       ],
