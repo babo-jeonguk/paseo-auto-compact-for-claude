@@ -33,24 +33,29 @@ export const projectRules = [
       "no-restricted-syntax": ["error",
         {
           // A sleep: a delayed timer whose callback only wakes something, as
-          // `setTimeout(resolve, ms)`, `() => resolve()` or `setInterval(poll, ms)`.
-          // A timer that ends a wait with a value or an error, including one
-          // passed as an extra argument, is a bound that fires only when the
-          // test fails, and is left alone.
+          // `setTimeout(resolve, ms)`, `() => resolve()` or `setInterval(poll, ms, id)`.
+          // A timer that ends a wait with a value or an error, including
+          // `setTimeout(reject, ms, error)`, is a bound that fires only when
+          // the test fails, and is left alone.
           selector: `CallExpression:matches([callee.name=${timer}], [callee.object.name='globalThis'][callee.property.name=${timer}])` +
             "[arguments.length>1]:not([arguments.1.value=0]):matches(" +
-            "[arguments.0.type='Identifier'][arguments.length=2], " +
+            "[arguments.0.type='Identifier']:not([arguments.0.name=/^(resolve|reject)$/][arguments.length>2]), " +
             "[arguments.0.body.type='CallExpression'][arguments.0.body.arguments.length=0], " +
             "[arguments.0.body.body.length=1][arguments.0.body.body.0.expression.type='CallExpression']" +
             "[arguments.0.body.body.0.expression.arguments.length=0])",
           message: realTime,
         },
         {
-          // The whole module under another name reaches the same timers.
           selector: "ImportDeclaration[source.value=/^(node:)?timers\\/promises$/] > " +
-            ":matches(ImportSpecifier[imported.name=/^(setTimeout|setInterval|scheduler)$/], " +
-            "ImportNamespaceSpecifier, ImportDefaultSpecifier)",
+            "ImportSpecifier[imported.name=/^(setTimeout|setInterval|scheduler)$/]",
           message: realTime,
+        },
+        {
+          // Which members the whole module is used for is not visible here.
+          selector: "ImportDeclaration[source.value=/^(node:)?timers\\/promises$/] > " +
+            ":matches(ImportNamespaceSpecifier, ImportDefaultSpecifier)",
+          message: "Import setImmediate by name from node:timers/promises; its other timers sleep in real time " +
+            '(CODING_STANDARDS.md "Tests").',
         },
       ],
     },
