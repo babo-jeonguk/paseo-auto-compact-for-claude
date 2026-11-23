@@ -126,24 +126,25 @@ test("offline ticks retry removal failures; successful sweeps run hourly and tol
   } finally { await f.close(); }
 });
 
-test("cleanup preserves same-activity protection across restart and allows a new native generation", async () => {
+test("cleanup preserves same-activity protection across restart and allows a new native generation", async (t) => {
   const f = await fixture();
-  try {
-    let s = f.make(); await s.ready;
-    assert.equal(await s.operation("old"), null);
-    assert.deepEqual((await f.disk.read()).disabled, ["a"]);
-    // Paseo can advance the host timestamp for /compact itself.
-    f.agent.revision = new Date(2000).toISOString();
-    const result = await s.compactNow("a", f.agent.revision, "new-id");
-    assert.equal(result.code, "existing"); assert.equal(result.operationId, null);
-    await s.observedTurn(f.agent); await s.tick(); assert.equal(f.sends, 0);
-    s.stop(); s = f.make(); await s.ready;
-    assert.equal((await s.compactNow("a", f.agent.revision, "another-id")).code, "existing");
-    f.agent.activityKey = "new-generation:1";
-    assert.equal((await s.compactNow("a", f.agent.revision, "fresh-id")).code, "accepted");
-    await f.committed(state => state.operations.some(op => op.id === "fresh-id" && op.state === "succeeded"));
-    assert.equal((await s.operation("fresh-id"))?.state, "succeeded");
-    assert.equal(f.sends, 1);
-    s.stop();
-  } finally { await f.close(); }
+  let s = f.make();
+  // Runs even if the test stops early, at a failed assertion or at the test
+  // runner's bound: the scheduler's timers stop before the folder is removed.
+  t.after(async () => { s.stop(); await f.close(); });
+  await s.ready;
+  assert.equal(await s.operation("old"), null);
+  assert.deepEqual((await f.disk.read()).disabled, ["a"]);
+  // Paseo can advance the host timestamp for /compact itself.
+  f.agent.revision = new Date(2000).toISOString();
+  const result = await s.compactNow("a", f.agent.revision, "new-id");
+  assert.equal(result.code, "existing"); assert.equal(result.operationId, null);
+  await s.observedTurn(f.agent); await s.tick(); assert.equal(f.sends, 0);
+  s.stop(); s = f.make(); await s.ready;
+  assert.equal((await s.compactNow("a", f.agent.revision, "another-id")).code, "existing");
+  f.agent.activityKey = "new-generation:1";
+  assert.equal((await s.compactNow("a", f.agent.revision, "fresh-id")).code, "accepted");
+  await f.committed(state => state.operations.some(op => op.id === "fresh-id" && op.state === "succeeded"));
+  assert.equal((await s.operation("fresh-id"))?.state, "succeeded");
+  assert.equal(f.sends, 1);
 });
