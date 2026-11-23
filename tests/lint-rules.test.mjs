@@ -63,6 +63,26 @@ test('unit tests start no real timer with a delay', () => {
   }
 });
 
+// A loop that waits for a condition but gives up after a number of turns
+// fails on a slower machine and duplicates the runner's bound.
+test('unit tests do not wait for a condition by counting turns', () => {
+  for (const file of ['server/a.test.ts', 'scripts/a.test.ts', 'tests/a.test.mjs', 'tests/support/a.ts']) {
+    for (const code of [
+      'for (let i = 0; i < 100 && !done(); i++) await settle();',
+      'for (let i = 0; i < 100 && (await read()) !== "done"; i++) await settle();',
+      'async function wait() { for (let i = 0; i < 100; i++) { if (done()) return; await settle(); } }',
+      'for (let i = 0; i < 100; i++) { if (done()) break; await new Promise(resolve => setImmediate(resolve)); }',
+    ]) flags(file, code, /CODING_STANDARDS\.md "Tests"/);
+    for (const code of [
+      'for (let i = 0; i < 19; i++) await f.tick();',
+      'while (!done()) await changed();',
+      'for (const page of pages) { if (!page) break; await read(page); }',
+      'for (let i = 0; i < 5; i++) assert.equal(await read(), 1);',
+    ]) passes(file, code);
+  }
+  passes('server/a.ts', 'for (let i = 0; i < 100 && !done(); i++) await settle();');
+});
+
 test('the real-time rule leaves process suites and product code alone', () => {
   for (const file of ['tests/simulation/run.mjs', 'tests/e2e/run.mjs', 'tests/simulation/a.test.mjs'])
     passes(file, 'await new Promise(resolve => setTimeout(resolve, 50));');
