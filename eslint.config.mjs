@@ -39,7 +39,7 @@ export const projectRules = [
           // reached through another name or a key built at run time is left
           // to review: a selector cannot tell what it names.
           selector: `CallExpression:matches([callee.name=${timer}], ` +
-            `[callee.object.name=/^global(This)?$/]:matches([callee.property.name=${timer}], ` +
+            `[callee.object.name=/^global(This)?$/]:matches([callee.computed=false][callee.property.name=${timer}], ` +
             `[callee.property.value=${timer}], ` +
             `[callee.property.expressions.length=0][callee.property.quasis.0.value.cooked=${timer}]))` +
             "[arguments.length>1]:not([arguments.1.value=0])",
@@ -48,7 +48,8 @@ export const projectRules = [
         {
           // Everything these modules offer but setImmediate waits in real time.
           selector: "ImportDeclaration[source.value=/^(node:)?timers(\\/promises)?$/] > " +
-            ":matches(ImportSpecifier:not([imported.name='setImmediate']), ImportNamespaceSpecifier, ImportDefaultSpecifier)",
+            ":matches(ImportSpecifier:not([imported.name='setImmediate'], [imported.value='setImmediate']), " +
+            "ImportNamespaceSpecifier, ImportDefaultSpecifier)",
           message: realTime,
         },
         {
