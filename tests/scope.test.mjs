@@ -1,8 +1,11 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { access, mkdir, writeFile } from 'node:fs/promises';
+import { once } from 'node:events';
+import { access, mkdir, readdir, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { createInterface } from 'node:readline';
+import { fileURLToPath } from 'node:url';
 import { cleanupScope } from './support/scope.ts';
 
 // A test context as the scope sees it: `end()` runs the hooks it registered
@@ -100,4 +103,128 @@ test('what was started on a folder stops before the folder goes, so its late wri
   scope.defer(() => writeFile(join(folder, 'state.json'), 'late'));
   await t.end();
   await gone(folder);
+});
+
+const program = fileURLToPath(new URL('./support/child.mjs', import.meta.url));
+
+// Reads the `<what> <value>` lines a child prints until it has printed each
+// of `names`; fails if its output ends first.
+async function printed(child, names) {
+  const values = {};
+  try {
+    for await (const line of createInterface({ input: child.stdout })) {
+      const [name, ...rest] = line.split(' ');
+      values[name] = rest.join(' ');
+      if (names.every(wanted => wanted in values)) return values;
+    }
+  } finally {
+    child.stdout.resume(); // the rest is read and dropped, so the output can end
+  }
+  throw new Error(`the child ended after printing only ${JSON.stringify(values)}`);
+}
+
+// Whether a process can still act: a zombie waiting to be reaped cannot.
+async function running(scope, pid) {
+  try { process.kill(pid, 0); } catch (error) { if (error.code === 'ESRCH') return false; throw error; }
+  if (process.platform === 'win32') return true;
+  try {
+    const { stdout } = await scope.run('ps', ['-o', 'stat=', '-p', String(pid)], { timeout: 15_000 });
+    return !stdout.trim().startsWith('Z');
+  } catch (error) {
+    if (error.code === 1) return false; // ps lists no such process
+    throw error;
+  }
+}
+
+test('a child and its grandchild killed at the spawn timeout leave no process, and the folder they wrote to goes', async (t) => {
+  const probe = cleanupScope(t);
+  const c = context();
+  const scope = cleanupScope(c);
+  const child = await scope.spawn(process.execPath, [program, 'tree'], { timeout: 2_000 });
+  const closed = once(child, 'close');
+  const { folder, grandchild } = await printed(child, ['folder', 'child', 'grandchild']);
+  // The child's temp directory is a folder of the test's own.
+  assert.equal(dirname(dirname(folder)), tmpdir());
+  assert.match(folder, /compact-child-made-/);
+  assert.equal(dirname(folder), child.temp);
+  const [code, signal] = await closed;
+  assert.equal(code === 0, false, `the child was killed, not finished (${code}, ${signal})`);
+  assert.equal(await running(probe, Number(grandchild)), false, 'the grandchild ends with the child');
+  await access(folder);
+  await c.end();
+  await gone(child.temp);
+});
+
+test('the end of a test ends the process tree it started before removing the folder it wrote to', async (t) => {
+  const probe = cleanupScope(t);
+  const c = context();
+  const scope = cleanupScope(c);
+  const child = await scope.spawn(process.execPath, [program, 'tree'], { timeout: 60_000 });
+  const { folder, child: pid, grandchild } = await printed(child, ['folder', 'child', 'grandchild']);
+  await c.end();
+  assert.equal(await running(probe, Number(pid)), false, 'the child has ended');
+  assert.equal(await running(probe, Number(grandchild)), false, 'the grandchild has ended');
+  await gone(folder);
+  await gone(child.temp);
+});
+
+test('a child that already exited leaves nothing to end, and its folder still goes', async () => {
+  const c = context();
+  const scope = cleanupScope(c);
+  const child = await scope.spawn(process.execPath, [program, 'exit', '0'], { timeout: 15_000 });
+  const [code] = await once(child, 'close');
+  assert.equal(code, 0);
+  await c.end();
+  assert.deepEqual(c.notes, []);
+  await gone(child.temp);
+});
+
+test('run() returns what the child printed, and rejects with its exit code as execFile does', async () => {
+  const c = context();
+  const scope = cleanupScope(c);
+  const ran = await scope.run(process.execPath, [program, 'exit', '0'], { timeout: 15_000 });
+  assert.equal(ran.stdout, 'ran\n');
+  assert.equal(ran.stderr, '');
+  await assert.rejects(scope.run(process.execPath, [program, 'exit', '3'], { timeout: 15_000 }), error => {
+    assert.equal(error.code, 3);
+    assert.equal(error.signal, null);
+    assert.equal(error.stdout, 'ran\n');
+    return true;
+  });
+  await c.end();
+  await gone(ran.temp);
+});
+
+test('a child that cannot start fails the call and leaves no folder', async () => {
+  const c = context();
+  const scope = cleanupScope(c);
+  let temp;
+  await assert.rejects(scope.run(join(tmpdir(), 'compact-missing-program'), [], { timeout: 15_000 }), error => {
+    assert.equal(error.code, 'ENOENT');
+    temp = error.temp;
+    return true;
+  });
+  await c.end();
+  assert.deepEqual(c.notes, []);
+  await gone(temp);
+});
+
+// The property every test relies on, checked once end to end: a test file whose
+// test the runner stops at its bound while it holds folders, a scheduler and a
+// process tree. Run as the suite runs, in one process.
+test('a test stopped at the runner\'s bound releases what it holds: the run exits on its own and leaves no folder or process', async (t) => {
+  const scope = cleanupScope(t);
+  const file = fileURLToPath(new URL('./support/stopped-at-bound.ts', import.meta.url));
+  const failed = await scope.run(process.execPath,
+    ['--import', 'tsx', '--test', '--test-isolation=none', '--test-timeout=4000', file], {
+      cwd: fileURLToPath(new URL('..', import.meta.url)), timeout: 60_000,
+      // tsx would otherwise keep its compile cache in the temp directory.
+      env: { ...process.env, TSX_DISABLE_CACHE: '1' },
+    }).then(() => assert.fail('the stopped test must fail the run'), error => error);
+  assert.equal(failed.signal, null, `the run exited on its own:\n${failed.stdout}`);
+  assert.equal(failed.code, 1, failed.stdout);
+  assert.match(failed.stdout, /timed out after 4000ms/);
+  const [, ...pids] = failed.stdout.match(/holding (\d+) (\d+)/) ?? assert.fail(`the test never held its tree:\n${failed.stdout}`);
+  for (const pid of pids) assert.equal(await running(scope, Number(pid)), false, `process ${pid} has ended`);
+  assert.deepEqual(await readdir(failed.temp), [], 'nothing is left in the run\'s temp directory');
 });

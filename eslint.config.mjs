@@ -35,6 +35,9 @@ const cleanupInFinally = 'A test stopped at the runner\'s bound never reaches it
 const temporaryFolder = 'A unit test creates a temporary folder through its cleanup scope (folder() in ' +
   'tests/support/scope.ts), which registers the removal in the same call, so no step between creating the folder ' +
   'and registering its removal can leak it (CODING_STANDARDS.md "Tests").';
+const childProcess = 'A unit test starts a child process through its cleanup scope (spawn() or run() in ' +
+  'tests/support/scope.ts), which gives the child a temp directory inside a folder the test owns and ends its whole ' +
+  'process tree when the test ends, so nothing it starts or creates outlives the test (CODING_STANDARDS.md "Tests").';
 const testHook = 'A unit test registers cleanup with its cleanup scope (defer() in tests/support/scope.ts), whose one ' +
   'hook releases in reverse order of acquisition, runs every release and reports each failure. Hooks registered ' +
   'one by one run in registration order and stop at the first that throws (CODING_STANDARDS.md "Tests").';
@@ -64,15 +67,17 @@ const writtenKey = (name, path = "") => `:matches([${path}computed=false][${path
 // The timer modules loaded at run time, named by a string or a template
 // without interpolation: import(), require(), or process.getBuiltinModule()
 // (also through the global object).
-const written = (path) => `:matches([${path}value=${timersModule}], ` +
-  `[${path}expressions.length=0][${path}quasis.0.value.cooked=${timersModule}])`;
+const written = (path, module = timersModule) => `:matches([${path}value=${module}], ` +
+  `[${path}expressions.length=0][${path}quasis.0.value.cooked=${module}])`;
 // A timeout signal, by name or through the global object with a written key.
 const abortTimeout = `CallExpression > MemberExpression.callee${writtenKey("timeout")}:matches([object.name='AbortSignal'], ` +
   `[object.object.name=/^global(This)?$/]${writtenKey("AbortSignal", "object.")})`;
-const timersLoad = `ImportExpression${written("source.")}, ` +
+const moduleLoad = (module) => `ImportExpression${written("source.", module)}, ` +
   `CallExpression:matches([callee.name='require'], ` +
   `[callee.type='MemberExpression']${writtenKey("getBuiltinModule", "callee.")}:matches([callee.object.name='process'], ` +
-  `[callee.object.object.name=/^global(This)?$/]${writtenKey("process", "callee.object.")}))${written("arguments.0.")}`;
+  `[callee.object.object.name=/^global(This)?$/]${writtenKey("process", "callee.object.")}))${written("arguments.0.", module)}`;
+const timersLoad = moduleLoad(timersModule);
+const childProcessModule = "/^(node:)?child_process$/";
 // The delay argument when a number is written into it, alone or inside an
 // expression; 0 (the next turn, or a lower bound) is not a duration. A function
 // in that position is a callback; `every` is a timer only on a clock.
@@ -126,8 +131,10 @@ const unitTestRules = [
         },
 ];
 // Cleanup that bypasses the test's scope: a temporary folder made directly,
-// whose removal the caller registers only afterwards, and a hook of the test
-// runner, which runs outside the scope's order. The scope's module is exempt.
+// whose removal the caller registers only afterwards, a hook of the test
+// runner, which runs outside the scope's order, and a child process, whose
+// temp files and descendants the test would not own. The support modules are
+// exempt: the scope and the programs its tests start live there.
 const scopeRules = [
   {
     selector: ":matches(ImportSpecifier[imported.name=/^mkdtemp(Sync)?$/], " +
@@ -139,6 +146,13 @@ const scopeRules = [
     selector: `CallExpression > MemberExpression.callee${writtenKey("after")}, ` +
       "ImportDeclaration[source.value='node:test'] > ImportSpecifier[imported.name=/^(after|afterEach)$/]",
     message: testHook,
+  },
+  {
+    // Types alone start nothing.
+    selector: `ImportDeclaration[source.value=${childProcessModule}]:not([importKind='type']), ` +
+      `:matches(ExportNamedDeclaration, ExportAllDeclaration)[source.value=${childProcessModule}], ` +
+      moduleLoad(childProcessModule),
+    message: childProcess,
   },
 ];
 // A wait for one event-loop turn: an immediate, a timer or interval with no

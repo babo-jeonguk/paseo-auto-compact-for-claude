@@ -186,6 +186,31 @@ test('unit tests register cleanup with their scope, not with test hooks', () => 
   ]) passes('server/a.test.ts', code);
 });
 
+// A child started anywhere but the scope's helper keeps its own temp files and
+// descendants, which a killed child leaves behind.
+test('unit tests start child processes through their cleanup scope', () => {
+  const started = [
+    "import { spawn } from 'node:child_process';",
+    "import { execFile, spawn } from 'child_process';",
+    "import * as child from 'node:child_process';",
+    "import child from 'node:child_process';",
+    "export { fork } from 'node:child_process';",
+    "const { exec } = await import('node:child_process');",
+    "const { execFileSync } = require('child_process');",
+    "process.getBuiltinModule('node:child_process').spawn('git');",
+    'await import(`node:child_process`);',
+  ];
+  for (const file of ['server/a.test.ts', 'scripts/a.test.ts', 'tests/a.test.mjs'])
+    for (const code of started) flags(file, code, /CODING_STANDARDS\.md "Tests"/);
+  for (const code of started) passes('tests/support/a.ts', code);
+  for (const file of ['tests/simulation/run.mjs', 'tests/e2e/run.mjs', 'scripts/a.mjs', 'server/a.ts'])
+    passes(file, "import { spawn } from 'node:child_process';");
+  for (const code of [
+    "import type { ChildProcess } from 'node:child_process';",
+    "await scope.run('git', ['init'], { timeout: GIT_TIMEOUT_MS });",
+  ]) passes('server/a.test.ts', code);
+});
+
 test('the unit-test real-time rule leaves process suites and product code alone', () => {
   for (const file of ['tests/simulation/run.mjs', 'tests/e2e/run.mjs', 'tests/simulation/a.test.mjs']) {
     passes(file, 'await new Promise(resolve => setTimeout(resolve, 50));');

@@ -1,3 +1,4 @@
+import { spawn as start, spawnSync, type ChildProcess, type SpawnOptions } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,7 +15,21 @@ export interface CleanupScope {
   // Creates a folder under the system temp directory and registers its removal
   // in the same call, so no step between the two can leak it.
   folder(prefix: string): Promise<string>;
+  // Starts a child process the test owns: its temp directory (TMPDIR, TMP and
+  // TEMP) is a folder of the test's, given as `temp`, so whatever the child
+  // and its descendants create there goes when the test ends, and its whole
+  // process tree ends then too. `timeout` bounds a hung child: when it passes,
+  // the tree ends. Options are spawn()'s.
+  spawn(command: string, args: readonly string[], options: ChildOptions): Promise<Child>;
+  // Runs a child as spawn() does and collects its output, like execFile:
+  // resolves on exit code 0, and otherwise rejects with `code`, `signal`,
+  // `stdout` and `stderr` on the error. Both carry the child's `temp`.
+  run(command: string, args: readonly string[], options: ChildOptions): Promise<Ran>;
 }
+
+export type ChildOptions = Omit<SpawnOptions, "timeout" | "detached"> & { timeout: number };
+export type Child = ChildProcess & { temp: string };
+export interface Ran { stdout: string; stderr: string; temp: string }
 
 const scopes = new WeakMap<ScopeContext, CleanupScope>();
 
@@ -55,6 +70,47 @@ export function cleanupScope(t: ScopeContext): CleanupScope {
   };
   const scope: CleanupScope = {
     defer,
+    async spawn(command, args, { timeout, env = process.env, ...options }) {
+      // Acquired first, so it goes only once the tree has ended.
+      const temp = await scope.folder("compact-child-");
+      const child = Object.assign(start(command, args, {
+        windowsHide: true, ...options,
+        // Its own process group on POSIX, so the group can be signalled.
+        detached: process.platform !== "win32",
+        env: { ...env, TMPDIR: temp, TMP: temp, TEMP: temp },
+      }), { temp });
+      // Every stream closes once each process holding it has exited, and a
+      // child that never started has none to close.
+      const closed = new Promise<void>(resolve => {
+        child.once("close", () => resolve());
+        child.once("error", () => { if (child.pid === undefined) resolve(); });
+      });
+      // eslint-disable-next-line no-restricted-syntax -- the time limit a real process keeps (CODING_STANDARDS.md "Tests"); spawn's own would end only the direct child
+      const limit = setTimeout(() => endTree(child), timeout);
+      child.once("exit", () => clearTimeout(limit));
+      defer(async () => {
+        clearTimeout(limit);
+        endTree(child);
+        // Output nobody reads any more is dropped, so the streams can end.
+        child.stdout?.resume();
+        child.stderr?.resume();
+        await closed;
+      });
+      return child;
+    },
+    async run(command, args, options) {
+      const child = await scope.spawn(command, args, { ...options, stdio: ["ignore", "pipe", "pipe"] });
+      let stdout = "", stderr = "";
+      child.stdout!.setEncoding("utf8").on("data", (chunk: string) => { stdout += chunk; });
+      child.stderr!.setEncoding("utf8").on("data", (chunk: string) => { stderr += chunk; });
+      const [code, signal] = await new Promise<[number | null, NodeJS.Signals | null]>((resolve, reject) => {
+        child.once("error", error => reject(Object.assign(error, { temp: child.temp })));
+        child.once("close", (exitCode: number | null, exitSignal: NodeJS.Signals | null) => resolve([exitCode, exitSignal]));
+      });
+      if (code === 0) return { stdout, stderr, temp: child.temp };
+      throw Object.assign(new Error(`Command failed: ${[command, ...args].join(" ")}\n${stderr}`),
+        { code, signal, stdout, stderr, temp: child.temp });
+    },
     async folder(prefix) {
       const folder = await mkdtemp(join(tmpdir(), prefix));
       // Retries give a Windows handle that closes late time to go.
@@ -67,4 +123,21 @@ export function cleanupScope(t: ScopeContext): CleanupScope {
   };
   scopes.set(t, scope);
   return scope;
+}
+
+// Ends a child's process tree. On POSIX the child leads its own process group,
+// which outlives the child while any descendant is alive, so signalling the
+// group reaches them even after the child itself has exited. Windows has no
+// such group: the tree is ended through the child while it still runs, and a
+// child that has exited is not signalled, since its PID may belong to another
+// process by then.
+function endTree(child: ChildProcess) {
+  if (child.pid === undefined) return;
+  if (process.platform !== "win32") {
+    try { process.kill(-child.pid, "SIGKILL"); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; // nothing left in the group
+    }
+  } else if (child.exitCode === null && child.signalCode === null) {
+    spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], { windowsHide: true });
+  }
 }

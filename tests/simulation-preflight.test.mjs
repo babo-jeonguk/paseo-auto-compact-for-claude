@@ -1,25 +1,19 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
-import { readFile, rm } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { cleanupScope } from './support/scope.ts';
 
 test('simulation cannot report another operating system as tested or count unrun cases as passed', async (t) => {
   const scope = cleanupScope(t);
   const reportDir = await scope.folder('compact-preflight-');
-  let report;
-  scope.defer(async () => {
-    if (report?.root && dirname(report.root) === tmpdir()) await rm(report.root, { recursive: true, force: true });
-  });
   const file = join(dirname(fileURLToPath(import.meta.url)), 'simulation/run.mjs');
   const expected = process.platform === 'win32' ? 'linux' : 'win32';
-  await assert.rejects(promisify(execFile)(process.execPath, [file, '--expect-platform', expected,
-    '--report-dir', reportDir], { timeout: 15_000, windowsHide: true }), error => error.code === 1);
-  report = JSON.parse(await readFile(join(reportDir, 'paseo-0.12.0', 'report.json'), 'utf8'));
+  // The runner's own folder lands in the child's temp directory, which the scope removes.
+  await assert.rejects(scope.run(process.execPath, [file, '--expect-platform', expected,
+    '--report-dir', reportDir], { timeout: 15_000 }), error => error.code === 1);
+  const report = JSON.parse(await readFile(join(reportDir, 'paseo-0.12.0', 'report.json'), 'utf8'));
   assert.equal(report.platform, process.platform);
   assert.equal(report.result, 'failed');
   assert.match(report.error, /Native OS mismatch/);

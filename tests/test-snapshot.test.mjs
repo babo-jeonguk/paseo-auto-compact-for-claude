@@ -1,8 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { execFile, spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { promisify } from 'node:util';
 import { copyFile, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { cleanupScope } from './support/scope.ts';
@@ -13,14 +11,6 @@ test('snapshot keeps testing its recorded commit while the source advances, prop
   const scope = cleanupScope(t);
   const root = await scope.folder('compact-snapshot-test-');
   const repo = join(root, 'repo');
-  let running;
-  // Lets a check still waiting go on, then waits for the wrapper to exit
-  // before its folder goes; its spawn timeout bounds that wait, so a signal
-  // that cannot be written is ignored: the wrapper still ends at that timeout.
-  scope.defer(async () => {
-    await writeFile(join(root, 'continue'), 'cleanup').catch(() => {});
-    await running?.catch(() => {}); // a spawn error has already failed the test
-  });
   await mkdir(join(repo, 'scripts'), { recursive: true });
   await mkdir(join(repo, 'tests/simulation'), { recursive: true });
   await mkdir(join(repo, 'node_modules'));
@@ -43,19 +33,21 @@ test('snapshot keeps testing its recorded commit while the source advances, prop
     if (!ready || await readFile('value', 'utf8') !== 'before') process.exit(2);
     process.exit(7);
   `);
-  const git = (...args) => promisify(execFile)('git', ['-C', repo, ...args], { windowsHide: true, timeout: 15_000 });
+  const git = (...args) => scope.run('git', ['-C', repo, ...args], { timeout: 15_000 });
   await git('init');
   await git('add', '.');
   await git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', '-c', 'commit.gpgsign=false', 'commit', '-m', 'initial');
   const revision = (await git('rev-parse', 'HEAD')).stdout.trim();
   const proceed = join(root, 'continue');
-  const child = spawn(process.execPath, ['scripts/test-snapshot.mjs'], {
-    cwd: repo, windowsHide: true, timeout: 40_000, stdio: ['ignore', 'pipe', 'pipe'],
+  // The wrapper makes its worktree in its temp directory, which the scope
+  // removes once the wrapper and the check it started have ended.
+  const child = await scope.spawn(process.execPath, ['scripts/test-snapshot.mjs'], {
+    cwd: repo, timeout: 40_000, stdio: ['ignore', 'pipe', 'pipe'],
     env: { ...process.env, SNAPSHOT_CONTINUE: proceed },
   });
   // Rejects on a spawn error as well as resolving on exit.
-  running = once(child, 'exit');
-  running.catch(() => {}); // awaited below and in the cleanup
+  const running = once(child, 'exit');
+  running.catch(() => {}); // awaited below
   // The check prints its start through the runner, which inherits its output.
   let output = '';
   const printed = new Promise(resolve => {
