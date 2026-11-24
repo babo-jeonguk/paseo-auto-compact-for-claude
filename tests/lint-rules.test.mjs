@@ -36,6 +36,10 @@ test('unit tests start no real timer with a delay', () => {
       'globalThis[`setInterval`](poll, 10);',
       'timer = setTimeout(() => resolve(null), ms);',
       "setTimeout(() => reject(new Error('stuck')), 1_000);",
+      'new setTimeout(fire, 50);',
+      "await new Promise(resolve => AbortSignal.timeout(0).addEventListener('abort', resolve));",
+      'AbortSignal.timeout(50);',
+      "globalThis.AbortSignal['timeout'](TIMEOUT_MS);",
       "const { setTimeout: sleep } = await import('node:timers/promises');",
       "await import('timers');",
       'await import(`node:timers/promises`);',
@@ -62,7 +66,7 @@ test('unit tests start no real timer with a delay', () => {
 
 // A turn is not the end of the work under test; only the support helper that
 // checks nothing real is pending after its turn may wait for one.
-test('unit tests do not wait for an event-loop turn outside the drained() helper', () => {
+test('unit tests outside tests/support do not wait for a bare event-loop turn', () => {
   const turns = [
     'await new Promise(resolve => setImmediate(resolve));',
     'setImmediate(fire);',
@@ -71,6 +75,8 @@ test('unit tests do not wait for an event-loop turn outside the drained() helper
     'setTimeout(resolve);',
     'const interval = setInterval(() => { clearInterval(interval); resolve(); }, 0);',
     'setInterval(fire);',
+    'new globalThis.setImmediate(fire);',
+    'new setTimeout(fire, 0);',
     "import { setImmediate } from 'node:timers/promises';",
     "import { setImmediate } from 'node:timers';",
     "import { 'setImmediate' as immediate } from 'node:timers/promises';",
@@ -157,6 +163,8 @@ test('server code waits on time only through injected timers', () => {
       'setTimeout(fire, POLL_MS);',
       'setInterval(tick, TICK_MS);',
       'setImmediate(fire);',
+      'new globalThis.setImmediate(fire);',
+      'new setTimeout(fire, POLL_MS);',
       'setTimeout(fire);',
       'globalThis.setTimeout(fire, POLL_MS);',
       "globalThis['setImmediate'](fire);",

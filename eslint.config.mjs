@@ -41,10 +41,10 @@ const serverRealTime = 'Server code waits on time only through the injected time
 const namedTiming = 'A timer or deadline argument is a named constant with an _MS suffix and a comment ' +
   'that says why it has that value (CODING_STANDARDS.md "Named timings").';
 const timer = "/^(setTimeout|setInterval)$/";
-// A call of one of `names` by name or through the global object with a written
-// key. One reached through another name or a key built at run time is left to
-// review: a selector cannot tell what it names.
-const globalCall = (names) => `CallExpression:matches([callee.name=${names}], ` +
+// A call of one of `names` (with or without `new`) by name or through the
+// global object with a written key. One reached through another name or a key
+// built at run time is left to review: a selector cannot tell what it names.
+const globalCall = (names) => `:matches(CallExpression, NewExpression):matches([callee.name=${names}], ` +
   `[callee.object.name=/^global(This)?$/]:matches([callee.computed=false][callee.property.name=${names}], ` +
   `[callee.property.value=${names}], ` +
   `[callee.property.expressions.length=0][callee.property.quasis.0.value.cooked=${names}]))`;
@@ -60,6 +60,9 @@ const writtenKey = (name, path = "") => `:matches([${path}computed=false][${path
 // (also through the global object).
 const written = (path) => `:matches([${path}value=${timersModule}], ` +
   `[${path}expressions.length=0][${path}quasis.0.value.cooked=${timersModule}])`;
+// A timeout signal, by name or through the global object with a written key.
+const abortTimeout = `CallExpression > MemberExpression.callee${writtenKey("timeout")}:matches([object.name='AbortSignal'], ` +
+  `[object.object.name=/^global(This)?$/]${writtenKey("AbortSignal", "object.")})`;
 const timersLoad = `ImportExpression${written("source.")}, ` +
   `CallExpression:matches([callee.name='require'], ` +
   `[callee.type='MemberExpression']${writtenKey("getBuiltinModule", "callee.")}:matches([callee.object.name='process'], ` +
@@ -76,6 +79,11 @@ const unitTestRules = [
         {
           // Any delay but 0 (the next turn), whatever the callback does.
           selector: `${globalCall(timer)}[arguments.length>1]:not([arguments.1.value=0])`,
+          message: realTime,
+        },
+        {
+          // A timeout signal is a real timer, whatever its delay.
+          selector: abortTimeout,
           message: realTime,
         },
         {
@@ -138,8 +146,7 @@ const namedTimingRules = [{
 // required or loaded as a built-in by a written name.
 const serverRealTimeRules = [{
   selector: `${globalCall("/^(setTimeout|setInterval|setImmediate)$/")}, ` +
-    `CallExpression > MemberExpression.callee${writtenKey("timeout")}:matches([object.name='AbortSignal'], ` +
-    `[object.object.name=/^global(This)?$/]${writtenKey("AbortSignal", "object.")}), ` +
+    `${abortTimeout}, ` +
     `:matches(ImportDeclaration, ExportNamedDeclaration, ExportAllDeclaration)[source.value=${timersModule}], ` +
     timersLoad,
   message: serverRealTime,

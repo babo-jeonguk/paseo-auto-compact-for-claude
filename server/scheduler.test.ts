@@ -1402,6 +1402,12 @@ const firstAfter = (f: ReturnType<typeof fixture>, from: number, ...calls: strin
 // and `reached` holds, so a tick past the bound expires that read.
 const readBound = (f: ReturnType<typeof fixture>, reached = () => true) =>
   f.until(() => reached() && f.timers.pendingWithin(INSPECT_TIMEOUT_MS) > 0);
+// Moves the clock and the timers on together, so a bound that counts from an
+// earlier moment is checked against the time that has passed since.
+const elapse = async (f: ReturnType<typeof fixture>, ms: number) => {
+  f.advance(ms);
+  await f.timers.tick(ms);
+};
 
 test("a turn-ended event observes only that conversation, without listing every agent", async () => {
   const f = fixture();
@@ -1553,19 +1559,21 @@ test("an attention read that never ends stops blocking observation after a minut
   f.advance(10_000);
   const pass = s.observe({ kind: "periodic" });
   await readBound(f);
-  await f.timers.tick(INSPECT_TIMEOUT_MS);
+  await elapse(f, INSPECT_TIMEOUT_MS);
   await assert.rejects(pass);
   f.addAgent("b");
-  // Only the end of a's read or the single-flight bound starts b's read.
+  // Only the end of a's read or the single-flight bound starts b's read. The
+  // bound counts from when the pass started, not from when its read timed out.
   const next = s.observe({ kind: "agent", agentId: "b" });
   await f.drained();
   assert.deepEqual(readsOf(f, "b"), [], "held while a's read runs");
-  await f.timers.tick(59_999);
+  await elapse(f, FULL_SCAN_INTERVAL_MS - INSPECT_TIMEOUT_MS - 1);
   await f.drained();
   assert.deepEqual(readsOf(f, "b"), [], "still held a moment before the bound");
-  await f.timers.tick(1); // the scheduler's single-flight bound
+  await elapse(f, 1);
+  await f.drained();
+  assert.deepEqual(readsOf(f, "b"), ["b"], "observation resumes a minute after the pass started");
   await next;
-  assert.deepEqual(f.counts.refreshes.filter(id => id === "b"), ["b"], "observation resumes instead of stalling for good");
 });
 
 test("a full scan reserves one listed conversation's finished reply although another's observation times out", async () => {
@@ -1778,11 +1786,16 @@ test("a listing that never ends stops blocking observation after a minute", asyn
   try {
     const first = s.observe({ kind: "full" });
     await readBound(f);
-    await f.timers.tick(INSPECT_TIMEOUT_MS);
+    await elapse(f, INSPECT_TIMEOUT_MS);
     await assert.rejects(first);
-    await f.timers.tick(60_000); // the scheduler's single-flight bound
-    await s.observe({ kind: "agent", agentId: "a" });
-    assert.deepEqual(f.counts.refreshes, ["a"], "observation resumes instead of stalling for good");
+    // The single-flight bound counts from when the scan started.
+    const next = s.observe({ kind: "agent", agentId: "a" });
+    await elapse(f, FULL_SCAN_INTERVAL_MS - INSPECT_TIMEOUT_MS - 1);
+    await f.drained();
+    assert.deepEqual(f.counts.refreshes, [], "held a moment before the bound");
+    await elapse(f, 1);
+    await next;
+    assert.deepEqual(f.counts.refreshes, ["a"], "observation resumes a minute after the scan started");
   } finally {
     release();
   }
