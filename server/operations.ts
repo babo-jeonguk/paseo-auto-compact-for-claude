@@ -4,7 +4,7 @@ import { finishedState, operationRowStatus, operationPending, type CompactOperat
 import { Refusal, readable, unchanged, type CompactOutcome, type Gateway, type State, type StateStore,
   type StoredOperation } from "./model";
 import type { Settings } from "../shared/settings";
-import { bounded, deadlineOf, INSPECT_TIMEOUT_MS, OBSERVATION_MS, readWithin, systemTimers,
+import { bounded, deadlineOf, INSPECT_TIMEOUT_MS, OBSERVATION_MS, readWithin, Stopped, systemTimers,
   type Timers } from "./deadline";
 import { automaticBlock } from "./policy";
 
@@ -86,14 +86,36 @@ export function createOperationWorker(options: {
   timers?: Timers;
   onError(error: unknown): void;
 }) {
-  const { store, update, gateway, settings, now, onError } = options;
+  const { store, gateway, settings, now } = options;
   const timers = options.timers ?? systemTimers;
   const owner = randomUUID();
+  // The worker's one lifetime, which stop() ends. Every wait takes its signal,
+  // as the gateway's waits take the gateway's, so stopping ends them at once
+  // and clears their timers. Every side effect (a state write, a report, a
+  // native request's release, a retry's wake-up, and a send, which the gateway
+  // asks `current()` about) goes through an owner that does nothing once the
+  // lifetime has ended, so no step of a run checks for itself.
+  const lifetime = new AbortController();
+  const live = () => !lifetime.signal.aborted;
+  // State writes: a stopped worker's transaction changes nothing and fails,
+  // checked when it runs, since the queue can hold it past stop().
+  const update = <T>(change: (state: State) => T) =>
+    options.update(state => { if (!live()) throw new Stopped(); return change(state); });
+  // Reports: what a stopped worker's run meets is its stopping, not a fault.
+  const onError = (error: unknown) => { if (live()) options.onError(error); };
+  const wait = <T>(work: Promise<T>, milliseconds: number) => bounded(work, milliseconds, timers, lifetime.signal);
+  // Retiring a finished operation's native request. A stopped worker starts no
+  // retirement: the request it leaves prepared expires on its own at the end of
+  // the longest observation its send could have had (observationEndBy).
+  const release = async (operation: StoredOperation) => {
+    if (live() && operation.evidence?.native && gateway.release)
+      await wait(gateway.release(operation), INSPECT_TIMEOUT_MS).catch(() => {});
+  };
   // Outcomes whose terminal write failed; they are written again, never re-earned.
   const outcomes = new Map<string, Ending>();
   // The last fault of work being retried; reported only if the work expires.
   const faults = new Map<string, unknown>();
-  let stopped = false, lastConnected = true;
+  let lastConnected = true;
   // Runs this worker has in flight, keyed by operation, so a second reconcile
   // never starts the same operation twice.
   const active = new Map<string, Promise<void>>();
@@ -102,7 +124,7 @@ export function createOperationWorker(options: {
   const retries = new Map<string, unknown>();
   // Pending work this worker claimed and still holds.
   const held = (operation: StoredOperation | undefined): operation is StoredOperation =>
-    !stopped && !!operation && operationPending(operation) && operation.owner === owner;
+    !!operation && operationPending(operation) && operation.owner === owner;
   function settle(operation: StoredOperation, ending: Ending) {
     operation.state = stateOf(ending);
     operation.result = resultOf(ending, operation.evidence?.dispatchStartedAt !== undefined);
@@ -124,20 +146,19 @@ export function createOperationWorker(options: {
     const fault = faults.get(id);
     faults.delete(id);
     if (finished && ending === "expired" && fault !== undefined) onError(fault);
-    if (finished?.evidence?.native && gateway.release)
-      await bounded(gateway.release(finished), INSPECT_TIMEOUT_MS, timers).catch(() => {});
+    if (finished) await release(finished);
   }
   // One owner of this worker's retry wake-ups. A retry saved by a worker that
   // has stopped since schedules nothing, and a newer wake-up replaces the old
   // one so a conversation's retry is neither doubled nor delayed by another.
-  function armRetry(id: string, wait: number) {
-    if (stopped) return;
+  function armRetry(id: string, delay: number) {
+    if (!live()) return;
     const previous = retries.get(id);
     if (previous !== undefined) timers.clearTimeout(previous);
     const timer = timers.setTimeout(() => {
       retries.delete(id);
       void reconcile(lastConnected).catch(onError);
-    }, wait);
+    }, delay);
     retries.set(id, timer);
   }
   // Every reconcile scans all pending work: conversations run independently and
@@ -146,7 +167,6 @@ export function createOperationWorker(options: {
   // reconcile the scheduler makes after saving it.
   async function reconcile(connected = true) {
     lastConnected = connected;
-    if (stopped) return;
     let state: State;
     try { state = await store.read(); }
     catch (error) { return onError(error); }
@@ -169,7 +189,7 @@ export function createOperationWorker(options: {
       // worker of this process; that worker's later checkpoints then fail.
       const operation = await update(state => {
         const current = state.operations.find(entry => entry.id === candidate.id);
-        if (stopped || !current || !operationPending(current)) return null;
+        if (!current || !operationPending(current)) return null;
         // A snapshot read before a fault must not skip the wait that fault wrote.
         if (!outcomes.has(current.id) && now() < (current.nextAttemptAt ?? 0) &&
             now() < deadlineOf(current)) return null;
@@ -188,7 +208,7 @@ export function createOperationWorker(options: {
       if (operation.evidence?.dispatchStartedAt !== undefined) {
         let result: CompactOutcome | null = null;
         if (gateway.inspect && (connected || operation.evidence?.boundary)) {
-          try { result = await bounded(gateway.inspect(operation), INSPECT_TIMEOUT_MS, timers); }
+          try { result = await wait(gateway.inspect(operation), INSPECT_TIMEOUT_MS); }
           catch (error) { onError(error); }
         }
         if (result) return await finish(operation.id, result);
@@ -199,21 +219,20 @@ export function createOperationWorker(options: {
       // Sending must start by this time; observation then has its own deadline.
       const sendBy = operation.sendBy!;
       if (expiredUnsent(operation)) return await finish(operation.id, "expired");
-      const wait = <T>(work: Promise<T>) => readWithin(work, sendBy, now(), timers);
+      const read = <T>(work: Promise<T>) => readWithin(work, sendBy, now(), timers, lifetime.signal);
       // Reading nothing is not evidence of change: an unreadable host, observer
       // or setting is thrown as a fault and retried; only a reading that shows a
       // change ends the attempt.
-      const [agent, config] = await Promise.all([wait(gateway.refresh(operation.agentId)).then(readable), wait(settings())]);
+      const [agent, config] = await Promise.all([read(gateway.refresh(operation.agentId)).then(readable), read(settings())]);
       if (!config) throw new Error("Compact settings could not be read");
       const allowed = async () => {
-        const [latest, state] = await Promise.all([wait(settings()), wait(store.read())]);
+        const [latest, state] = await Promise.all([read(settings()), read(store.read())]);
         if (!latest) throw new Error("Compact settings could not be read");
-        return !stopped && !!agent && operation.reservationEndedAt !== undefined &&
+        return !!agent && operation.reservationEndedAt !== undefined &&
           now() <= (operation.deliveryExpiresAt ?? Infinity) &&
           automaticBlock({ agentId: operation.agentId, endedAt: operation.reservationEndedAt,
             settings: latest, disabled: state.disabled, now: now(), agent }) === null;
       };
-      if (stopped) return;
       if (!agent?.eligible || !agent.idle || !unchanged(operation, agent) ||
           (operation.kind === "automatic" && (!gateway.automatic || !await allowed())))
         return await finish(operation.id,
@@ -221,7 +240,9 @@ export function createOperationWorker(options: {
       let observeUntil: number | null = null;
       const execution = {
         id: operation.id, sendBy: sendBy,
-        current: () => !stopped && now() < (observeUntil ?? sendBy),
+        // The gateway asks this right before sending and again at the dispatch
+        // marker, so a stopped worker sends nothing.
+        current: () => live() && now() < (observeUntil ?? sendBy),
         checkpoint: async (evidence: NonNullable<StoredOperation["evidence"]>) => {
           await update(state => {
             const current = state.operations.find(entry => entry.id === operation.id);
@@ -239,7 +260,6 @@ export function createOperationWorker(options: {
       const outcome = await (operation.kind === "automatic"
         ? gateway.automatic!(agent, { expiresAt: Math.min(operation.deliveryExpiresAt ?? Infinity, sendBy), allowed }, execution)
         : gateway.compact(agent.agentId, agent, execution));
-      if (stopped) return;
       if (outcome.status === "unknown") {
         const saved = (await store.read()).operations.find(entry => entry.id === operation.id);
         if (saved?.evidence?.dispatchStartedAt !== undefined && !saved.evidence.invalidated && now() < deadlineOf(saved))
@@ -253,7 +273,7 @@ export function createOperationWorker(options: {
       // only the fault that ends it is reported. The decision is made on the
       // stored record, never on the copy taken at claim: work whose marker was
       // written during this run is not ours to expire, and is never resent.
-      if (!claimed || outcomes.has(claimed.id) || stopped) return onError(error);
+      if (!claimed || outcomes.has(claimed.id)) return onError(error);
       const id = claimed.id;
       try {
         const next = await update(state => {
@@ -262,13 +282,13 @@ export function createOperationWorker(options: {
           if (error instanceof Refusal) return "refused" as const;
           if (expiredUnsent(current)) return "expired" as const;
           // Never wait past the send deadline: the expiry is reported on time.
-          const wait = Math.min(1_000 * 2 ** Math.max(0, (current.attempt ?? 1) - 1) + Math.floor(Math.random() * 500),
+          const delay = Math.min(1_000 * 2 ** Math.max(0, (current.attempt ?? 1) - 1) + Math.floor(Math.random() * 500),
             MAX_RETRY_DELAY_MS, current.sendBy! - now());
           current.state = "requested";
-          current.nextAttemptAt = now() + wait;
+          current.nextAttemptAt = now() + delay;
           delete current.owner;
           current.updatedAt = now();
-          return wait;
+          return delay;
         });
         if (next === "not-classified") return onError(error);
         if (next === "refused") return await finish(id, { status: "failed", detail: (error as Refusal).message });
@@ -280,7 +300,7 @@ export function createOperationWorker(options: {
     }
   }
   return { reconcile, stop() {
-    stopped = true;
+    lifetime.abort();
     for (const timer of retries.values()) timers.clearTimeout(timer);
     retries.clear();
   },
