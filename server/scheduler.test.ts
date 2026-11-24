@@ -28,6 +28,8 @@ function fixture(automatic = true) {
     reset() { this.reads = 0; this.writes = 0; this.lists = 0; this.refreshes = []; },
   };
   let listGate: Promise<void> | null = null;
+  // Listings waiting at the gate `holdList` set, now and at most at once.
+  let heldLists = 0, peakHeldLists = 0;
   // Stored states, sends, reads and armed timers wake tests waiting for them.
   const signal = changes();
   // The scheduler's and its worker's timers run only when a test moves them on.
@@ -73,7 +75,12 @@ function fixture(automatic = true) {
     list: async (observe) => {
       counts.lists++;
       const listed = structuredClone(agents);
-      if (listGate) await listGate;
+      if (listGate) {
+        peakHeldLists = Math.max(peakHeldLists, ++heldLists);
+        signal.changed();
+        await listGate;
+        heldLists--;
+      }
       for (const agent of listed) {
         observe((async () => {
           await listedHolds.get(agent.agentId)?.();
@@ -118,6 +125,9 @@ function fixture(automatic = true) {
     // Waits until the condition holds after a stored state, send or read.
     until: signal.until,
     timers,
+    // Resolves once a listing waits at the gate `holdList` set.
+    listingHeld: () => signal.until(() => heldLists > 0),
+    get peakHeldLists() { return peakHeldLists; },
     // Hold agent listings (not refreshes) until released.
     holdList() {
       let release!: () => void;
@@ -1122,7 +1132,8 @@ test("restart observes a dispatched operation and an old worker cannot overwrite
   f.advance(180_001);
   await second.reconcile();
   release();
-  await new Promise<void>(resolve => setImmediate(resolve));
+  // The stopped worker's run has ended, so whatever it would write is written.
+  await first.idle();
   assert.equal((await second.operation("request-a"))?.state, "unknown");
 });
 
@@ -1350,7 +1361,20 @@ function nativeAgent(f: ReturnType<typeof fixture>, agentId: string, activity = 
 }
 const reserved = (f: ReturnType<typeof fixture>) =>
   f.state.jobs.filter(job => job.status === "scheduled").map(job => job.agentId).sort();
-const settle = () => new Promise<void>(resolve => setImmediate(resolve));
+// A held host read: `hold` waits until `release`, and `seen` keeps what `read()`
+// returned the moment the read ended. Once the call that would have acted has
+// finished, a test checks from `seen` what had happened while the read still
+// ran, instead of guessing after one turn that nothing would.
+function heldRead<T>(read: () => T) {
+  let release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const state = {
+    release, seen: undefined as T | undefined,
+    hold: async () => { await held; state.seen ??= read(); },
+  };
+  return state;
+}
+const readsOf = (f: ReturnType<typeof fixture>, id: string) => f.counts.refreshes.filter(entry => entry === id);
 // Resolves once the scheduler waits on a host read under its five-second bound
 // and `reached` holds, so a tick past the bound expires that read.
 const readBound = (f: ReturnType<typeof fixture>, reached = () => true) =>
@@ -1468,9 +1492,8 @@ test("an attention pass applies one conversation's newer reply although another'
   await s.ready;
   await s.observe({ kind: "periodic" });
   assert.deepEqual(reserved(f), ["a", "b"]);
-  let releaseA!: () => void;
-  const heldA = new Promise<void>(resolve => { releaseA = resolve; });
-  f.holdRefresh("a", () => heldA);
+  const a = heldRead(() => readsOf(f, "b"));
+  f.holdRefresh("a", a.hold);
   // b replied again while both still hold a reservation.
   f.advance(10_000);
   f.agents[1] = nativeAgent(f, "b", "2");
@@ -1482,17 +1505,17 @@ test("an attention pass applies one conversation's newer reply although another'
     assert.equal(f.state.jobs.find(job => job.agentId === "b")?.activityKey, "launch:b:2",
       "b's newer reply is applied in the same pass");
     assert.equal(f.counts.lists, 1, "the attention pass lists nothing");
-    // a's read is not cancelled: the next pass waits for it.
+    // a's read is not cancelled: the next pass waits for it. observe()
+    // queues it at once, so nothing has been read for it yet.
     f.advance(10_000);
     const next = s.observe({ kind: "periodic" });
-    await settle();
-    assert.deepEqual(f.counts.refreshes.filter(id => id === "b"), ["b"],
-      "observation stays single-flight while a's read is still running");
-    releaseA();
+    assert.deepEqual(readsOf(f, "b"), ["b"], "the next pass is queued, not started");
+    a.release();
     await next;
-    assert.deepEqual(f.counts.refreshes.filter(id => id === "b"), ["b", "b"]);
+    assert.deepEqual(a.seen, ["b"], "observation stays single-flight while a's read is still running");
+    assert.deepEqual(readsOf(f, "b"), ["b", "b"]);
   } finally {
-    releaseA?.();
+    a.release();
   }
 });
 
@@ -1509,10 +1532,12 @@ test("an attention read that never ends stops blocking observation after a minut
   await f.timers.tick(INSPECT_TIMEOUT_MS);
   await assert.rejects(pass);
   f.addAgent("b");
+  // observe() queues the read at once; only the single-flight bound starts it.
   const next = s.observe({ kind: "agent", agentId: "b" });
-  await settle();
-  assert.deepEqual(f.counts.refreshes.filter(id => id === "b"), [], "held while a's read runs");
-  await f.timers.tick(60_000); // the scheduler's single-flight bound
+  assert.deepEqual(readsOf(f, "b"), [], "held while a's read runs");
+  await f.timers.tick(59_999);
+  assert.deepEqual(readsOf(f, "b"), [], "still held a moment before the bound");
+  await f.timers.tick(1); // the scheduler's single-flight bound
   await next;
   assert.deepEqual(f.counts.refreshes.filter(id => id === "b"), ["b"], "observation resumes instead of stalling for good");
 });
@@ -1520,8 +1545,8 @@ test("an attention read that never ends stops blocking observation after a minut
 test("a full scan reserves one listed conversation's finished reply although another's observation times out", async () => {
   const f = fixture();
   f.agents.splice(0, 1, nativeAgent(f, "a"), nativeAgent(f, "b"));
-  let releaseA!: () => void;
-  f.holdListed("a", () => new Promise<void>(resolve => { releaseA = resolve; }));
+  const a = heldRead(() => [...f.counts.refreshes]);
+  f.holdListed("a", a.hold);
   const s = f.make();
   await s.ready;
   try {
@@ -1532,13 +1557,13 @@ test("a full scan reserves one listed conversation's finished reply although ano
     assert.deepEqual(reserved(f), ["b"], "b's reservation is created by the scan");
     // a's observation is not cancelled: the next observation waits for it.
     const next = s.observe({ kind: "agent", agentId: "b" });
-    await settle();
-    assert.deepEqual(f.counts.refreshes, [], "observation stays single-flight while a's read is still running");
-    releaseA();
+    assert.deepEqual(f.counts.refreshes, [], "the next observation is queued, not started");
+    a.release();
     await next;
+    assert.deepEqual(a.seen, [], "observation stays single-flight while a's read is still running");
     assert.deepEqual(f.counts.refreshes, ["b"]);
   } finally {
-    releaseA?.();
+    a.release();
   }
 });
 
@@ -1594,7 +1619,7 @@ test("a compaction due during a slow observation is dispatched on time", async (
   f.advance(55 * 60_000);
   const release = f.holdList();
   const scan = s.observe({ kind: "full" });
-  await settle();
+  await f.listingHeld();
   await s.tick();
   assert.equal(f.calls, 1, "the tick did not wait for the agent listing");
   release();
@@ -1610,15 +1635,15 @@ test("overlapping observations never run duplicate scans, and a turn end during 
   await s.ready;
   const release = f.holdList();
   const scans = [s.observe({ kind: "full" })];
-  await settle();
+  await f.listingHeld();
   // The reply of b ends while the full scan is already listing.
   f.agents[1] = nativeAgent(f, "b", "2");
   scans.push(s.observe({ kind: "periodic" }), s.observe({ kind: "full" }),
     s.observe({ kind: "agent", agentId: "b" }), s.observe({ kind: "agent", agentId: "b" }));
-  await settle();
-  assert.equal(f.counts.lists, 1, "one listing at a time");
+  assert.equal(f.counts.lists, 1, "the later requests are queued, not started");
   release();
   await Promise.all(scans);
+  assert.equal(f.peakHeldLists, 1, "one listing at a time");
   assert.ok(f.counts.lists + f.counts.refreshes.length <= 3,
     `queued requests were merged: ${JSON.stringify(f.counts)}`);
   assert.equal(f.state.jobs.find(job => job.agentId === "b")?.activityKey, "launch:b:2");
@@ -1680,7 +1705,7 @@ test("a scan read before a session's new generation cannot replace its skipped r
   await s.ready;
   const release = f.holdList();
   const scan = s.observe({ kind: "full" });
-  await settle();
+  await f.listingHeld();
   // The session reopened: a new generation's reply is recorded by a status read and skipped.
   f.advance(1_000);
   const current = { ...nativeAgent(f, "a"), activityKey: "launch:new-generation:1" };
@@ -1708,10 +1733,10 @@ test("a scan that times out keeps observation single-flight until its listing ac
   await f.timers.tick(INSPECT_TIMEOUT_MS);
   await assert.rejects(first);
   const second = s.observe({ kind: "full" });
-  await settle();
-  assert.equal(f.counts.lists, 1, "no second listing while the first is still running");
+  assert.equal(f.counts.lists, 1, "the second scan is queued, not started");
   release();
   await second;
+  assert.equal(f.peakHeldLists, 1, "no second listing while the first is still running");
   assert.equal(f.counts.lists, 2, "the queued scan runs once the listing ends");
 });
 
@@ -1726,11 +1751,8 @@ test("a listing that never ends stops blocking observation after a minute", asyn
     await f.timers.tick(INSPECT_TIMEOUT_MS);
     await assert.rejects(first);
     await f.timers.tick(60_000); // the scheduler's single-flight bound
-    await settle();
-    const second = s.observe({ kind: "agent", agentId: "a" });
-    await settle();
+    await s.observe({ kind: "agent", agentId: "a" });
     assert.deepEqual(f.counts.refreshes, ["a"], "observation resumes instead of stalling for good");
-    await second;
   } finally {
     release();
   }
@@ -1741,18 +1763,18 @@ test("a refresh that fails does not end single-flight while a sibling refresh is
   f.agents.splice(0, 1, nativeAgent(f, "a"), nativeAgent(f, "b"));
   const s = f.make();
   await s.ready;
-  let releaseB!: () => void;
   let heldB = false;
   const refreshed: string[] = [];
+  const b = heldRead(() => refreshed.filter(id => id === "b"));
   f.gateway.refresh = async (id) => {
     refreshed.push(id);
     if (id === "a") throw new Error("host failed for a");
-    if (!heldB) { heldB = true; await new Promise<void>(resolve => { releaseB = resolve; }); }
+    if (!heldB) { heldB = true; await b.hold(); }
     return structuredClone(f.agents.find(agent => agent.agentId === id) ?? null);
   };
   const release = f.holdList();
   const full = s.observe({ kind: "full" });
-  await settle();
+  await f.listingHeld();
   // Two turn ends merge into one plan that refreshes a and b together.
   const merged = [s.observe({ kind: "agent", agentId: "a" }), s.observe({ kind: "agent", agentId: "b" })];
   release();
@@ -1762,10 +1784,10 @@ test("a refresh that fails does not end single-flight while a sibling refresh is
   await f.timers.tick(INSPECT_TIMEOUT_MS);
   await assert.rejects(merged[0], /host failed for a/);
   const again = s.observe({ kind: "agent", agentId: "b" });
-  await settle();
-  assert.deepEqual(refreshed.filter(id => id === "b"), ["b"], "no second read of b while the first is running");
-  releaseB();
+  assert.deepEqual(refreshed.filter(id => id === "b"), ["b"], "the read is queued, not started");
+  b.release();
   await again;
+  assert.deepEqual(b.seen, ["b"], "no second read of b while the first is running");
   assert.deepEqual(refreshed.filter(id => id === "b"), ["b", "b"]);
 });
 
@@ -2104,7 +2126,7 @@ test("one conversation's failed refresh does not drop another conversation's fin
   const release = f.holdList();
   // A full scan that read no conversation is still running...
   const full = s.observe({ kind: "full" });
-  await settle();
+  await f.listingHeld();
   // ...when replies of a and b end; their turn-end observations merge.
   f.agents.push(nativeAgent(f, "a"), nativeAgent(f, "b"));
   const merged = [s.observe({ kind: "agent", agentId: "a" }), s.observe({ kind: "agent", agentId: "b" })];
@@ -2119,13 +2141,13 @@ test("a refresh that hangs past the deadline does not drop another conversation'
   f.agents.splice(0, 1);
   const s = f.make();
   await s.ready;
-  let releaseA!: () => void;
-  f.holdRefresh("a", () => new Promise<void>(resolve => { releaseA = resolve; }));
+  const a = heldRead(() => readsOf(f, "b"));
+  f.holdRefresh("a", a.hold);
   const release = f.holdList();
   try {
     // A full scan that read no conversation is still running...
     const full = s.observe({ kind: "full" });
-    await settle();
+    await f.listingHeld();
     // ...when replies of a and b end; their turn-end observations merge.
     f.agents.push(nativeAgent(f, "a"), nativeAgent(f, "b"));
     const merged = [s.observe({ kind: "agent", agentId: "a" }), s.observe({ kind: "agent", agentId: "b" })];
@@ -2136,13 +2158,12 @@ test("a refresh that hangs past the deadline does not drop another conversation'
     await assert.rejects(merged[1], "the timeout is still reported");
     assert.deepEqual(reserved(f), ["b"], "b's finished reply is reserved although a's read is still running");
     const again = s.observe({ kind: "agent", agentId: "b" });
-    await settle();
-    assert.deepEqual(f.counts.refreshes.filter(id => id === "b"), ["b"],
-      "observation stays single-flight while a's read is still running");
-    releaseA();
+    assert.deepEqual(readsOf(f, "b"), ["b"], "the read is queued, not started");
+    a.release();
     await again;
+    assert.deepEqual(a.seen, ["b"], "observation stays single-flight while a's read is still running");
   } finally {
-    releaseA?.();
+    a.release();
   }
 });
 
@@ -2157,7 +2178,7 @@ test("a status read that sees a busy new session fences an older scan's finished
   const release = f.holdList();
   // A scan reads the old session's finished reply...
   const scan = s.observe({ kind: "full" });
-  await settle();
+  await f.listingHeld();
   // ...then a newer status read sees a reopened session that is still working.
   f.advance(1_000);
   f.agents[0] = busyAgent(f, "a", "launch:new-generation:1");
@@ -2174,13 +2195,15 @@ test("a scan that sees a busy conversation fences an older status read's finishe
   await s.ready;
   const old = structuredClone(f.agents[0]);
   let releaseRead!: () => void;
+  let reached!: () => void;
+  const reading = new Promise<void>(resolve => { reached = resolve; });
   f.gateway.refresh = async () => {
-    await new Promise<void>(resolve => { releaseRead = resolve; });
+    await new Promise<void>(resolve => { releaseRead = resolve; reached(); });
     return structuredClone(old);
   };
   // A status read starts, but its host read ends late...
   const status = s.session("a");
-  await settle();
+  await reading;
   // ...after a newer scan saw the reopened session still working.
   f.advance(1_000);
   f.agents[0] = busyAgent(f, "a", "launch:new-generation:1");

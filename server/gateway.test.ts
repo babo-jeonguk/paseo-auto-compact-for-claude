@@ -907,24 +907,26 @@ function directoryScheduler(host: ReturnType<typeof directory>["host"]) {
   return { scheduler, timers, until: signal.until, listing: () => listing,
     reserved: () => state.jobs.filter(job => job.status === "scheduled").map(job => job.agentId).sort() };
 }
-const turn = () => new Promise<void>(resolve => setImmediate(resolve));
 
 test("a scan whose later listing page fails stays single-flight until reads started on earlier pages end", async (t) => {
   let releaseA!: () => void;
   const heldA = new Promise<void>(resolve => { releaseA = resolve; });
+  // The reads started by the time a's read ends.
+  let seen: string[] | undefined;
   const dir = directory(1, {
-    holdRead: id => id === "a" ? heldA : undefined,
+    holdRead: id => id === "a" ? heldA.then(() => { seen ??= [...dir.reads]; }) : undefined,
     holdPage: start => { if (start === 1) throw new Error("page failed"); },
   });
   const { scheduler } = directoryScheduler(dir.host);
   t.after(() => { scheduler.stop(); dir.host.stop(); });
   await scheduler.ready;
   await assert.rejects(scheduler.observe({ kind: "full" }), /page failed/);
+  // observe() queues the read at once, and only the end of a's read starts it.
   const next = scheduler.observe({ kind: "agent", agentId: "b" });
-  await turn();
-  assert.deepEqual(dir.reads, ["a"], "b is not read while a's read from the failed scan still runs");
+  assert.deepEqual(dir.reads, ["a"], "b's read is queued, not started");
   releaseA();
   await next;
+  assert.deepEqual(seen, ["a"], "b is not read while a's read from the failed scan still runs");
   assert.deepEqual(dir.reads, ["a", "b"]);
 });
 

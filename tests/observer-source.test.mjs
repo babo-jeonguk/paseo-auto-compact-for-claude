@@ -6,6 +6,8 @@ function fixture(env = {}, settings = {}) {
   let time = 1_000_000, contextTokens = 100_000, usageGate = null, afterUsage = null, clockGate = null, usageFailures = 0;
   const hooks = new Map(), files = new Map();
   const timers = new Set();
+  // Every context reading the observer started, in order.
+  const readings = [];
   const configuration = { launchId: 'launch-1', ledger: '/ledger', request: '/request', receipts: '/receipts' };
   // A held clock read blocks only the first read after a context reading.
   const $ = { clock: { now: async () => { if (clockGate) { const gate = clockGate; clockGate = null; await gate(); } return time; }, every: (_ms, fn) => {
@@ -15,9 +17,13 @@ function fixture(env = {}, settings = {}) {
     fs: { write: async (p, v) => files.set(p, v), read: async p => files.get(p) ?? '{}' },
     session: { id: async () => 'native-1',
       // A held reading resolves to the context as it is when released.
-      usage: async () => { await usageGate;
-        if (usageFailures > 0) { usageFailures--; throw new Error('usage unavailable'); } if (afterUsage) { clockGate = afterUsage; afterUsage = null; }
-        return { context: { window: 1_000_000, ...(contextTokens === undefined ? {} : { tokens: contextTokens }) } }; } },
+      usage: () => {
+        const reading = (async () => { await usageGate;
+          if (usageFailures > 0) { usageFailures--; throw new Error('usage unavailable'); } if (afterUsage) { clockGate = afterUsage; afterUsage = null; }
+          return { context: { window: 1_000_000, ...(contextTokens === undefined ? {} : { tokens: contextTokens }) } }; })();
+        readings.push(reading);
+        return reading;
+      } },
     env: { get: async name => env[name] },
     settings: { read: async () => settings } };
   registerObserver((name, ...rest) => { hooks.set(name, rest.at(-1)); return { catch() {} }; }, configuration);
@@ -38,14 +44,18 @@ function fixture(env = {}, settings = {}) {
       preparedAt: time, expiresAt: time + 30_000, ...overrides }));
   };
   const usage = { input_tokens: 100, cache_read_input_tokens: 100, cache_creation_input_tokens: 0 };
-  const step = async (turnId = 'user-1') => {
-    const generator = hooks.get('turn.step')($, { turnId }, async function* () { return { usage }; });
+  // `requested` is called when the step's model request starts.
+  const step = async (turnId = 'user-1', requested = () => {}) => {
+    const generator = hooks.get('turn.step')($, { turnId }, async function* () { requested(); return { usage }; });
     while (!(await generator.next()).done) { /* drain the step */ }
   };
   // Paseo's /compact runs as a command around Claude's compaction and hooks.
   const compact = (inner = async () => {}) => event('command.run', { command: 'compact', args: '' },
     async () => { await inner(); return {}; });
   return { event, step, ledger, request, files, compact, tick,
+    // Resolves once every reading started so far has returned. The observer
+    // acts on a reading before this resolves, since it waited on it first.
+    readingsReturned: () => Promise.allSettled([...readings]),
     timers: () => timers.size,
     intervals: () => [...timers].map(timer => timer.ms),
     failUsage(count = 1) { usageFailures = count; },
@@ -511,14 +521,17 @@ test('with classic hooks skipped, a context reading that never settles holds nei
   let release;
   const returned = f.compact(async () => { release = f.holdUsage(); });
   await returned; // the command returns while the reading stays pending
-  for (let i = 0; i < 19; i++) void f.tick(); // each tick's reading stays pending
+  // Each tick ends although the reading it found still runs.
+  for (let i = 0; i < 19; i++) await f.tick();
   assert.equal(f.ledger().compact.status, 'running');
-  void f.tick();
-  await new Promise(resolve => setImmediate(resolve));
+  await f.tick();
   assert.equal(f.ledger().compact.status, 'failed', 'no reset seen within 10 seconds');
   f.context(undefined);
   release();
-  await new Promise(resolve => setImmediate(resolve));
+  // The late readings have returned and the observer has acted on them; the
+  // heartbeat's save is written after any save that action started.
+  await f.readingsReturned();
+  await f.tick(5_000, 5_000);
   assert.equal(f.ledger().compact.status, 'failed', 'a late reading cannot change it');
 });
 
@@ -548,8 +561,10 @@ test('with classic hooks skipped, a model request while the limit reads the cloc
   const { release, reached } = f.holdNextClock();
   const limit = f.tick(500, 500);
   await reached;
-  const stepping = f.step('user-2');
-  await new Promise(resolve => setImmediate(resolve));
+  let requested;
+  const requesting = new Promise(resolve => { requested = resolve; });
+  const stepping = f.step('user-2', requested);
+  await requesting;
   release();
   await limit; await stepping;
   assert.equal(f.ledger().compact.status, 'unknown', 'the limit never rewrites a recorded result');
