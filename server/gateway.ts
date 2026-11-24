@@ -4,8 +4,8 @@ import { randomUUID } from "node:crypto";
 import { Refusal, readable, targetOf, unchanged, type Gateway, type Observation, type DispatchGuard, type ExecutionContext,
   type OperationEvidence, type StoredOperation } from "./model";
 import type { createObserver } from "./observer";
-import { bounded, CLEANUP_TIMEOUT_MS, deadlineOf, LIVE_OBSERVATION_MS, observationEndBy, readWithin, SEND_DEADLINE_MS,
-  SEND_TIMEOUT_MS } from "./deadline";
+import { bounded, CLEANUP_TIMEOUT_MS, deadlineOf, LIVE_OBSERVATION_MS, observationEndBy, pause, readWithin, SEND_DEADLINE_MS,
+  SEND_TIMEOUT_MS, systemTimers, type Timers } from "./deadline";
 import { claudeProvider } from "../shared/providers";
 import { SESSION_RESUME_REQUIRED } from "../shared/rpc";
 export { claudeProvider } from "../shared/providers";
@@ -47,12 +47,17 @@ const HISTORY_REFETCH_INTERVAL_MS = 1_000;
 // little and notices completion soon after Claude reports it.
 export const EVIDENCE_POLL_MS = 50;
 export function createGateway(options: {
-  observer?: Observer; now?: () => number; timeoutMs?: number; pollMs?: number; dispatchTimeoutMs?: number; cleanupTimeoutMs?: number;
+  observer?: Observer; now?: () => number; timers?: Timers; timeoutMs?: number; pollMs?: number; dispatchTimeoutMs?: number;
+  cleanupTimeoutMs?: number;
 } = {}) {
   const { observer } = options;
   const now = options.now ?? Date.now;
+  const timers = options.timers ?? systemTimers;
   const pending = new Map<string, { turnId: string | null; cancel(): void }>();
   const busy = new Set<string>();
+  // Running attempts. Stopping the gateway stops each one, which ends its
+  // waits at once and clears their timers.
+  const attempts = new Set<AbortController>();
   let api: Api | null = null;
   let stopped = false;
   const requireApi = () => {
@@ -161,11 +166,13 @@ export function createGateway(options: {
     const live = options.timeoutMs ?? LIVE_OBSERVATION_MS;
     const sendBy = execution?.sendBy ?? now() + SEND_DEADLINE_MS[automatic ? "automatic" : "manual"];
     let deadline = sendBy;
-    const wait = <T>(work: Promise<T>) => bounded(work, deadline - now());
-    const read = <T>(work: Promise<T>) => readWithin(work, deadline, now());
+    const attempt = new AbortController();
+    const wait = <T>(work: Promise<T>) => bounded(work, deadline - now(), timers, attempt.signal);
+    const read = <T>(work: Promise<T>) => readWithin(work, deadline, now(), timers, attempt.signal);
     const currentWorker = () => !stopped && (execution?.current() ?? true) && now() < deadline;
     const ref = requireApi().agents.ref(agentId);
     busy.add(agentId);
+    attempts.add(attempt);
     const id = execution?.id ?? randomUUID();
     let operation: Awaited<ReturnType<Observer['prepare']>> | undefined;
     let sent = false, armed = false, cancelled = false, ownershipLost = false;
@@ -250,7 +257,8 @@ export function createGateway(options: {
       const send = ref.send("/compact", { messageId: id });
       // A rejection/timeout may still mean delivery. Inspect evidence until the
       // original deadline; late send rejection is consumed by bounded().
-      await bounded(send, Math.min(options.dispatchTimeoutMs ?? SEND_TIMEOUT_MS, deadline - now())).catch(() => {});
+      await bounded(send, Math.min(options.dispatchTimeoutMs ?? SEND_TIMEOUT_MS, deadline - now()), timers, attempt.signal)
+        .catch(() => {});
       while (currentWorker() && !cancelled) {
         await checkpoint();
         const native = operation ? await read(observer!.receipt(agentId, evidence.native!)) ??
@@ -284,7 +292,8 @@ export function createGateway(options: {
           // next poll proves the command's turn and boundary again from history.
           if (losses === at) return { status: "completed", detail: "Compaction completed in the same Claude session" };
         }
-        await wait(new Promise(resolve => setTimeout(resolve, options.pollMs ?? EVIDENCE_POLL_MS)));
+        // The next check, or the deadline if it comes first; the loop then ends.
+        await pause(Math.min(options.pollMs ?? EVIDENCE_POLL_MS, deadline - now()), timers, attempt.signal);
       }
       return { status: "unknown", detail: "Compaction completion unconfirmed; no automatic retry" };
     } catch (error) {
@@ -293,6 +302,7 @@ export function createGateway(options: {
       throw error;
     } finally {
       armed = false;
+      attempts.delete(attempt);
       if (pending.get(agentId) === entry) {
         completions.delete(agentId);
         pending.delete(agentId);
@@ -302,8 +312,8 @@ export function createGateway(options: {
       // so a restarting query can still attribute its refusal; the next instance's
       // reconciliation retires it once the operation settles.
       await Promise.all([
-        operation && !(sent && stopped) ? bounded(observer!.cancel(operation, sent), cleanupMs).catch(() => {}) : undefined,
-        subscription ? bounded(Promise.resolve(subscription.release()), cleanupMs).catch(() => {}) : undefined,
+        operation && !(sent && stopped) ? bounded(observer!.cancel(operation, sent), cleanupMs, timers).catch(() => {}) : undefined,
+        subscription ? bounded(Promise.resolve(subscription.release()), cleanupMs, timers).catch(() => {}) : undefined,
       ]);
       busy.delete(agentId);
     }
@@ -318,7 +328,11 @@ export function createGateway(options: {
     },
     started(_event: LifecycleEvents["agent.turn.before"]) {},
     ended(event: End) { completions.get(event.agent.id)?.(event); },
-    stop() { stopped = true; for (const entry of pending.values()) entry.cancel(); },
+    stop() {
+      stopped = true;
+      for (const entry of pending.values()) entry.cancel();
+      for (const attempt of attempts) attempt.abort();
+    },
     async providers() {
       const current = requireApi();
       const [{ entries }, { config }] = await Promise.all([

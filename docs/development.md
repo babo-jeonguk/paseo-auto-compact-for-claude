@@ -68,7 +68,7 @@ npm run test:update
 npm run lint
 ```
 
-`npm test` and `test:focused` fail any unit test that runs longer than 60 seconds, so a broken wait fails instead of hanging. The slowest unit test takes about 5 seconds; the rest of the bound is room for slow CI runners. A test stopped at the bound skips its own `finally`, so a real timer it leaves running keeps the process alive after the failure is printed, until that timer ends or, for one that repeats, the CI job's time limit.
+`npm test` and `test:focused` fail any unit test that runs longer than 60 seconds, so a broken wait fails instead of hanging. The product's waits run on injected timers that unit tests drive, so the slowest unit test takes under a second; the rest of the bound is room for slow CI runners. A test stopped at the bound skips its own `finally` but still runs its `t.after()` hooks, which is why cleanup is registered there. A real timer such a test leaves running keeps the process alive after the failure is printed, until that timer ends or, for one that repeats, the CI job's time limit.
 
 After committing, use a disposable detached worktree for native validation. The runner records the exact commit and keeps results in `test-results/snapshots/<sha>-<timestamp>/`. Editing or pushing your original checkout does not change the files being tested.
 

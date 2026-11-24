@@ -125,7 +125,7 @@ export function createOperationWorker(options: {
     faults.delete(id);
     if (finished && ending === "expired" && fault !== undefined) onError(fault);
     if (finished?.evidence?.native && gateway.release)
-      await bounded(gateway.release(finished), INSPECT_TIMEOUT_MS).catch(() => {});
+      await bounded(gateway.release(finished), INSPECT_TIMEOUT_MS, timers).catch(() => {});
   }
   // One owner of this worker's retry wake-ups. A retry saved by a worker that
   // has stopped since schedules nothing, and a newer wake-up replaces the old
@@ -188,7 +188,7 @@ export function createOperationWorker(options: {
       if (operation.evidence?.dispatchStartedAt !== undefined) {
         let result: CompactOutcome | null = null;
         if (gateway.inspect && (connected || operation.evidence?.boundary)) {
-          try { result = await bounded(gateway.inspect(operation), INSPECT_TIMEOUT_MS); }
+          try { result = await bounded(gateway.inspect(operation), INSPECT_TIMEOUT_MS, timers); }
           catch (error) { onError(error); }
         }
         if (result) return await finish(operation.id, result);
@@ -199,7 +199,7 @@ export function createOperationWorker(options: {
       // Sending must start by this time; observation then has its own deadline.
       const sendBy = operation.sendBy!;
       if (expiredUnsent(operation)) return await finish(operation.id, "expired");
-      const wait = <T>(work: Promise<T>) => readWithin(work, sendBy, now());
+      const wait = <T>(work: Promise<T>) => readWithin(work, sendBy, now(), timers);
       // Reading nothing is not evidence of change: an unreadable host, observer
       // or setting is thrown as a fault and retried; only a reading that shows a
       // change ends the attempt.
