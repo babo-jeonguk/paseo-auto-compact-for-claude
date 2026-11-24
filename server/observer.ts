@@ -203,12 +203,10 @@ export function createObserver(options: { home?: string; now?: () => number } = 
       detail: `Idle delay exceeds the ${ledger.cache?.ttlMinutes}-minute cache window (${ledger.cache?.source})` };
     return null;
   }
-  async function cancel(operation: { directory: string; id: string; preparation?: string }, sent = true) {
+  async function cancel(operation: { directory: string; id: string }, sent = true) {
     const path = join(operation.directory, 'request.json');
     const request = JSON.parse(await readFile(path, 'utf8'));
     if (request.id !== operation.id) return;
-    // A preparation of the same ID is a newer request, not this operation's to retire.
-    if (operation.preparation !== undefined && request.preparation !== operation.preparation) return;
     // The ledger can be caught mid-write; then only a durable receipt can prove consumption.
     const ledger = await readFile(join(operation.directory, 'ledger.json'), 'utf8')
       .then(text => LedgerSchema.safeParse(JSON.parse(text)))
@@ -319,8 +317,7 @@ export function createObserver(options: { home?: string; now?: () => number } = 
       if (ledger.activeTurns.length || ledger.pendingInputs || ledger.compact?.status === 'running')
         throw new Refusal('Claude is still working');
       if (requireCache) { const blocked = reason(ledger, agent); if (blocked) throw new Refusal(blocked.detail); }
-      // Identifies this preparation, so a retry of the same request is distinct.
-      const request = { id, preparation: randomUUID(), launchId: ledger.launchId, generation: ledger.generation,
+      const request = { id, launchId: ledger.launchId, generation: ledger.generation,
         sessionId: ledger.sessionId, revision: ledger.revision, preparedAt: now(), expiresAt,
         requireCache, cacheDeadline: ledger.cacheDeadline, clockEpoch: ledger.clockEpoch, status: 'prepared' };
       const receipts = join(agentDirectory(agent.agentId), 'receipts');
