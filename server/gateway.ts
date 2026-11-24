@@ -53,11 +53,11 @@ export function createGateway(options: {
   const { observer } = options;
   const now = options.now ?? Date.now;
   const timers = options.timers ?? systemTimers;
-  const pending = new Map<string, { turnId: string | null; cancel(): void }>();
+  const pending = new Map<string, { turnId: string | null }>();
   const busy = new Set<string>();
-  // Running attempts. Stopping the gateway stops each one, which ends its
-  // waits at once and clears their timers.
-  const attempts = new Set<AbortController>();
+  // Stopping the gateway aborts this signal, which ends every wait on it at
+  // once, cleanup waits included, and clears their timers.
+  const stopping = new AbortController();
   let api: Api | null = null;
   let stopped = false;
   const requireApi = () => {
@@ -166,16 +166,15 @@ export function createGateway(options: {
     const live = options.timeoutMs ?? LIVE_OBSERVATION_MS;
     const sendBy = execution?.sendBy ?? now() + SEND_DEADLINE_MS[automatic ? "automatic" : "manual"];
     let deadline = sendBy;
-    const attempt = new AbortController();
-    const wait = <T>(work: Promise<T>) => bounded(work, deadline - now(), timers, attempt.signal);
-    const read = <T>(work: Promise<T>) => readWithin(work, deadline, now(), timers, attempt.signal);
+    const wait = <T>(work: Promise<T>) => bounded(work, deadline - now(), timers, stopping.signal);
+    const read = <T>(work: Promise<T>) => readWithin(work, deadline, now(), timers, stopping.signal);
     const currentWorker = () => !stopped && (execution?.current() ?? true) && now() < deadline;
     const ref = requireApi().agents.ref(agentId);
     busy.add(agentId);
-    attempts.add(attempt);
     const id = execution?.id ?? randomUUID();
     let operation: Awaited<ReturnType<Observer['prepare']>> | undefined;
-    let sent = false, armed = false, cancelled = false, ownershipLost = false;
+    let preparing: ReturnType<Observer['prepare']> | undefined;
+    let sent = false, armed = false, ownershipLost = false;
     let boundary = false;
     // Lost live views so far. After one, the live command turn and boundary
     // prove nothing on their own; `pinned` holds what history read since the
@@ -185,7 +184,7 @@ export function createGateway(options: {
     const proof = () => losses ? { turnId: pinned?.turnId ?? null, boundary: !!pinned?.boundary }
       : { turnId: entry.turnId, boundary };
     const evidence: OperationEvidence = {};
-    const entry = { turnId: null as string | null, cancel() { cancelled = true; } };
+    const entry = { turnId: null as string | null };
     let subscription: ReturnType<typeof ref.timeline.subscribe> | undefined;
     const endings = new Map<string, End>();
     let saved = "", lastCheckpoint = 0;
@@ -211,7 +210,8 @@ export function createGateway(options: {
       const startBy = Math.min(guard?.expiresAt ?? Infinity, sendBy);
       const reopens = reopensStaleSessions(agentId);
       if (observer) {
-        operation = await read(observer.prepare(before, automatic, observationEndBy(sendBy), id));
+        preparing = observer.prepare(before, automatic, observationEndBy(sendBy), id);
+        operation = await read(preparing);
         const { launchId, generation, sessionId, revision } = operation;
         evidence.native = { id, launchId, generation, sessionId, revision };
         await checkpoint(true);
@@ -229,7 +229,7 @@ export function createGateway(options: {
       await read(subscription.ready);
       const current = readable(await read(gateway.refresh(agentId)));
       // Running out of time or being stopped is not a reading of the session.
-      if (!currentWorker() || cancelled || now() > startBy) throw new Error("Send deadline passed or worker stopped before send");
+      if (!currentWorker() || now() > startBy) throw new Error("Send deadline passed or worker stopped before send");
       if (!current?.idle || !unchanged({ revision: before.revision, target: targetOf(before) }, current) ||
           (guard && !await read(guard.allowed())))
         throw new Refusal("Reservation cancelled or session changed before send");
@@ -239,7 +239,7 @@ export function createGateway(options: {
       evidence.dispatchStartedAt = now();
       await checkpoint(true);
       deadline = now() + live;
-      if (!currentWorker() || cancelled)
+      if (!currentWorker())
         return { status: "unknown", detail: "Worker stopped at dispatch boundary; no automatic retry" };
       // The host may have reopened the session while the marker was written.
       // With `reopens` read above this check is in memory and cannot fail, and
@@ -257,9 +257,9 @@ export function createGateway(options: {
       const send = ref.send("/compact", { messageId: id });
       // A rejection/timeout may still mean delivery. Inspect evidence until the
       // original deadline; late send rejection is consumed by bounded().
-      await bounded(send, Math.min(options.dispatchTimeoutMs ?? SEND_TIMEOUT_MS, deadline - now()), timers, attempt.signal)
+      await bounded(send, Math.min(options.dispatchTimeoutMs ?? SEND_TIMEOUT_MS, deadline - now()), timers, stopping.signal)
         .catch(() => {});
-      while (currentWorker() && !cancelled) {
+      while (currentWorker()) {
         await checkpoint();
         const native = operation ? await read(observer!.receipt(agentId, evidence.native!)) ??
           await read(observer!.result(agentId, operation)) : null;
@@ -293,7 +293,7 @@ export function createGateway(options: {
           if (losses === at) return { status: "completed", detail: "Compaction completed in the same Claude session" };
         }
         // The next check, or the deadline if it comes first; the loop then ends.
-        await pause(Math.min(options.pollMs ?? EVIDENCE_POLL_MS, deadline - now()), timers, attempt.signal);
+        await pause(Math.min(options.pollMs ?? EVIDENCE_POLL_MS, deadline - now()), timers, stopping.signal);
       }
       return { status: "unknown", detail: "Compaction completion unconfirmed; no automatic retry" };
     } catch (error) {
@@ -302,18 +302,23 @@ export function createGateway(options: {
       throw error;
     } finally {
       armed = false;
-      attempts.delete(attempt);
       if (pending.get(agentId) === entry) {
         completions.delete(agentId);
         pending.delete(agentId);
       }
       const cleanupMs = options.cleanupTimeoutMs ?? CLEANUP_TIMEOUT_MS;
+      // A preparation that outlives the wait on it is still retired once it
+      // lands; the cleanup wait bounds waiting, it does not cancel the work.
       // When the plugin stops after dispatch, leave the prepared request intact
       // so a restarting query can still attribute its refusal; the next instance's
       // reconciliation retires it once the operation settles.
+      const prepared = operation !== undefined ? Promise.resolve(operation) : preparing;
+      const retire = prepared && !(sent && stopped)
+        ? prepared.then(value => observer!.cancel(value, sent), () => undefined)
+        : undefined;
       await Promise.all([
-        operation && !(sent && stopped) ? bounded(observer!.cancel(operation, sent), cleanupMs, timers).catch(() => {}) : undefined,
-        subscription ? bounded(Promise.resolve(subscription.release()), cleanupMs, timers).catch(() => {}) : undefined,
+        retire ? bounded(retire, cleanupMs, timers, stopping.signal).catch(() => {}) : undefined,
+        subscription ? bounded(Promise.resolve(subscription.release()), cleanupMs, timers, stopping.signal).catch(() => {}) : undefined,
       ]);
       busy.delete(agentId);
     }
@@ -330,8 +335,7 @@ export function createGateway(options: {
     ended(event: End) { completions.get(event.agent.id)?.(event); },
     stop() {
       stopped = true;
-      for (const entry of pending.values()) entry.cancel();
-      for (const attempt of attempts) attempt.abort();
+      stopping.abort();
     },
     async providers() {
       const current = requireApi();

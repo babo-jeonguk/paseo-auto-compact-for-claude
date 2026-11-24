@@ -3,7 +3,7 @@ import type { StoredOperation } from "./model";
 export class DeadlineExceeded extends Error {
   constructor() { super("Compaction deadline exceeded"); }
 }
-// A wait whose attempt stopped before the wait ended.
+// A wait its caller ended by stopping before the wait finished.
 export class Stopped extends Error {
   constructor() { super("Compaction attempt stopped"); }
 }
@@ -61,10 +61,14 @@ export const observationEndBy = (sendBy: number) => sendBy + OBSERVATION_MS;
 // Attaching both handlers also consumes late rejections after the timer wins.
 // A timeout bounds waiting; it does not cancel a remote side effect. The wait
 // runs on the caller's timers, and `stop`, when given, ends it early when the
-// caller's attempt stops. However it ends, its timer is cleared.
+// caller stops. It settles once: a late settle, abort or deadline after it
+// ended does nothing. However it ends, its timer is cleared.
 export function bounded<T>(work: Promise<T>, milliseconds: number, timers: Timers, stop?: AbortSignal): Promise<T> {
   return new Promise((resolve, reject) => {
+    let ended = false;
     const end = (settle: () => void) => {
+      if (ended) return;
+      ended = true;
       timers.clearTimeout(timer);
       stop?.removeEventListener("abort", stopped);
       settle();
