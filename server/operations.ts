@@ -89,24 +89,32 @@ export function createOperationWorker(options: {
   const { store, gateway, settings, now } = options;
   const timers = options.timers ?? systemTimers;
   const owner = randomUUID();
-  // The worker's one lifetime, which stop() ends. Every wait takes its signal,
-  // as the gateway's waits take the gateway's, so stopping ends them at once
-  // and clears their timers. Every side effect (a state write, a report, a
-  // native request's release, a retry's wake-up, and a send, which the gateway
-  // asks `current()` about) goes through an owner that does nothing once the
-  // lifetime has ended, so no step of a run checks for itself.
+  // The worker's one lifetime, which stop() ends. Every await of a run takes its
+  // signal — reads, state transactions, the dispatch call — as the gateway's
+  // waits take the gateway's, so stopping ends them at once and clears their
+  // timers. Every side effect (a state write, a report, a native request's
+  // release, a retry's wake-up, and a send, which the gateway asks `current()`
+  // about) goes through an owner that does nothing once the lifetime has ended,
+  // so no step of a run checks for itself.
   const lifetime = new AbortController();
   const live = () => !lifetime.signal.aborted;
+  // An await of a run: bounded by its own deadline where it has one, and by the
+  // lifetime where it has none.
+  const wait = <T>(work: Promise<T>, milliseconds = Infinity) =>
+    bounded(work, milliseconds, timers, lifetime.signal);
   // State writes: a stopped worker's transaction changes nothing and fails,
-  // checked when it runs, since the queue can hold it past stop().
+  // checked when it runs, since the queue can hold it past stop(); the caller's
+  // wait on it also ends at once.
   const update = <T>(change: (state: State) => T) =>
-    options.update(state => { if (!live()) throw new Stopped(); return change(state); });
+    wait(options.update(state => { if (!live()) throw new Stopped(); return change(state); }));
   // Reports: what a stopped worker's run meets is its stopping, not a fault.
   const onError = (error: unknown) => { if (live()) options.onError(error); };
-  const wait = <T>(work: Promise<T>, milliseconds: number) => bounded(work, milliseconds, timers, lifetime.signal);
   // Retiring a finished operation's native request. A stopped worker starts no
-  // retirement: the request it leaves prepared expires on its own at the end of
-  // the longest observation its send could have had (observationEndBy).
+  // retirement, since one it started would not be ordered with the next
+  // instance's writes; the request stays prepared, as after a crash at this
+  // point. A release that fails or outlasts its wait is not reported either:
+  // the operation has already ended, and a request it leaves prepared is
+  // checked like any other at the next /compact (docs/runtime.md).
   const release = async (operation: StoredOperation) => {
     if (live() && operation.evidence?.native && gateway.release)
       await wait(gateway.release(operation), INSPECT_TIMEOUT_MS).catch(() => {});
@@ -168,7 +176,7 @@ export function createOperationWorker(options: {
   async function reconcile(connected = true) {
     lastConnected = connected;
     let state: State;
-    try { state = await store.read(); }
+    try { state = await wait(store.read()); }
     catch (error) { return onError(error); }
     const started: Promise<void>[] = [];
     for (const candidate of state.operations.filter(operationPending)) {
@@ -257,11 +265,11 @@ export function createOperationWorker(options: {
         },
       };
       // Before the dispatch marker the gateway throws instead; see below.
-      const outcome = await (operation.kind === "automatic"
+      const outcome = await wait(operation.kind === "automatic"
         ? gateway.automatic!(agent, { expiresAt: Math.min(operation.deliveryExpiresAt ?? Infinity, sendBy), allowed }, execution)
         : gateway.compact(agent.agentId, agent, execution));
       if (outcome.status === "unknown") {
-        const saved = (await store.read()).operations.find(entry => entry.id === operation.id);
+        const saved = (await wait(store.read())).operations.find(entry => entry.id === operation.id);
         if (saved?.evidence?.dispatchStartedAt !== undefined && !saved.evidence.invalidated && now() < deadlineOf(saved))
           return; // Ambiguous delivery continues through evidence reconciliation.
       }
