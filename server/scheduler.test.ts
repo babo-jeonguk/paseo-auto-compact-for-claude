@@ -1529,8 +1529,10 @@ test("an attention pass applies one conversation's newer reply although another'
   try {
     const pass = s.observe({ kind: "periodic" });
     await readBound(f, () => f.counts.refreshes.at(-1) === "a");
+    // Handled before the tick: the timeout rejects the pass while later due timers still run.
+    const timedOut = assert.rejects(pass, "a's timeout is still reported");
     await f.timers.tick(INSPECT_TIMEOUT_MS);
-    await assert.rejects(pass, "a's timeout is still reported");
+    await timedOut;
     assert.equal(f.state.jobs.find(job => job.agentId === "b")?.activityKey, "launch:b:2",
       "b's newer reply is applied in the same pass");
     assert.equal(f.counts.lists, 1, "the attention pass lists nothing");
@@ -2204,8 +2206,10 @@ test("a refresh that hangs past the deadline does not drop another conversation'
     release();
     await full;
     await readBound(f, () => f.counts.refreshes.includes("a"));
+    // Handled before the tick: the timeout rejects the read while later due timers still run.
+    const timedOut = assert.rejects(merged[1], "the timeout is still reported");
     await f.timers.tick(INSPECT_TIMEOUT_MS);
-    await assert.rejects(merged[1], "the timeout is still reported");
+    await timedOut;
     assert.deepEqual(reserved(f), ["b"], "b's finished reply is reserved although a's read is still running");
     const from = f.hostCalls.length;
     const again = s.observe({ kind: "agent", agentId: "b" });

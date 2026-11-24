@@ -19,12 +19,15 @@ const product = ["index.server.ts", "index.client.tsx", "client/**", "server/**"
 // the scripts run on real time.
 const server = ["server/**", "shared/**"];
 
-const realTime = 'Unit tests start no real timer with a delay. Advance the injected clock or the test\'s mock timers ' +
-  'and wait on observable state such as a fake being called; the test runner bounds every test, so a wait needs ' +
+const realTime = 'Unit tests start no real timer with a delay. Move the injected timers on (fakeTimers() in ' +
+  'tests/support/timers.ts) and wait on observable state such as a fake being called; the test runner bounds every test, so a wait needs ' +
   'no timer of its own (CODING_STANDARDS.md "Tests").';
 const countedWait = 'A unit test waits for a condition through a signal, not by counting loop turns: wait on the fake\'s ' +
   'change (changes() in tests/support/changes.ts) or on the promise of the step itself; the test runner bounds the ' +
   'wait (CODING_STANDARDS.md "Tests").';
+const mockTimers = 'Unit tests move product time only through fakeTimers() in tests/support/timers.ts, the one ' +
+  'fake of the injected Timers that product code waits on; Node\'s mock timers replace the global timers with ' +
+  'other semantics, such as when a due callback runs (CODING_STANDARDS.md "Tests").';
 const contextMock = 'A unit test mocks through its test context (t.mock), which the runner restores even when the ' +
   'test stops at its bound and its finally never runs; a mock on the shared tracker would outlive it ' +
   '(CODING_STANDARDS.md "Tests").';
@@ -117,8 +120,9 @@ const unitTestRules = [
         },
         {
           // The shared tracker's mocks that patch state other tests also see.
-          // mock.fn() makes a standalone function and patches nothing.
-          selector: "MemberExpression[object.name='mock'][property.name=/^(timers|method|getter|setter|property|module)$/]",
+          // mock.fn() makes a standalone function and patches nothing. Its
+          // timers are a finding of their own outside the support modules.
+          selector: "MemberExpression[object.name='mock'][property.name=/^(method|getter|setter|property|module)$/]",
           message: contextMock,
         },
         {
@@ -132,6 +136,16 @@ const unitTestRules = [
           message: cleanupInFinally,
         },
 ];
+// Node's mock timers on the shared tracker (`mock.timers`) or a test context
+// (`t.mock.timers`). Outside the support modules both are a second fake of
+// product time; inside them only the shared tracker's outlives the test.
+const mockTimersAt = (object) => `MemberExpression${writtenKey("timers")}${object}`;
+const sharedTrackerTimers = mockTimersAt("[object.name='mock']");
+const mockTimersRules = [{
+  selector: `${sharedTrackerTimers}, ${mockTimersAt(`[object.type='MemberExpression']${writtenKey("mock", "object.")}`)}`,
+  message: mockTimers,
+}];
+const sharedMockTimersRules = [{ selector: sharedTrackerTimers, message: contextMock }];
 // Cleanup that bypasses the test's scope: a temporary folder made directly,
 // whose removal the caller registers only afterwards, a hook of the test
 // runner, which runs outside the scope's order, and a child process, whose
@@ -198,11 +212,11 @@ export const projectRules = [
   {
     files: unitTests,
     ignores: testSupport,
-    rules: { "no-restricted-syntax": ["error", ...unitTestRules, ...turnWaitRules, ...scopeRules] },
+    rules: { "no-restricted-syntax": ["error", ...unitTestRules, ...mockTimersRules, ...turnWaitRules, ...scopeRules] },
   },
   {
     files: testSupport,
-    rules: { "no-restricted-syntax": ["error", ...unitTestRules] },
+    rules: { "no-restricted-syntax": ["error", ...unitTestRules, ...sharedMockTimersRules] },
   },
   {
     files: product,
