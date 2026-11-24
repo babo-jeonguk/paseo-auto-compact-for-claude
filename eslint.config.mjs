@@ -28,10 +28,19 @@ const countedWait = 'A unit test waits for a condition through a signal, not by 
 const contextMock = 'A unit test mocks through its test context (t.mock), which the runner restores even when the ' +
   'test stops at its bound and its finally never runs; a mock on the shared tracker would outlive it ' +
   '(CODING_STANDARDS.md "Tests").';
-const cleanupInFinally = 'A test stopped at the runner\'s bound never reaches its finally, so it registers the cleanup ' +
-  'of what would outlive it (a timer, process, server or temporary folder) with t.after() right after acquiring it; ' +
-  'the runner still runs those hooks. A finally that must still wait says why it is safe in a disable comment ' +
-  '(CODING_STANDARDS.md "Tests").';
+const cleanupInFinally = 'A test stopped at the runner\'s bound never reaches its finally, so what acquires something ' +
+  'that would outlive the test (a timer, process, server or temporary folder) registers its release with the test\'s ' +
+  'cleanup scope (tests/support/scope.ts) as it acquires it; the runner still runs the scope\'s hook. A finally ' +
+  'that must still wait says why it is safe in a disable comment (CODING_STANDARDS.md "Tests").';
+const temporaryFolder = 'A unit test creates a temporary folder through its cleanup scope (folder() in ' +
+  'tests/support/scope.ts), which registers the removal in the same call, so no step between creating the folder ' +
+  'and registering its removal can leak it (CODING_STANDARDS.md "Tests").';
+const childProcess = 'A unit test starts a child process through its cleanup scope (spawn() or run() in ' +
+  'tests/support/scope.ts), which gives the child a temp directory inside a folder the test owns and ends its whole ' +
+  'process tree when the test ends, so nothing it starts or creates outlives the test (CODING_STANDARDS.md "Tests").';
+const testHook = 'A unit test registers cleanup with its cleanup scope (defer() in tests/support/scope.ts), whose one ' +
+  'hook releases in reverse order of acquisition, runs every release and reports each failure. Hooks registered ' +
+  'one by one run in registration order and stop at the first that throws (CODING_STANDARDS.md "Tests").';
 const turnWait = 'A unit test does not wait for a bare event-loop turn: work can still act after one. Wait on the ' +
   'promise of the call, on a fake\'s change, or with drained() from tests/support/drained.ts, which takes the turn ' +
   'and then fails if Node still lists a real timer, immediate or I/O request as pending (CODING_STANDARDS.md "Tests").';
@@ -52,21 +61,25 @@ const timersModule = "/^(node:)?timers(\\/promises)?$/";
 // The key of the member expression at `path` ("" for the node itself, or
 // "callee." and "object." for one below it), written as a name, a string or a
 // template without interpolation.
-const writtenKey = (name, path = "") => `:matches([${path}computed=false][${path}property.name='${name}'], ` +
-  `[${path}property.value='${name}'], ` +
-  `[${path}property.expressions.length=0][${path}property.quasis.0.value.cooked='${name}'])`;
+// `key` is an esquery value: a quoted name or a regular expression.
+const writtenKeyMatching = (key, path = "") => `:matches([${path}computed=false][${path}property.name=${key}], ` +
+  `[${path}property.value=${key}], ` +
+  `[${path}property.expressions.length=0][${path}property.quasis.0.value.cooked=${key}])`;
+const writtenKey = (name, path = "") => writtenKeyMatching(`'${name}'`, path);
 // The timer modules loaded at run time, named by a string or a template
 // without interpolation: import(), require(), or process.getBuiltinModule()
 // (also through the global object).
-const written = (path) => `:matches([${path}value=${timersModule}], ` +
-  `[${path}expressions.length=0][${path}quasis.0.value.cooked=${timersModule}])`;
+const written = (path, module = timersModule) => `:matches([${path}value=${module}], ` +
+  `[${path}expressions.length=0][${path}quasis.0.value.cooked=${module}])`;
 // A timeout signal, by name or through the global object with a written key.
 const abortTimeout = `CallExpression > MemberExpression.callee${writtenKey("timeout")}:matches([object.name='AbortSignal'], ` +
   `[object.object.name=/^global(This)?$/]${writtenKey("AbortSignal", "object.")})`;
-const timersLoad = `ImportExpression${written("source.")}, ` +
+const moduleLoad = (module) => `ImportExpression${written("source.", module)}, ` +
   `CallExpression:matches([callee.name='require'], ` +
   `[callee.type='MemberExpression']${writtenKey("getBuiltinModule", "callee.")}:matches([callee.object.name='process'], ` +
-  `[callee.object.object.name=/^global(This)?$/]${writtenKey("process", "callee.object.")}))${written("arguments.0.")}`;
+  `[callee.object.object.name=/^global(This)?$/]${writtenKey("process", "callee.object.")}))${written("arguments.0.", module)}`;
+const timersLoad = moduleLoad(timersModule);
+const childProcessModule = "/^(node:)?child_process$/";
 // The delay argument when a number is written into it, alone or inside an
 // expression; 0 (the next turn, or a lower bound) is not a duration. A function
 // in that position is a callback; `every` is a timer only on a clock.
@@ -119,6 +132,33 @@ const unitTestRules = [
           message: cleanupInFinally,
         },
 ];
+// Cleanup that bypasses the test's scope: a temporary folder made directly,
+// whose removal the caller registers only afterwards, a hook of the test
+// runner, which runs outside the scope's order, and a child process, whose
+// temp files and descendants the test would not own. The support modules are
+// exempt: the scope and the programs its tests start live there.
+const scopeRules = [
+  {
+    selector: ":matches(ImportSpecifier[imported.name=/^mkdtemp(Sync)?$/], " +
+      `MemberExpression${writtenKeyMatching("/^mkdtemp(Sync)?$/")}, ` +
+      "ObjectPattern > Property[key.name=/^mkdtemp(Sync)?$/])",
+    message: temporaryFolder,
+  },
+  {
+    selector: `CallExpression > MemberExpression.callee:matches(${writtenKey("after")}, ${writtenKey("afterEach")}), ` +
+      "ImportDeclaration[source.value='node:test'] > ImportSpecifier[imported.name=/^(after|afterEach)$/]",
+    message: testHook,
+  },
+  {
+    // Types alone start nothing.
+    selector: `ImportDeclaration[source.value=${childProcessModule}]:not([importKind='type'])` +
+      ":has(> :matches(ImportDefaultSpecifier, ImportNamespaceSpecifier, ImportSpecifier:not([importKind='type']))), " +
+      `ExportNamedDeclaration[source.value=${childProcessModule}]:not([exportKind='type']):has(> ExportSpecifier:not([exportKind='type'])), ` +
+      `ExportAllDeclaration[source.value=${childProcessModule}]:not([exportKind='type']), ` +
+      moduleLoad(childProcessModule),
+    message: childProcess,
+  },
+];
 // A wait for one event-loop turn: an immediate, a timer or interval with no
 // delay, or setImmediate imported from the timer modules (loading them at run
 // time is a real-time finding already). Test support modules are exempt:
@@ -158,7 +198,7 @@ export const projectRules = [
   {
     files: unitTests,
     ignores: testSupport,
-    rules: { "no-restricted-syntax": ["error", ...unitTestRules, ...turnWaitRules] },
+    rules: { "no-restricted-syntax": ["error", ...unitTestRules, ...turnWaitRules, ...scopeRules] },
   },
   {
     files: testSupport,

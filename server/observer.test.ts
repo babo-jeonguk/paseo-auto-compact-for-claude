@@ -1,16 +1,16 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { mkdir, mkdtemp, readFile, readdir, rm, symlink, utimes, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rm, symlink, utimes, writeFile } from 'node:fs/promises';
 import { join, delimiter } from 'node:path';
-import { tmpdir } from 'node:os';
 import { createObserver, QUERY_RESTARTED_REFUSAL } from './observer';
 import { CLOCK_STEP_TOLERANCE_MS } from './deadline';
 import { observerAsset } from './observer-assets.generated';
 import type { PluginSessionOpenRequest } from '@getpaseo/plugin/server';
 import type { Observation, StoredOperation } from './model';
+import { cleanupScope, type CleanupScope } from '../tests/support/scope';
 
-async function fixture() {
-  const home = await mkdtemp(join(tmpdir(), 'compact-observer-'));
+async function fixture(scope: CleanupScope) {
+  const home = await scope.folder('compact-observer-');
   let time = 1_000_000;
   const observer = createObserver({ home, now: () => time });
   // The additive 0.14 fields are harmless to 0.12/0.13 and verify that the
@@ -39,12 +39,11 @@ async function fixture() {
   const agent: Observation = { agentId: 'a', title: null, workspace: home, provider: 'claude',
     revision: new Date(time).toISOString(), tokens: 210_000, eligible: true, idle: true, sessionId: 'native-a' };
   return { home, request, prepared, observer, agent, ledger, save, directory, parent, manifest,
-    advance(ms: number) { time += ms; }, close: () => rm(home, { recursive: true, force: true }) };
+    advance(ms: number) { time += ms; } };
 }
 
 test('observer session preparation preserves provider environment and ignores history/non-Claude sessions', async (t) => {
-  const f = await fixture();
-  t.after(() => f.close());
+  const f = await fixture(cleanupScope(t));
   assert.equal(f.prepared.env.OTHER, 'preserved');
   assert.equal((f.prepared as typeof f.request).title, 'Conversation');
   assert.deepEqual((f.prepared as typeof f.request).labels, { retained: 'yes' });
@@ -90,8 +89,7 @@ test('the current observer build is listed, so the build it replaces stays check
 });
 
 test('the compatible pre-fix observer stays readable during rollout; unknown builds stay rejected', async (t) => {
-  const f = await fixture();
-  t.after(() => f.close());
+  const f = await fixture(cleanupScope(t));
   const manifestPath = join(f.parent, 'current.json');
   for (const build of READABLE_BUILDS) {
     await writeFile(manifestPath, JSON.stringify({ ...f.manifest, build }));
@@ -104,8 +102,7 @@ test('the compatible pre-fix observer stays readable during rollout; unknown bui
 });
 
 test('observer rejects mismatched sessions, busy native work, default TTL fallback and changed generations', async (t) => {
-  const f = await fixture();
-  t.after(() => f.close());
+  const f = await fixture(cleanupScope(t));
   assert.match((await f.observer.readiness({ ...f.agent, sessionId: 'other' }))!.detail, /unavailable/);
   f.ledger.activeTurns = ['background']; await f.save();
   await assert.rejects(f.observer.prepare(f.agent, true, 1_030_000), /still working/);
@@ -125,8 +122,7 @@ test('observer rejects mismatched sessions, busy native work, default TTL fallba
 });
 
 test('a ledger written just before a WSL clock step back stays readable; a far-future ledger does not', async (t) => {
-  const f = await fixture();
-  t.after(() => f.close());
+  const f = await fixture(cleanupScope(t));
   // A heartbeat saved at 1_001_800, then the system clock stepped back 1.8 s.
   f.ledger.updatedAt = 1_001_800; await f.save();
   assert(await f.observer.read('a'));
@@ -147,8 +143,7 @@ test('the observer and the server use the same clock-step tolerance', async () =
 });
 
 test('native receipt must match operation and revision; settling preserves subsequent manual compact', async (t) => {
-  const f = await fixture();
-  t.after(() => f.close());
+  const f = await fixture(cleanupScope(t));
   const operation = await f.observer.prepare(f.agent, true, 1_030_000);
   f.ledger.compact = { id: 'foreign', revision: 1, status: 'completed' }; await f.save();
   assert.equal(await f.observer.result('a', operation), null);
@@ -179,8 +174,7 @@ test('native receipt must match operation and revision; settling preserves subse
 });
 
 test('release caught in the middle of a ledger write still retires the request', async (t) => {
-  const f = await fixture();
-  t.after(() => f.close());
+  const f = await fixture(cleanupScope(t));
   const ledgerPath = join(f.directory, 'ledger.json');
   const status = async () => JSON.parse(await readFile(join(f.directory, 'request.json'), 'utf8')).status;
   // Without a receipt, a sent request whose ledger cannot be read is cancelled,
@@ -202,8 +196,7 @@ test('release caught in the middle of a ledger write still retires the request',
 });
 
 test('opening a session removes closed or long-idle launches of that conversation only', async (t) => {
-  const f = await fixture();
-  t.after(() => f.close());
+  const f = await fixture(cleanupScope(t));
   const day = 24 * 60 * 60_000;
   // File times before 1970 are not applied on Windows; use a present-day clock.
   const present = Date.now();
@@ -232,8 +225,7 @@ test('opening a session removes closed or long-idle launches of that conversatio
 });
 
 test('durable receipts survive closed-launch pruning and require every native identity field', async (t) => {
-  const f = await fixture();
-  t.after(() => f.close());
+  const f = await fixture(cleanupScope(t));
   const operation = await f.observer.prepare(f.agent, false, 1_030_000, 'caller-request');
   assert.equal(operation.id, 'caller-request');
   const path = join(f.parent, 'receipts', 'caller-request.json');
@@ -255,8 +247,7 @@ test('durable receipts survive closed-launch pruning and require every native id
 });
 
 test('receipt cleanup protects retained work, collects old orphans and never follows directory links', async (t) => {
-  const f = await fixture();
-  t.after(() => f.close());
+  const f = await fixture(cleanupScope(t));
   const receipts = join(f.parent, 'receipts');
   const old = { id: 'orphan', launchId: f.manifest.launchId, generation: 'generation-1', sessionId: 'native-a',
     revision: 1, status: 'completed', reason: null, observedAt: 100 };
@@ -286,8 +277,7 @@ test('receipt cleanup protects retained work, collects old orphans and never fol
 });
 
 test('an observer that cannot be read is a fault, not an absent observer', async (t) => {
-  const f = await fixture();
-  t.after(() => f.close());
+  const f = await fixture(cleanupScope(t));
   assert(await f.observer.read('a'));
   // Half-written ledger: thrown, so dispatch retries instead of treating it as gone.
   await writeFile(join(f.directory, 'ledger.json'), '{"version":1,');
@@ -312,8 +302,7 @@ test('an observer that cannot be read is a fault, not an absent observer', async
 });
 
 test('every observer readiness answer carries its blocked reason code', async (t) => {
-  const f = await fixture();
-  t.after(() => f.close());
+  const f = await fixture(cleanupScope(t));
   const code = async (agent = f.agent, dueAt?: number) => (await f.observer.readiness(agent, dueAt))?.reason;
   assert.equal(await f.observer.readiness(f.agent, 1_060_000), null);
   assert.equal(await code(f.agent, 4_600_000), 'idle_delay_exceeds_cache');
@@ -334,8 +323,7 @@ test('every observer readiness answer carries its blocked reason code', async (t
 });
 
 test('a placeholder ledger is a starting observer until a turn completes after the launch was prepared', async (t) => {
-  const f = await fixture();
-  t.after(() => f.close());
+  const f = await fixture(cleanupScope(t));
   // A freshly opened session: the observer has not written its first ledger yet.
   f.advance(5_000);
   await f.observer.prepareSession(f.request, true);
@@ -362,8 +350,7 @@ test('a placeholder ledger is a starting observer until a turn completes after t
 });
 
 test('a placeholder from a launch prepared before preparation times were recorded uses its file time', async (t) => {
-  const f = await fixture();
-  t.after(() => f.close());
+  const f = await fixture(cleanupScope(t));
   await f.observer.prepareSession(f.request, true);
   const manifestPath = join(f.parent, 'current.json');
   const { launchId, build } = JSON.parse(await readFile(manifestPath, 'utf8'));
@@ -378,8 +365,7 @@ test('a placeholder from a launch prepared before preparation times were recorde
 });
 
 test('a confirmed query-restart refusal is accepted by both receipt and result; ambiguous or foreign records stay rejected', async (t) => {
-  const f = await fixture();
-  t.after(() => f.close());
+  const f = await fixture(cleanupScope(t));
   const operation = await f.observer.prepare(f.agent, false, 1_030_000, 'restart-op');
   const path = join(f.parent, 'receipts', 'restart-op.json');
   const prepared = {

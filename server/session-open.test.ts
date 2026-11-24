@@ -1,28 +1,30 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import { delimiter, join } from "node:path";
-import { tmpdir } from "node:os";
 import type { PluginServerContext, PluginSessionOpenRequest } from "@getpaseo/plugin/server";
 import contribute from "../index.server";
+import { cleanupScope, type CleanupScope } from "../tests/support/scope";
 
 type Before = (input: { request: PluginSessionOpenRequest }, context: unknown) => Promise<PluginSessionOpenRequest>;
 
-// Stops the plugin before its state folder goes and puts back the Paseo home
-// the other tests in this process read.
-async function restore(previous: string | undefined, home: string, dispose: () => void) {
-  dispose();
-  if (previous === undefined) delete process.env.PASEO_HOME;
-  else process.env.PASEO_HOME = previous;
-  await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 });
+// A Paseo home for the plugin under test. PASEO_HOME points at it until the
+// test ends and then goes back to what the other tests in this process read;
+// the plugin a test starts on it stops before either.
+async function paseoHome(scope: CleanupScope, prefix: string) {
+  const home = await scope.folder(prefix);
+  const previous = process.env.PASEO_HOME;
+  process.env.PASEO_HOME = home;
+  scope.defer(() => {
+    if (previous === undefined) delete process.env.PASEO_HOME;
+    else process.env.PASEO_HOME = previous;
+  });
+  return home;
 }
 
 test("plugin state or observer failures cannot prevent a Claude session from opening", async (t) => {
-  const home = await mkdtemp(join(tmpdir(), "compact-session-open-"));
-  const previous = process.env.PASEO_HOME;
-  process.env.PASEO_HOME = home;
-  let dispose = () => {};
-  t.after(() => restore(previous, home, dispose));
+  const scope = cleanupScope(t);
+  const home = await paseoHome(scope, "compact-session-open-");
   t.mock.method(console, "error", () => {});
   let open: Before | undefined;
   const server = {
@@ -37,7 +39,7 @@ test("plugin state or observer failures cannot prevent a Claude session from ope
   const data = join(home, "plugin-data", "auto-compact-for-claude");
   await mkdir(data, { recursive: true });
   await writeFile(join(data, "state.json"), "{ corrupt");
-  dispose = contribute(server);
+  scope.defer(contribute(server));
   const request = { agentId: "a", workspaceId: "w", provider: "claude",
     purpose: "interactive", reason: "create", cwd: home, title: "Conversation",
     labels: { retained: "yes" }, metadata: {}, background: false, tools: [], mcpServers: {},
@@ -54,11 +56,8 @@ test("plugin state or observer failures cannot prevent a Claude session from ope
 });
 
 test("turn-ended hooks use native activity without reading the deprecated timeline snapshot", async (t) => {
-  const home = await mkdtemp(join(tmpdir(), "compact-empty-timeline-"));
-  const previous = process.env.PASEO_HOME;
-  process.env.PASEO_HOME = home;
-  let dispose = () => {};
-  t.after(() => restore(previous, home, dispose));
+  const scope = cleanupScope(t);
+  const home = await paseoHome(scope, "compact-empty-timeline-");
   let ended: ((event: unknown, context: unknown) => void) | undefined;
   const server = {
     registerSettings: () => ({ read: async () => ({ status: "loading" }), subscribe: () => () => {} }),
@@ -69,7 +68,7 @@ test("turn-ended hooks use native activity without reading the deprecated timeli
     before: () => () => {},
     handle: () => {},
   } as unknown as PluginServerContext;
-  dispose = contribute(server);
+  scope.defer(contribute(server));
   const event = {
     agent: { id: "a", provider: "claude", cwd: home, title: null,
       parentAgentId: null, workspaceId: "w" },

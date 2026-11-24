@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { DeadlineExceeded, INSPECT_TIMEOUT_MS, OBSERVATION_MS, Stopped } from "./deadline";
 import { Refusal, type OperationEvidence, type StoredOperation } from "./model";
@@ -13,6 +12,7 @@ import { DEFAULT_SETTINGS } from "../shared/settings";
 import { changes } from "../tests/support/changes";
 import { fakeTimers } from "../tests/support/timers";
 import { drainer } from "../tests/support/drained";
+import { cleanupScope, type CleanupScope } from "../tests/support/scope";
 import type {
   PluginHandlerContext,
   PluginLifecycleEvents,
@@ -47,6 +47,7 @@ function testClock(pollMs: number) {
 }
 
 function fixture(
+  scope: CleanupScope,
   items: unknown[],
   outcome: unknown = { kind: "completed" },
   changeSession = false,
@@ -56,6 +57,9 @@ function fixture(
   const pollMs = options.pollMs ?? 1;
   const clock = testClock(pollMs);
   const host = createGateway({ timeoutMs: 40, now: clock.now, timers: clock.timers, ...options, pollMs });
+  // The clock moves on its own while an attempt polls, so the gateway stops
+  // when the test ends, before anything it was given is released.
+  scope.defer(() => host.stop());
   let sends = 0;
   let native = "native-a";
   const agent = {
@@ -129,7 +133,8 @@ function fixture(
     setAgent: (patch: Record<string, unknown>) => Object.assign(agent, patch) });
 }
 
-test("gateway requires completed manual boundary from command turn and same persistence session", async () => {
+test("gateway requires completed manual boundary from command turn and same persistence session", async (t) => {
+  const scope = cleanupScope(t);
   for (const [items, expected] of [
     [[], "unknown"],
     [[{ type: "compaction", status: "loading" }], "unknown"],
@@ -139,22 +144,22 @@ test("gateway requires completed manual boundary from command turn and same pers
       "completed",
     ],
   ] as const) {
-    const host = fixture([...items]);
+    const host = fixture(scope, [...items]);
     assert.equal((await host.gateway.compact("a")).status, expected);
     assert.equal(host.clock.timers.pending, 0, "an attempt that ends leaves none of its timers armed");
   }
-  const changed = fixture(
+  const changed = fixture(scope,
     [{ type: "compaction", status: "completed", trigger: "manual" }],
     { kind: "completed" },
     true
   );
   assert.equal((await changed.gateway.compact("a")).status, "failed");
-  const failed = fixture([], {
+  const failed = fixture(scope, [], {
     kind: "failed",
     error: { message: "fixture failure" },
   });
   assert.equal((await failed.gateway.compact("a")).status, "failed");
-  const historicalOnly = fixture(
+  const historicalOnly = fixture(scope,
     [{ type: "compaction", status: "completed", trigger: "manual" }],
     { kind: "completed" },
     false,
@@ -167,8 +172,9 @@ test("gateway requires completed manual boundary from command turn and same pers
   );
 });
 
-test("hidden background agents are never compaction targets; absent or false background is unchanged", async () => {
-  const host = fixture([{ type: "compaction", status: "completed", trigger: "manual" }]);
+test("hidden background agents are never compaction targets; absent or false background is unchanged", async (t) => {
+  const scope = cleanupScope(t);
+  const host = fixture(scope, [{ type: "compaction", status: "completed", trigger: "manual" }]);
   for (const background of [undefined, false]) {
     host.setAgent({ background });
     assert.equal((await host.gateway.refresh("a"))!.eligible, true);
@@ -183,8 +189,9 @@ test("hidden background agents are never compaction targets; absent or false bac
   host.stop();
 });
 
-test("a reservation whose agent later becomes hidden background is skipped instead of dispatched", async () => {
-  const host = fixture([]);
+test("a reservation whose agent later becomes hidden background is skipped instead of dispatched", async (t) => {
+  const scope = cleanupScope(t);
+  const host = fixture(scope, []);
   let time = 1_000_000;
   let state: import("./model").State = { version: 1, disabled: [], jobs: [], operations: [] };
   const scheduler = createScheduler({
@@ -193,6 +200,8 @@ test("a reservation whose agent later becomes hidden background is skipped inste
     settings: async () => ({ ...DEFAULT_SETTINGS }),
     now: () => time,
   });
+  // It runs on real timers, so it stops however the test ends.
+  scope.defer(() => scheduler.stop());
   await scheduler.ready;
   await scheduler.observedTurn((await host.gateway.refresh("a"))!);
   assert.equal(state.jobs[0].status, "scheduled");
@@ -202,12 +211,11 @@ test("a reservation whose agent later becomes hidden background is skipped inste
   assert.equal(host.sendCount(), 0);
   assert.equal(state.jobs[0].status, "skipped");
   assert.match(state.jobs[0].detail, /no longer eligible/);
-  scheduler.stop();
-  host.stop();
 });
 
-test("completed command ownership is released; stock gateway offers no automatic dispatch", async () => {
-  const host = fixture([]);
+test("completed command ownership is released; stock gateway offers no automatic dispatch", async (t) => {
+  const scope = cleanupScope(t);
+  const host = fixture(scope, []);
   const running = host.gateway.compact("a");
   await running;
   assert.equal(host.ownTurn("a", "compact-1"), false);
@@ -236,21 +244,22 @@ function observer(result: Receipt | null) {
   } as unknown as NonNullable<Parameters<typeof createGateway>[0]>['observer'];
 }
 
-test('automatic public dispatch requires both its own boundary and matching native completion', async () => {
+test('automatic public dispatch requires both its own boundary and matching native completion', async (t) => {
+  const scope = cleanupScope(t);
   const boundary = [{ type: 'compaction', status: 'completed', trigger: 'manual' }];
   for (const [receipt, expected] of [
     [null, 'unknown'],
     [{ status: 'completed', detail: 'Native PostCompact' }, 'completed'],
     [{ status: 'unknown', detail: 'Overlapping input' }, 'unknown'],
   ] as const) {
-    const host = fixture(boundary, undefined, false, boundary, { observer: observer(receipt), timeoutMs: 1_000 });
+    const host = fixture(scope, boundary, undefined, false, boundary, { observer: observer(receipt), timeoutMs: 1_000 });
     const agent = (await host.gateway.refresh('a'))!;
     assert.equal((await host.gateway.automatic!(agent)).status, expected);
     assert.equal(host.sendCount(), 1);
   }
   // Input after the command (a steered message, say) is not evidence either way.
   const foreign = [...boundary, { type: 'user_message', clientMessageId: 'unrelated' }];
-  const host = fixture(boundary, undefined, false, foreign, {
+  const host = fixture(scope, boundary, undefined, false, foreign, {
     observer: observer({ status: 'completed', detail: 'Native PostCompact' }), timeoutMs: 1_000,
   });
   assert.equal((await host.gateway.automatic!((await host.gateway.refresh('a'))!)).status, 'completed');
@@ -260,9 +269,9 @@ test('automatic public dispatch requires both its own boundary and matching nati
 // Another user message seen live after the send, in its own turn or in the
 // command's, followed by what Claude and the host report for the command.
 interface OverlapOptions { receipt?: Receipt | null; outcome?: unknown; events?: Array<{ turnId: string; item: unknown }>; timeoutMs?: number }
-async function overlap({ receipt = { status: 'completed', detail: 'Native PostCompact' },
+async function overlap(scope: CleanupScope, { receipt = { status: 'completed', detail: 'Native PostCompact' },
   outcome = { kind: 'completed' }, events = [], timeoutMs = 1_000 }: OverlapOptions = {}) {
-  const host = fixture([], outcome, false, [], { observer: observer(receipt), timeoutMs });
+  const host = fixture(scope, [], outcome, false, [], { observer: observer(receipt), timeoutMs });
   const send = host.ref.send;
   let emit!: (message: unknown) => void;
   const subscribe = host.ref.timeline.subscribe;
@@ -287,44 +296,49 @@ async function overlap({ receipt = { status: 'completed', detail: 'Native PostCo
 const STEERED = { type: 'user_message', clientMessageId: 'steered' };
 const OWN_BOUNDARY = { turnId: 'compact-1', item: { type: 'compaction', status: 'completed', trigger: 'manual' } };
 
-test('input after the command does not decide the outcome: Claude and the command turn do', async () => {
+test('input after the command does not decide the outcome: Claude and the command turn do', async (t) => {
+  const scope = cleanupScope(t);
   for (const [name, events] of [
     ['steered into the command turn', [{ turnId: 'compact-1', item: STEERED }, OWN_BOUNDARY]],
     ['in its own later turn', [OWN_BOUNDARY, { turnId: 'next-turn', item: STEERED }]],
     ['seen before the boundary', [{ turnId: 'next-turn', item: STEERED }, OWN_BOUNDARY]],
   ] as const) {
-    const { result, evidence } = await overlap({ events: [...events] });
+    const { result, evidence } = await overlap(scope, { events: [...events] });
     assert.equal(result.status, 'completed', name);
     assert.equal(evidence?.invalidated, false, name);
   }
 });
 
-test('with input after the command, a failure Claude or the host reports is still a failure', async () => {
+test('with input after the command, a failure Claude or the host reports is still a failure', async (t) => {
+  const scope = cleanupScope(t);
   const events = [{ turnId: 'next-turn', item: STEERED }];
-  assert.equal((await overlap({ events, receipt: { status: 'failed', detail: 'Cancelled' } })).result.status, 'failed');
-  assert.equal((await overlap({ events, outcome: { kind: 'canceled' } })).result.status, 'failed');
+  assert.equal((await overlap(scope, { events, receipt: { status: 'failed', detail: 'Cancelled' } })).result.status, 'failed');
+  assert.equal((await overlap(scope, { events, outcome: { kind: 'canceled' } })).result.status, 'failed');
 });
 
-test('with input after the command and no completion from Claude, the attempt stays open for reconciliation', async () => {
-  const { result, evidence } = await overlap({ events: [{ turnId: 'next-turn', item: STEERED }, OWN_BOUNDARY],
+test('with input after the command and no completion from Claude, the attempt stays open for reconciliation', async (t) => {
+  const scope = cleanupScope(t);
+  const { result, evidence } = await overlap(scope, { events: [{ turnId: 'next-turn', item: STEERED }, OWN_BOUNDARY],
     receipt: null, timeoutMs: 60 });
   assert.equal(result.status, 'unknown');
   assert.equal(evidence?.invalidated, false, 'the evidence stays valid for reconciliation');
 });
 
-test('a boundary in any turn but the command\'s own never completes the attempt', async () => {
+test('a boundary in any turn but the command\'s own never completes the attempt', async (t) => {
+  const scope = cleanupScope(t);
   const boundary = { type: 'compaction', status: 'completed', trigger: 'manual' };
-  const { result } = await overlap({ events: [{ turnId: 'next-turn', item: STEERED }, { turnId: 'next-turn', item: boundary }],
+  const { result } = await overlap(scope, { events: [{ turnId: 'next-turn', item: STEERED }, { turnId: 'next-turn', item: boundary }],
     timeoutMs: 60 });
   assert.equal(result.status, 'unknown');
 });
 
-test('last-moment off policy and expired delivery prevent public send', async () => {
+test('last-moment off policy and expired delivery prevent public send', async (t) => {
+  const scope = cleanupScope(t);
   for (const guard of [
     { expiresAt: START + 30_000, allowed: async () => false },
     { expiresAt: 0, allowed: async () => true },
   ]) {
-    const host = fixture([], undefined, false, [], { observer: observer(null) });
+    const host = fixture(scope, [], undefined, false, [], { observer: observer(null) });
     // Policy off is a reading; running out of time is not.
     await assert.rejects(host.gateway.automatic!((await host.gateway.refresh('a'))!, guard),
       guard.expiresAt ? Refusal : /Send deadline passed/);
@@ -332,19 +346,21 @@ test('last-moment off policy and expired delivery prevent public send', async ()
   }
 });
 
-test('before sending, a refusal and any other error are both thrown for the worker to classify', async () => {
+test('before sending, a refusal and any other error are both thrown for the worker to classify', async (t) => {
+  const scope = cleanupScope(t);
   for (const error of [new Refusal('Claude is still working'), new Error('EIO')]) {
     const native = observer(null)!;
     native.prepare = async () => { throw error; };
-    const host = fixture([], undefined, false, [], { observer: native });
+    const host = fixture(scope, [], undefined, false, [], { observer: native });
     const agent = (await host.gateway.refresh('a'))!;
     await assert.rejects(host.gateway.compact('a', agent), error);
     assert.equal(host.sendCount(), 0);
   }
 });
 
-test('a second call for a conversation already compacting is a refusal', async () => {
-  const host = fixture([{ type: "compaction", status: "completed", trigger: "manual" }]);
+test('a second call for a conversation already compacting is a refusal', async (t) => {
+  const scope = cleanupScope(t);
+  const host = fixture(scope, [{ type: "compaction", status: "completed", trigger: "manual" }]);
   const first = host.gateway.compact('a');
   await assert.rejects(host.gateway.compact('a'), (error: unknown) =>
     error instanceof Refusal && /already running/.test(error.message));
@@ -352,12 +368,13 @@ test('a second call for a conversation already compacting is a refusal', async (
   assert.equal(host.sendCount(), 1);
 });
 
-test('Claude admits the compaction for as long as it can be observed, not only until sending must start', async () => {
+test('Claude admits the compaction for as long as it can be observed, not only until sending must start', async (t) => {
+  const scope = cleanupScope(t);
   const native = observer(null)!;
   const prepare = native.prepare;
   let admitted = 0;
   native.prepare = async (agent, cache, expiresAt, id) => { admitted = expiresAt; return prepare(agent, cache, expiresAt, id); };
-  const host = fixture([], undefined, false, [], { observer: native });
+  const host = fixture(scope, [], undefined, false, [], { observer: native });
   const sendBy = host.clock.now() + 1_000;
   await host.gateway.automatic!((await host.gateway.refresh('a'))!, { expiresAt: host.clock.now() + 500, allowed: async () => true },
     { id: 'late-admission', sendBy, checkpoint: async () => {}, current: () => true });
@@ -370,13 +387,11 @@ test("completion evidence is checked every 50 ms after sending", () => {
 });
 
 test('a send that starts just before its deadline is still observed in full', async (t) => {
+  const scope = cleanupScope(t);
   // A live budget longer than the send deadline, as in production (120 s vs. what is left).
   let time = 1_000_000;
-  const host = fixture([{ type: "compaction", status: "completed", trigger: "manual" }],
+  const host = fixture(scope, [{ type: "compaction", status: "completed", trigger: "manual" }],
     undefined, false, undefined, { timeoutMs: 1_000, now: () => time });
-  // The clock moves only with the send, so a missing boundary would poll on;
-  // stopping ends the attempt even if the test stops early.
-  t.after(() => host.stop());
   const send = host.ref.send;
   // The send takes past its deadline, so the boundary arrives after it.
   host.ref.send = async (text, options) => { time += 80; return send(text, options); };
@@ -387,20 +402,22 @@ test('a send that starts just before its deadline is still observed in full', as
   assert.equal(host.sendCount(), 1);
 });
 
-test('an unreadable observer is reported on the observation and is a fault before sending', async () => {
+test('an unreadable observer is reported on the observation and is a fault before sending', async (t) => {
+  const scope = cleanupScope(t);
   const native = observer(null)!;
   native.read = async () => { throw new Error('Claude observer could not be read'); };
-  const host = fixture([], undefined, false, [], { observer: native });
+  const host = fixture(scope, [], undefined, false, [], { observer: native });
   const agent = (await host.gateway.refresh('a'))!;
   assert.equal(agent.observerUnreadable, true);
   await assert.rejects(host.gateway.compact('a', agent), /could not be read/);
   assert.equal(host.sendCount(), 0);
 });
 
-test('a host that reopens stale plugin sessions never sends against an observer from the prior plugin instance', async () => {
+test('a host that reopens stale plugin sessions never sends against an observer from the prior plugin instance', async (t) => {
+  const scope = cleanupScope(t);
   const native = observer(null)!;
   native.startedHere = () => false;
-  const host = fixture([], undefined, false, [], { observer: native });
+  const host = fixture(scope, [], undefined, false, [], { observer: native });
   Object.assign(host.ref, { reload: async () => null });
   assert.equal((await host.gateway.refresh('a'))!.resumeRequired, true);
   await assert.rejects(host.gateway.compact('a', (await host.gateway.refresh('a'))!),
@@ -411,22 +428,24 @@ test('a host that reopens stale plugin sessions never sends against an observer 
   assert.equal(host.sendCount(), 0);
 });
 
-test('a host without session reopening never requires a resume', async () => {
+test('a host without session reopening never requires a resume', async (t) => {
+  const scope = cleanupScope(t);
   const native = observer({ status: 'completed', detail: 'Native PostCompact' })!;
   native.startedHere = () => false;
-  const host = fixture([{ type: "compaction", status: "completed", trigger: "manual" }], undefined, false, undefined,
+  const host = fixture(scope, [{ type: "compaction", status: "completed", trigger: "manual" }], undefined, false, undefined,
     { observer: native });
   const agent = (await host.gateway.refresh('a'))!;
   assert.equal(agent.resumeRequired, undefined);
   assert.equal((await host.gateway.automatic!(agent)).status, 'completed');
 });
 
-test('observer ownership is rechecked at the dispatch boundary, in memory, and ends the attempt at once', async () => {
+test('observer ownership is rechecked at the dispatch boundary, in memory, and ends the attempt at once', async (t) => {
+  const scope = cleanupScope(t);
   const native = observer(null)!;
   let ownershipChecks = 0;
   let markerPersisted = false;
   native.startedHere = () => { ownershipChecks++; return !markerPersisted; };
-  const host = fixture([], undefined, false, [], { observer: native });
+  const host = fixture(scope, [], undefined, false, [], { observer: native });
   Object.assign(host.ref, { reload: async () => null });
   const saved: OperationEvidence[] = [];
   const result = await host.gateway.compact('a', (await host.gateway.refresh('a'))!, {
@@ -442,13 +461,14 @@ test('observer ownership is rechecked at the dispatch boundary, in memory, and e
   assert.equal(host.sendCount(), 0);
 });
 
-test('an absent or unreadable observer is not misreported as a session awaiting reload, and reading it never throws', async () => {
+test('an absent or unreadable observer is not misreported as a session awaiting reload, and reading it never throws', async (t) => {
+  const scope = cleanupScope(t);
   for (const read of [async () => null, async () => { throw new Error('Claude observer could not be read'); }]) {
     const native = observer(null)!;
     native.read = read;
     native.startedHere = () => false;
     native.prepare = async () => { throw new Refusal('Claude observer unavailable'); };
-    const host = fixture([], undefined, false, [], { observer: native });
+    const host = fixture(scope, [], undefined, false, [], { observer: native });
     Object.assign(host.ref, { reload: async () => null });
     const agent = (await host.gateway.refresh('a'))!;
     assert.equal(agent.resumeRequired, undefined);
@@ -458,7 +478,8 @@ test('an absent or unreadable observer is not misreported as a session awaiting 
   }
 });
 
-test('idle pending input is distinguished from an active reply without allowing dispatch', async () => {
+test('idle pending input is distinguished from an active reply without allowing dispatch', async (t) => {
+  const scope = cleanupScope(t);
   const native = observer(null)!;
   const read = native.read;
   let pendingInputs = 3;
@@ -468,7 +489,7 @@ test('idle pending input is distinguished from an active reply without allowing 
     return current?.ledger ? { ...current, ledger: { ...current.ledger, pendingInputs, activeTurns,
       ordinaryEndedAt: 1000 } } : current;
   };
-  const host = fixture([], undefined, false, [], { observer: native });
+  const host = fixture(scope, [], undefined, false, [], { observer: native });
   const stuck = (await host.gateway.refresh('a'))!;
   assert.equal(stuck.idle, false);
   assert.equal(stuck.busyReason, 'input');
@@ -485,9 +506,10 @@ test('idle pending input is distinguished from an active reply without allowing 
 });
 
 
-test("every external gateway wait is bounded, including send and release", async () => {
+test("every external gateway wait is bounded, including send and release", async (t) => {
+  const scope = cleanupScope(t);
   for (const stalled of ["send", "subscribe", "refresh", "release"] as const) {
-    const host = fixture([{ type: "compaction", status: "completed", trigger: "manual" }],
+    const host = fixture(scope, [{ type: "compaction", status: "completed", trigger: "manual" }],
       undefined, false, undefined, { timeoutMs: 50, dispatchTimeoutMs: 5, cleanupTimeoutMs: 5 });
     // The stalled call is reached before the wait on it is armed.
     let reached = false;
@@ -530,10 +552,11 @@ test("every external gateway wait is bounded, including send and release", async
   }
 });
 
-test("stopping the gateway ends a waiting attempt at once and leaves none of its timers armed", async () => {
+test("stopping the gateway ends a waiting attempt at once and leaves none of its timers armed", async (t) => {
+  const scope = cleanupScope(t);
   // Before sending, a read that never ends is abandoned and the attempt fails
   // for the worker to classify.
-  const before = fixture([], undefined, false, [], { observer: observer(null) });
+  const before = fixture(scope, [], undefined, false, [], { observer: observer(null) });
   let reading!: () => void;
   const reached = new Promise<void>(resolve => { reading = resolve; });
   const agent = (await before.gateway.refresh("a"))!;
@@ -546,7 +569,7 @@ test("stopping the gateway ends a waiting attempt at once and leaves none of its
   assert.equal(before.clock.timers.pending, 0, "the read's deadline is cleared");
   // After sending, a history read that never ends is abandoned and the outcome
   // stays unknown for reconciliation.
-  const after = fixture([], undefined, false, [], { observer: observer({ status: "completed", detail: "Native PostCompact" }),
+  const after = fixture(scope, [], undefined, false, [], { observer: observer({ status: "completed", detail: "Native PostCompact" }),
     timeoutMs: 120_000 });
   let emit!: (message: unknown) => void;
   const subscribe = after.ref.timeline.subscribe;
@@ -569,6 +592,7 @@ test("stopping the gateway ends a waiting attempt at once and leaves none of its
 });
 
 test("a native request whose preparation outlives the wait on it is retired once it is prepared", async (t) => {
+  const scope = cleanupScope(t);
   for (const ending of ["deadline", "stop"] as const) {
     const native = observer(null)!;
     const prepare = native.prepare;
@@ -580,8 +604,7 @@ test("a native request whose preparation outlives the wait on it is retired once
     let retire!: (value: string) => void;
     const retired = new Promise<string>(resolve => { retire = resolve; });
     native.cancel = async (operation: { id: string }, sent?: boolean) => { retire(`${operation.id}:${sent}`); };
-    const host = fixture([], undefined, false, [], { observer: native });
-    t.after(() => host.stop());
+    const host = fixture(scope, [], undefined, false, [], { observer: native });
     const attempt = host.gateway.automatic!((await host.gateway.refresh("a"))!, undefined, {
       id: `late-${ending}`, sendBy: host.clock.now() + 30_000, checkpoint: async () => {}, current: () => true,
     });
@@ -641,9 +664,9 @@ async function abandonedPreparation(host: ReturnType<typeof fixture>, reached: P
 }
 
 test("a retry prepares a conversation's native request only after an earlier attempt's late writes to it end", async (t) => {
+  const scope = cleanupScope(t);
   const { native, writes, reached, land } = stalledPreparation();
-  const host = fixture([], undefined, false, [], { observer: native });
-  t.after(() => host.stop());
+  const host = fixture(scope, [], undefined, false, [], { observer: native });
   await abandonedPreparation(host, reached, "retried");
   const agent = (await host.gateway.refresh("a"))!;
   const execution = () => ({ id: "retried", sendBy: host.clock.now() + 30_000, checkpoint: async () => {}, current: () => true });
@@ -662,9 +685,9 @@ test("a retry prepares a conversation's native request only after an earlier att
 });
 
 test("releasing a finished operation's native request waits for an attempt's late writes to it", async (t) => {
+  const scope = cleanupScope(t);
   const { native, writes, reached, land } = stalledPreparation();
-  const host = fixture([], undefined, false, [], { observer: native });
-  t.after(() => host.stop());
+  const host = fixture(scope, [], undefined, false, [], { observer: native });
   await abandonedPreparation(host, reached, "finished");
   const finished = { id: "finished", agentId: "a", evidence: {
     native: { id: "finished", launchId: "launch", generation: "generation", sessionId: "native-a", revision: 1 } } };
@@ -675,10 +698,10 @@ test("releasing a finished operation's native request waits for an attempt's lat
 });
 
 test("stopping the gateway also ends the wait on an attempt's cleanup", async (t) => {
+  const scope = cleanupScope(t);
   for (const at of ["cleanup", "observation"] as const) {
     const items = at === "cleanup" ? [{ type: "compaction", status: "completed", trigger: "manual" }] : [];
-    const host = fixture(items, undefined, false, undefined, { timeoutMs: 120_000 });
-    t.after(() => host.stop());
+    const host = fixture(scope, items, undefined, false, undefined, { timeoutMs: 120_000 });
     // Releasing the subscription never ends.
     let releasing = false;
     const subscribe = host.ref.timeline.subscribe;
@@ -697,8 +720,9 @@ test("stopping the gateway also ends the wait on an attempt's cleanup", async (t
   }
 });
 
-test("stable identity and durable send marker precede provider dispatch", async () => {
-  const host = fixture([{ type: "compaction", status: "completed", trigger: "manual" }]);
+test("stable identity and durable send marker precede provider dispatch", async (t) => {
+  const scope = cleanupScope(t);
+  const host = fixture(scope, [{ type: "compaction", status: "completed", trigger: "manual" }]);
   const checkpoints: OperationEvidence[] = [];
   const send = host.ref.send;
   host.ref.send = async (text, options) => {
@@ -715,8 +739,9 @@ test("stable identity and durable send marker precede provider dispatch", async 
   assert.equal(checkpoints.at(-1)?.turnId, "compact-1");
 });
 
-test("failed marker persistence never sends and late send rejection is consumed", async () => {
-  const host = fixture([]);
+test("failed marker persistence never sends and late send rejection is consumed", async (t) => {
+  const scope = cleanupScope(t);
+  const host = fixture(scope, []);
   const drained = drainer();
   // A fault before sending is the worker's to retry, so it is thrown, not an outcome.
   await assert.rejects(host.gateway.compact("a", undefined, {
@@ -736,9 +761,10 @@ test("failed marker persistence never sends and late send rejection is consumed"
   await drained();
 });
 
-test("recovery requires both the native receipt and the exact message's command boundary", async () => {
+test("recovery requires both the native receipt and the exact message's command boundary", async (t) => {
+  const scope = cleanupScope(t);
   const native = observer({ status: "completed", detail: "receipt" })!;
-  const host = fixture([], undefined, false, [], { observer: native });
+  const host = fixture(scope, [], undefined, false, [], { observer: native });
   const operation: StoredOperation = {
     id: "caller-request", agentId: "a", revision: "rev", target: { sessionId: "native-a", activityKey: null },
     kind: "manual", state: "observing", createdAt: 1, updatedAt: 1, result: null, inputFingerprint: null,
@@ -771,12 +797,13 @@ test("recovery requires both the native receipt and the exact message's command 
   assert.equal(await host.gateway.inspect!(operation), null, "late completion cannot extend the observation deadline");
 });
 
-test('native activity identity survives compaction without restoring its scheduling window', async () => {
+test('native activity identity survives compaction without restoring its scheduling window', async (t) => {
+  const scope = cleanupScope(t);
   const native = observer(null)!;
   const initial = (await native.read('a'))!;
   let ledger = initial.ledger!;
   native.read = async () => ({ directory: initial.directory, ledger });
-  const host = fixture([], undefined, false, [], { observer: native });
+  const host = fixture(scope, [], undefined, false, [], { observer: native });
   const before = await host.gateway.refresh('a');
   assert(before?.activityKey);
   for (const status of ['running', 'completed', 'failed', 'unknown'] as const) {
@@ -799,7 +826,7 @@ test('native activity identity survives compaction without restoring its schedul
 // observer that records which agents' native ledgers were read. A `slow`
 // agent's ledger read does not end; a `broken` agent's host reference throws.
 // `holdRead` and `holdPage` may delay or fail one ledger read or listing page.
-function directory(pageSize = 2, { slow = [] as string[], broken = [] as string[],
+function directory(scope: CleanupScope, pageSize = 2, { slow = [] as string[], broken = [] as string[],
   holdRead = (_id: string): Promise<void> | void => {},
   holdPage = (_start: number): Promise<void> | void => {} } = {}) {
   const base = {
@@ -833,6 +860,8 @@ function directory(pageSize = 2, { slow = [] as string[], broken = [] as string[
     return current?.ledger ? { ...current, ledger: { ...current.ledger, sessionId: `native-${id}` } } : current;
   };
   const host = createGateway({ observer: native });
+  // It runs on real timers.
+  scope.defer(() => host.stop());
   host.attach({
     config: { get: async () => ({ config: { providers: {} } }) },
     agents: {
@@ -860,8 +889,9 @@ function directory(pageSize = 2, { slow = [] as string[], broken = [] as string[
 }
 const INELIGIBLE = ["archived", "internal", "child", "unavailable", "closed", "codex"];
 
-test("the full list still observes every agent, but reads native ledgers only for eligible Claude agents", async () => {
-  const { host, reads } = directory();
+test("the full list still observes every agent, but reads native ledgers only for eligible Claude agents", async (t) => {
+  const scope = cleanupScope(t);
+  const { host, reads } = directory(scope);
   const listed: Promise<import("./model").Observation>[] = [];
   await host.gateway.list((observation) => { listed.push(observation); });
   const observations = await Promise.all(listed);
@@ -881,8 +911,9 @@ test("the full list still observes every agent, but reads native ledgers only fo
   host.stop();
 });
 
-test("each listed agent's observation settles on its own, so a slow or failing one hides no other", async () => {
-  const dir = directory(2, { slow: ["b"], broken: ["c"] }), { host } = dir;
+test("each listed agent's observation settles on its own, so a slow or failing one hides no other", async (t) => {
+  const scope = cleanupScope(t);
+  const dir = directory(scope, 2, { slow: ["b"], broken: ["c"] }), { host } = dir;
   const listed: Promise<import("./model").Observation>[] = [];
   await host.gateway.list((observation) => { listed.push(observation); });
   assert.equal(dir.listCalls, Math.ceil((3 + INELIGIBLE.length) / 2), "every page is listed without waiting for b");
@@ -901,7 +932,7 @@ test("each listed agent's observation settles on its own, so a slow or failing o
 // Its timers run only when a test moves them on, and arming one wakes `until`.
 // Each listed observation is recorded in `dir.calls` as it is fulfilled.
 // `drained()` resolves once nothing is left to run but what the test holds.
-function directoryScheduler(dir: ReturnType<typeof directory>) {
+function directoryScheduler(scope: CleanupScope, dir: ReturnType<typeof directory>) {
   const { host } = dir;
   const drained = drainer();
   let state: import("./model").State = { version: 1, disabled: [], jobs: [], operations: [] };
@@ -920,19 +951,20 @@ function directoryScheduler(dir: ReturnType<typeof directory>) {
     now: () => 1_000_000,
     timers,
   });
+  scope.defer(() => scheduler.stop());
   return { scheduler, timers, drained, until: signal.until, listing: () => listing,
     reserved: () => state.jobs.filter(job => job.status === "scheduled").map(job => job.agentId).sort() };
 }
 
 test("a scan whose later listing page fails stays single-flight until reads started on earlier pages end", async (t) => {
+  const scope = cleanupScope(t);
   let releaseA!: () => void;
   const heldA = new Promise<void>(resolve => { releaseA = resolve; });
-  const dir = directory(1, {
+  const dir = directory(scope, 1, {
     holdRead: id => id === "a" ? heldA : undefined,
     holdPage: start => { if (start === 1) throw new Error("page failed"); },
   });
-  const { scheduler, drained } = directoryScheduler(dir);
-  t.after(() => { scheduler.stop(); dir.host.stop(); });
+  const { scheduler, drained } = directoryScheduler(scope, dir);
   await scheduler.ready;
   await assert.rejects(scheduler.observe({ kind: "full" }), /page failed/);
   const from = dir.calls.length;
@@ -949,20 +981,18 @@ test("a scan whose later listing page fails stays single-flight until reads star
 });
 
 test("a listed conversation's read is bounded from when it starts, not from when paging ends", async (t) => {
+  const scope = cleanupScope(t);
   let releasePage!: () => void;
   const page = new Promise<void>(resolve => { releasePage = resolve; });
   let releaseA!: () => void;
   const heldA = new Promise<void>(resolve => { releaseA = resolve; });
   let startedA!: () => void;
   const readingA = new Promise<void>(resolve => { startedA = resolve; });
-  const dir = directory(1, {
+  const dir = directory(scope, 1, {
     holdRead: id => { if (id === "a") { startedA(); return heldA; } },
     holdPage: start => start === 1 ? page : undefined,
   });
-  const { scheduler, timers, until, listing, reserved } = directoryScheduler(dir);
-  // Runs even if the test stops early, at a failed assertion or at the test
-  // runner's bound.
-  t.after(() => { scheduler.stop(); dir.host.stop(); });
+  const { scheduler, timers, until, listing, reserved } = directoryScheduler(scope, dir);
   try {
     await scheduler.ready;
     let settled: unknown = "pending";
@@ -988,8 +1018,9 @@ test("a listed conversation's read is bounded from when it starts, not from when
   }
 });
 
-test("refreshing an ineligible agent does not read its ledger; an eligible one still does", async () => {
-  const { host, reads } = directory();
+test("refreshing an ineligible agent does not read its ledger; an eligible one still does", async (t) => {
+  const scope = cleanupScope(t);
+  const { host, reads } = directory(scope);
   for (const id of INELIGIBLE) {
     const agent = await host.gateway.refresh(id);
     assert.equal(agent?.eligible, false, id);
@@ -1004,8 +1035,9 @@ test("refreshing an ineligible agent does not read its ledger; an eligible one s
 // emits `lost`, then `live` items. `history` is what a timeline refetch returns,
 // the command's own entry first unless the test says otherwise; `lose` emits
 // another lost view while that read is in flight. `reads` counts the refetches.
-test("recovery completes from stored boundary evidence when history no longer pins the command", async () => {
-  const host = fixture([], undefined, false, [], { observer: observer({ status: "completed", detail: "receipt" }) });
+test("recovery completes from stored boundary evidence when history no longer pins the command", async (t) => {
+  const scope = cleanupScope(t);
+  const host = fixture(scope, [], undefined, false, [], { observer: observer({ status: "completed", detail: "receipt" }) });
   const operation: StoredOperation = {
     id: "stored", agentId: "a", revision: "rev", target: { sessionId: "native-a", activityKey: null },
     kind: "manual", state: "observing", createdAt: 1, updatedAt: 1, result: null, inputFingerprint: null,
@@ -1020,8 +1052,9 @@ test("recovery completes from stored boundary evidence when history no longer pi
   assert.equal((await host.gateway.inspect!(operation))?.status, "completed");
 });
 
-test("a live view lost while completion is verified is proved again from history", async () => {
-  const host = fixture([], undefined, false, [BOUNDARY_ITEM], { observer: observer({ status: "completed", detail: "Native PostCompact" }) });
+test("a live view lost while completion is verified is proved again from history", async (t) => {
+  const scope = cleanupScope(t);
+  const host = fixture(scope, [], undefined, false, [BOUNDARY_ITEM], { observer: observer({ status: "completed", detail: "Native PostCompact" }) });
   let emit!: (message: unknown) => void;
   const subscribe = host.ref.timeline.subscribe;
   host.ref.timeline.subscribe = listener => { emit = listener; return subscribe(listener); };
@@ -1056,11 +1089,11 @@ interface LostViewOptions {
   // The gateway's clock, read through the test's clock time.
   timeoutMs?: number; now?: (time: number) => number;
 }
-async function lostView(lost: typeof LOST_VIEW[number], { live = [], before = [],
+async function lostView(scope: CleanupScope, lost: typeof LOST_VIEW[number], { live = [], before = [],
   history = (id: string) => [command(id), { turnId: "compact-1", item: BOUNDARY }],
   receipt = { status: "completed", detail: "Native PostCompact" },
   timeoutMs = 1_000, now = time => time }: LostViewOptions = {}) {
-  const host = fixture([], undefined, false, [...before], { observer: observer(receipt), timeoutMs,
+  const host = fixture(scope, [], undefined, false, [...before], { observer: observer(receipt), timeoutMs,
     now: () => now(host.clock.now()) });
   const send = host.ref.send;
   let emit!: (message: unknown) => void;
@@ -1085,36 +1118,40 @@ async function lostView(lost: typeof LOST_VIEW[number], { live = [], before = []
 }
 const command = (id: string) => ({ turnId: "compact-1", item: { type: "user_message", clientMessageId: id } });
 
-test("a lost live view is not a conversation change: completion is read from the receipt and pinned history", async () => {
+test("a lost live view is not a conversation change: completion is read from the receipt and pinned history", async (t) => {
+  const scope = cleanupScope(t);
   for (const lost of LOST_VIEW) {
-    const { result, evidence } = await lostView(lost, { live: [BOUNDARY] });
+    const { result, evidence } = await lostView(scope, lost, { live: [BOUNDARY] });
     assert.equal(result.status, "completed", lost);
     assert.equal(evidence?.invalidated, false, lost);
   }
 });
 
-test("after a lost live view, a boundary only history shows is enough", async () => {
+test("after a lost live view, a boundary only history shows is enough", async (t) => {
+  const scope = cleanupScope(t);
   for (const lost of LOST_VIEW) {
-    const { result, evidence } = await lostView(lost);
+    const { result, evidence } = await lostView(scope, lost);
     assert.equal(result.status, "completed", lost);
     assert.equal(evidence?.invalidated, false, lost);
     assert.equal(evidence?.turnId, "compact-1", lost);
   }
 });
 
-test("after a lost live view, another user message after the command in history is not evidence", async () => {
+test("after a lost live view, another user message after the command in history is not evidence", async (t) => {
+  const scope = cleanupScope(t);
   const other = { turnId: "next-turn", item: { type: "user_message", clientMessageId: "someone-else" } };
   const boundary = { turnId: "compact-1", item: BOUNDARY };
   for (const lost of LOST_VIEW) {
     for (const history of [(id: string) => [command(id), other, boundary], (id: string) => [command(id), boundary, other]]) {
-      const { result, evidence } = await lostView(lost, { live: [BOUNDARY], history });
+      const { result, evidence } = await lostView(scope, lost, { live: [BOUNDARY], history });
       assert.equal(result.status, "completed", lost);
       assert.equal(evidence?.invalidated, false, lost);
     }
   }
 });
 
-test("after a lost live view, completion still needs the native receipt and the command's own boundary in history", async () => {
+test("after a lost live view, completion still needs the native receipt and the command's own boundary in history", async (t) => {
+  const scope = cleanupScope(t);
   const foreign = (id: string) => [command(id), { turnId: "other-turn", item: BOUNDARY }];
   // A page without the command is not proof that it was never delivered.
   const missing = () => [{ turnId: "compact-1", item: BOUNDARY }];
@@ -1124,7 +1161,7 @@ test("after a lost live view, completion still needs the native receipt and the 
       ["boundary in another turn", { history: foreign }],
       ["command missing from the page", { history: missing }],
     ] as const) {
-      const { result, evidence, reads } = await lostView(lost, { live: [BOUNDARY], timeoutMs: 60, ...options });
+      const { result, evidence, reads } = await lostView(scope, lost, { live: [BOUNDARY], timeoutMs: 60, ...options });
       assert.equal(result.status, "unknown", `${lost}: ${name}`);
       // History is only worth reading once Claude reports completion; when it
       // does, the outcome must come from having read it, not from the deadline.
@@ -1135,7 +1172,8 @@ test("after a lost live view, completion still needs the native receipt and the 
   }
 });
 
-test("a history page read across another lost live view proves nothing, not even a change", async () => {
+test("a history page read across another lost live view proves nothing, not even a change", async (t) => {
+  const scope = cleanupScope(t);
   const other = { turnId: "next-turn", item: { type: "user_message", clientMessageId: "someone-else" } };
   const boundary = { turnId: "compact-1", item: BOUNDARY };
   for (const lost of LOST_VIEW) {
@@ -1149,7 +1187,7 @@ test("a history page read across another lost live view proves nothing, not even
       offset += 1_000; // the next poll may read history again
       return [command(id), other, boundary];
     };
-    const { result, evidence, reads } = await lostView(lost, { history, timeoutMs: 5_000, now: time => time + offset });
+    const { result, evidence, reads } = await lostView(scope, lost, { history, timeoutMs: 5_000, now: time => time + offset });
     assert.equal(reads, 2, lost);
     assert.equal(result.status, "completed", lost);
     assert.equal(evidence?.invalidated, false, lost);
@@ -1175,12 +1213,13 @@ function pollSignal() {
 }
 
 test("after a lost live view, history is read at most once a second while completion is awaited", async (t) => {
+  const scope = cleanupScope(t);
   let time = Date.now();
   const native = observer({ status: "completed", detail: "Native PostCompact" })!;
   const polls = pollSignal();
   const receipt = native.receipt;
   native.receipt = (...args) => { polls.poll(); return receipt(...args); };
-  const host = fixture([], undefined, false, [], { observer: native, timeoutMs: 120_000, now: () => time });
+  const host = fixture(scope, [], undefined, false, [], { observer: native, timeoutMs: 120_000, now: () => time });
   const send = host.ref.send;
   let emit!: (message: unknown) => void;
   const subscribe = host.ref.timeline.subscribe;
@@ -1197,7 +1236,7 @@ test("after a lost live view, history is read at most once a second while comple
   });
   // Past the live deadline, so the attempt ends even if the test stops early,
   // at a failed assertion or at the test runner's bound.
-  t.after(() => { time += 120_000; });
+  scope.defer(() => { time += 120_000; });
   const until = (done: () => boolean) => polls.until(done, attempt, "the attempt stopped polling");
   const pollsAfter = (count: number) => { const target = polls.count + count; return until(() => polls.count >= target); };
   await until(() => reads >= 1);
@@ -1214,19 +1253,21 @@ test("after a lost live view, history is read at most once a second while comple
   assert.equal(host.sendCount(), 1);
 });
 
-test("another user message seen live, before or after a lost live view, does not end the attempt", async () => {
+test("another user message seen live, before or after a lost live view, does not end the attempt", async (t) => {
+  const scope = cleanupScope(t);
   const message = { type: "user_message", clientMessageId: "someone-else" };
   for (const lost of LOST_VIEW) {
     for (const [name, options] of [["before", { before: [message] }], ["after", { live: [message] }]] as const) {
-      const { result, evidence } = await lostView(lost, { ...options });
+      const { result, evidence } = await lostView(scope, lost, { ...options });
       assert.equal(result.status, "completed", `${lost}: ${name}`);
       assert.equal(evidence?.invalidated, false, `${lost}: ${name}`);
     }
   }
 });
 
-test("an attempt that ends unknown after a lost live view stays open for reconciliation", async () => {
-  const host = fixture([], undefined, false, [], { observer: observer(null), timeoutMs: 40 });
+test("an attempt that ends unknown after a lost live view stays open for reconciliation", async (t) => {
+  const scope = cleanupScope(t);
+  const host = fixture(scope, [], undefined, false, [], { observer: observer(null), timeoutMs: 40 });
   const send = host.ref.send;
   let emit!: (message: unknown) => void;
   const subscribe = host.ref.timeline.subscribe;
@@ -1262,8 +1303,8 @@ test("an attempt that ends unknown after a lost live view stays open for reconci
   assert.equal(state.operations[0].evidence?.invalidated, false);
 });
 
-async function realObserverFixture(now = () => Date.now()) {
-  const home = await mkdtemp(join(tmpdir(), "compact-gateway-restart-"));
+async function realObserverFixture(scope: CleanupScope, now = () => Date.now()) {
+  const home = await scope.folder("compact-gateway-restart-");
   const native = createObserver({ home, now });
   // Include Paseo 0.14+ session-open fields so this compiles across SDK 0.12–0.16+.
   await native.prepareSession({
@@ -1289,20 +1330,17 @@ async function realObserverFixture(now = () => Date.now()) {
   return {
     home, native, parent, directory, launchId: manifest.launchId as string, ledger,
     saveLedger, readRequest, writeReceipt,
-    close: () => rm(home, { recursive: true, force: true }),
   };
 }
 
 test("live observation reports a confirmed query-restart refusal promptly for both Compact now and automatic compaction", async (t) => {
+  const scope = cleanupScope(t);
   for (const kind of ["manual", "automatic"] as const) {
     const time = 1_000_000;
-    const obs = await realObserverFixture(() => time);
-    const host = fixture([], undefined, false, [], {
+    const obs = await realObserverFixture(scope, () => time);
+    const host = fixture(scope, [], undefined, false, [], {
       observer: obs.native, now: () => time, timeoutMs: 120_000, pollMs: 1,
     });
-    // On a frozen clock the live poll never reaches its deadline, so a test that
-    // stops early stops the gateway before its observer folder is removed.
-    t.after(async () => { host.stop(); await obs.close(); });
     const send = host.ref.send;
     let sawGenerationChange!: () => void;
     const generationChanged = new Promise<void>(resolve => { sawGenerationChange = resolve; });
@@ -1352,20 +1390,18 @@ test("live observation reports a confirmed query-restart refusal promptly for bo
 });
 
 test("a generation change without a matching refusal stays pending until the observation deadline", async (t) => {
+  const scope = cleanupScope(t);
   let time = 1_000_000;
-  const obs = await realObserverFixture(() => time);
-  const host = fixture([], undefined, false, [], {
+  const obs = await realObserverFixture(scope, () => time);
+  const host = fixture(scope, [], undefined, false, [], {
     observer: obs.native, now: () => time, timeoutMs: 120_000, pollMs: 1,
   });
   let attempt: Promise<import("./model").CompactOutcome> | undefined;
   // Runs even if the test stops early, at a failed assertion or at the test
-  // runner's bound: past the deadline the attempt ends, then the host and the
-  // observer stop.
-  t.after(async () => {
+  // runner's bound: past the deadline the attempt ends, before the host stops.
+  scope.defer(() => {
     time += 120_000;
     void attempt?.catch(() => {});
-    host.stop();
-    await obs.close();
   });
   const send = host.ref.send;
   const originalResult = obs.native.result;
@@ -1407,12 +1443,11 @@ test("a generation change without a matching refusal stays pending until the obs
 });
 
 test("stopping the plugin after dispatch preserves request.json so a query-restart refusal remains recoverable", async (t) => {
+  const scope = cleanupScope(t);
   const time = 1_000_000;
-  const obs = await realObserverFixture(() => time);
-  t.after(() => obs.close());
-  const host = fixture([], undefined, false, [], { observer: obs.native, now: () => time, timeoutMs: 120_000, pollMs: 1 });
+  const obs = await realObserverFixture(scope, () => time);
+  const host = fixture(scope, [], undefined, false, [], { observer: obs.native, now: () => time, timeoutMs: 120_000, pollMs: 1 });
   // The clock stands still; stopping ends the attempt even if the send is never reached.
-  t.after(() => host.stop());
   const send = host.ref.send;
   let saved: OperationEvidence | undefined;
   host.ref.send = async (text, options) => {
@@ -1436,7 +1471,7 @@ test("stopping the plugin after dispatch preserves request.json so a query-resta
     status: "failed", reason: "Claude query restarted before compaction ran", observedAt: time + 500,
     refusal: QUERY_RESTARTED_REFUSAL, prepared,
   });
-  const restarted = fixture([], undefined, false, [], { observer: obs.native, now: () => time });
+  const restarted = fixture(scope, [], undefined, false, [], { observer: obs.native, now: () => time });
   const stored: StoredOperation = {
     id: req.id, agentId: "a", revision: agent.revision!, target: { sessionId: "native-a", activityKey: agent.activityKey ?? null },
     kind: "manual", state: "observing", createdAt: time, updatedAt: time, result: null, inputFingerprint: null,
@@ -1450,9 +1485,9 @@ test("stopping the plugin after dispatch preserves request.json so a query-resta
 });
 
 test("recovery accepts a confirmed query-restart refusal within the deadline and ignores late or ambiguous receipts", async (t) => {
-  const obs = await realObserverFixture(() => 1_000_000);
-  t.after(() => obs.close());
-  const host = fixture([], undefined, false, [], { observer: obs.native, now: () => 1_000_000 });
+  const scope = cleanupScope(t);
+  const obs = await realObserverFixture(scope, () => 1_000_000);
+  const host = fixture(scope, [], undefined, false, [], { observer: obs.native, now: () => 1_000_000 });
   const native = { id: "recover-restart", launchId: obs.launchId, generation: "gen-1", sessionId: "native-a", revision: 2 };
   const operation: StoredOperation = {
     id: native.id, agentId: "a", revision: "rev", target: { sessionId: "native-a", activityKey: null },
