@@ -14,7 +14,8 @@ test('snapshot keeps testing its recorded commit while the source advances, prop
   const repo = join(root, 'repo');
   let running;
   // Lets a check still waiting go on, then waits for the wrapper to exit;
-  // its spawn timeout bounds that wait.
+  // its spawn timeout bounds that wait, so a signal that cannot be written is
+  // ignored: the wrapper still ends at that timeout.
   t.after(async () => {
     await writeFile(join(root, 'continue'), 'cleanup').catch(() => {});
     await running?.catch(() => {}); // a spawn error has already failed the test

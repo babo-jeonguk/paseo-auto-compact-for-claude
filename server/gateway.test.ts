@@ -692,7 +692,9 @@ test("a scan whose later listing page fails stays single-flight until reads star
     holdPage: start => { if (start === 1) throw new Error("page failed"); },
   });
   const { scheduler } = directoryScheduler(dir.host);
-  t.after(() => { scheduler.stop(); dir.host.stop(); });
+  // a's held read runs under the gateway's real per-read bound, so a test that
+  // stops before releasing it would keep that timer running.
+  t.after(() => { releaseA(); scheduler.stop(); dir.host.stop(); });
   await scheduler.ready;
   await assert.rejects(scheduler.observe({ kind: "full" }), /page failed/);
   const next = scheduler.observe({ kind: "agent", agentId: "b" });
@@ -1050,10 +1052,12 @@ test("live observation reports a confirmed query-restart refusal promptly for bo
   for (const kind of ["manual", "automatic"] as const) {
     const time = 1_000_000;
     const obs = await realObserverFixture(() => time);
-    t.after(() => obs.close());
     const host = fixture([], undefined, false, [], {
       observer: obs.native, now: () => time, timeoutMs: 120_000, pollMs: 1,
     });
+    // On a frozen clock the live poll never reaches its deadline, so a test that
+    // stops early stops the gateway before its observer folder is removed.
+    t.after(async () => { host.stop(); await obs.close(); });
     const send = host.ref.send;
     let sawGenerationChange!: () => void;
     const generationChanged = new Promise<void>(resolve => { sawGenerationChange = resolve; });
