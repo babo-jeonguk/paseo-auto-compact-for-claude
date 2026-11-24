@@ -138,18 +138,20 @@ const unitTestRules = [
 const scopeRules = [
   {
     selector: ":matches(ImportSpecifier[imported.name=/^mkdtemp(Sync)?$/], " +
-      "MemberExpression:matches([computed=false][property.name=/^mkdtemp(Sync)?$/], [property.value=/^mkdtemp(Sync)?$/]), " +
+      "MemberExpression:matches([computed=false][property.name=/^mkdtemp(Sync)?$/], [property.value=/^mkdtemp(Sync)?$/], " +
+      "[property.expressions.length=0][property.quasis.0.value.cooked=/^mkdtemp(Sync)?$/]), " +
       "ObjectPattern > Property[key.name=/^mkdtemp(Sync)?$/])",
     message: temporaryFolder,
   },
   {
-    selector: `CallExpression > MemberExpression.callee${writtenKey("after")}, ` +
+    selector: `CallExpression > MemberExpression.callee:matches(${writtenKey("after")}, ${writtenKey("afterEach")}), ` +
       "ImportDeclaration[source.value='node:test'] > ImportSpecifier[imported.name=/^(after|afterEach)$/]",
     message: testHook,
   },
   {
     // Types alone start nothing.
-    selector: `ImportDeclaration[source.value=${childProcessModule}]:not([importKind='type']), ` +
+    selector: `ImportDeclaration[source.value=${childProcessModule}]:not([importKind='type'])` +
+      ":has(> :matches(ImportDefaultSpecifier, ImportNamespaceSpecifier, ImportSpecifier:not([importKind='type']))), " +
       `:matches(ExportNamedDeclaration, ExportAllDeclaration)[source.value=${childProcessModule}], ` +
       moduleLoad(childProcessModule),
     message: childProcess,
