@@ -1,14 +1,14 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
 import { z } from "zod";
 import { createCachedStore, createStore } from "./store";
 import type { State, StateStore } from "./model";
 import { claudeProvider } from "./gateway";
 import { syncJobs } from "./operations";
 import { StatusSchema } from "../shared/rpc";
+import { cleanupScope } from "../tests/support/scope";
 
 const released = new URL("../tests/fixtures/state-v1.0.2.json", import.meta.url);
 // v1.0.2's own state schema, verbatim: what a rollback reads.
@@ -35,8 +35,7 @@ const V102StateSchema = z.object({
 });
 
 test("file store retains off policies and processed revisions across instances", async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "compact-store-"));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  const root = await cleanupScope(t).folder("compact-store-");
   const path = join(root, "state.json");
   const first = createStore(path);
   assert.equal((await first.read()).jobs.length, 0);
@@ -85,8 +84,7 @@ test("provider inheritance follows exact Claude root, rejects substring names an
 });
 
 test("migration expires old pending work while preserving settings-independent off choices and history", async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "compact-store-migrate-"));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  const root = await cleanupScope(t).folder("compact-store-migrate-");
   const path = join(root, "state.json");
   const store = createStore(path);
   await writeFile(path, JSON.stringify({ version: 1, disabled: ["a"], jobs: [
@@ -103,8 +101,7 @@ test("migration expires old pending work while preserving settings-independent o
 });
 
 test("the state v1.0.2 really wrote migrates to legacy history and keeps every guard", async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "compact-v1.0.2-"));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  const root = await cleanupScope(t).folder("compact-v1.0.2-");
   const path = join(root, "state.json");
   const legacy = JSON.parse(await readFile(released, "utf8"));
   await writeFile(path, JSON.stringify(legacy));
@@ -132,8 +129,7 @@ test("the state v1.0.2 really wrote migrates to legacy history and keeps every g
 });
 
 test("a rollback to v1.0.2 reads our state, keeps attempted activities guarded and rolls forward again", async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "compact-rollback-"));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  const root = await cleanupScope(t).folder("compact-rollback-");
   const path = join(root, "state.json");
   const target = { sessionId: "native-a", activityKey: "launch:generation:1" };
   const operation = (id: string, state: "succeeded" | "expired" | "requested") => ({ id, agentId: id, revision: "rev", target,
@@ -265,8 +261,7 @@ test("a write that lands while the first read is in flight is not replaced by th
 });
 
 test("the cached file store keeps today's unreadable-state failure and missing-file default", async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "compact-cached-store-"));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  const root = await cleanupScope(t).folder("compact-cached-store-");
   const path = join(root, "state.json");
   const missing = createCachedStore(createStore(path));
   assert.deepEqual(await missing.read(), { version: 1, disabled: [], jobs: [], operations: [] });
@@ -304,8 +299,7 @@ test("a read error clears a snapshot that a concurrent read cached, so the next 
 });
 
 test("a blocked reservation reads back with its reason code; records without one, or from a rollback, still load", async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "compact-blocked-"));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  const root = await cleanupScope(t).folder("compact-blocked-");
   const path = join(root, "state.json");
   const job = (agentId: string, blockedReason?: string) => ({ agentId, revision: "rev", endedAt: 10,
     status: "blocked" as const, detail: "Claude observer unavailable", ...(blockedReason ? { blockedReason } : {}) });

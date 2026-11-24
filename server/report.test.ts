@@ -2,12 +2,13 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { DeadlineExceeded } from "./deadline";
 import { createReporter, REPORT_GRACE_MS } from "./report";
+import { cleanupScope } from "../tests/support/scope";
 
 test("a defect is reported at once; the host being unavailable only if it outlasts the grace period", (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const lines: string[] = [];
   const reporter = createReporter(line => lines.push(line));
-  t.after(() => reporter.dispose());
+  cleanupScope(t).defer(() => reporter.dispose());
   reporter.report(new TypeError("broken"));
   reporter.report(new DeadlineExceeded());
   reporter.report(new Error("Daemon client closed"));

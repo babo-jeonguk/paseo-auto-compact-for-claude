@@ -3,23 +3,23 @@ import { test } from 'node:test';
 import { execFile, spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { promisify } from 'node:util';
-import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { tmpdir } from 'node:os';
+import { cleanupScope } from './support/scope.ts';
 
 const STARTED = 'snapshot check started';
 
 test('snapshot keeps testing its recorded commit while the source advances, propagates failure and removes its worktree', async (t) => {
-  const root = await mkdtemp(join(tmpdir(), 'compact-snapshot-test-'));
+  const scope = cleanupScope(t);
+  const root = await scope.folder('compact-snapshot-test-');
   const repo = join(root, 'repo');
   let running;
-  // Lets a check still waiting go on, then waits for the wrapper to exit;
-  // its spawn timeout bounds that wait, so a signal that cannot be written is
-  // ignored: the wrapper still ends at that timeout.
-  t.after(async () => {
+  // Lets a check still waiting go on, then waits for the wrapper to exit
+  // before its folder goes; its spawn timeout bounds that wait, so a signal
+  // that cannot be written is ignored: the wrapper still ends at that timeout.
+  scope.defer(async () => {
     await writeFile(join(root, 'continue'), 'cleanup').catch(() => {});
     await running?.catch(() => {}); // a spawn error has already failed the test
-    await rm(root, { recursive: true, force: true });
   });
   await mkdir(join(repo, 'scripts'), { recursive: true });
   await mkdir(join(repo, 'tests/simulation'), { recursive: true });

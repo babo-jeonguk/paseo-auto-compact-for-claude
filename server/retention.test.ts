@@ -1,14 +1,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
 import { HISTORY_RETENTION_MS, HISTORY_SWEEP_INTERVAL_MS, pruneOperationHistory, type OperationReceipts } from "./retention";
 import { createScheduler } from "./scheduler";
 import { createStore } from "./store";
 import { DEFAULT_SETTINGS } from "../shared/settings";
 import type { Gateway, Observation, State, StoredOperation } from "./model";
 import { changes } from "../tests/support/changes";
+import { cleanupScope, type CleanupScope } from "../tests/support/scope";
 
 const now = HISTORY_RETENTION_MS + 1000;
 const operation = (id: string, state: StoredOperation["state"] = "succeeded", updatedAt = 1000): StoredOperation => ({
@@ -45,8 +44,8 @@ test("receipt deletion failure preserves the operation while other expired recor
   assert.equal(errors.length, 1);
 });
 
-async function fixture() {
-  const home = await mkdtemp(join(tmpdir(), "compact-retention-"));
+async function fixture(scope: CleanupScope) {
+  const home = await scope.folder("compact-retention-");
   const disk = createStore(join(home, "state.json"));
   const old = operation("old");
   const state = stateWith(old);
@@ -81,18 +80,22 @@ async function fixture() {
     },
   };
   return { agent, disk, removed, errors, committed,
-    make: () => createScheduler({ store, gateway, receipts, now: () => time,
-      settings: async () => ({ ...DEFAULT_SETTINGS, enabled: false }), onError: error => errors.push(error) }),
+    // Each scheduler runs on real timers, so it stops when the test ends,
+    // before the folder its store writes to is removed.
+    make() {
+      const scheduler = createScheduler({ store, gateway, receipts, now: () => time,
+        settings: async () => ({ ...DEFAULT_SETTINGS, enabled: false }), onError: error => errors.push(error) });
+      scope.defer(() => scheduler.stop());
+      return scheduler;
+    },
     get sends() { return sends; }, get sweeps() { return sweeps; },
     failCommit(value: boolean) { failCommit = value; }, failRemoval(value: boolean) { failRemoval = value; },
     advance(ms: number) { time += ms; },
-    close: () => rm(home, { recursive: true, force: true }),
   };
 }
 
 test("cleanup survives a state commit failure and restart after receipt deletion", async (t) => {
-  const f = await fixture();
-  t.after(() => f.close());
+  const f = await fixture(cleanupScope(t));
   f.failCommit(true);
   const first = f.make(); await first.ready;
   assert.deepEqual(f.removed, ["old"]);
@@ -108,8 +111,7 @@ test("cleanup survives a state commit failure and restart after receipt deletion
 });
 
 test("offline ticks retry removal failures; successful sweeps run hourly and tolerate clock rollback", async (t) => {
-  const f = await fixture();
-  t.after(() => f.close());
+  const f = await fixture(cleanupScope(t));
   f.failRemoval(true);
   const s = f.make(); await s.ready;
   assert(await s.operation("old"));
@@ -123,11 +125,8 @@ test("offline ticks retry removal failures; successful sweeps run hourly and tol
 });
 
 test("cleanup preserves same-activity protection across restart and allows a new native generation", async (t) => {
-  const f = await fixture();
+  const f = await fixture(cleanupScope(t));
   let s = f.make();
-  // Runs even if the test stops early, at a failed assertion or at the test
-  // runner's bound: the scheduler's timers stop before the folder is removed.
-  t.after(async () => { s.stop(); await f.close(); });
   await s.ready;
   assert.equal(await s.operation("old"), null);
   assert.deepEqual((await f.disk.read()).disabled, ["a"]);

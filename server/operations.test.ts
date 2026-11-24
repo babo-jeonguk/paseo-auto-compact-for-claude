@@ -4,6 +4,7 @@ import { createOperationWorker, recoverOperations } from "./operations";
 import { TICK_INTERVAL_MS } from "./scheduler";
 import { changes } from "../tests/support/changes";
 import { fakeTimers } from "../tests/support/timers";
+import { cleanupScope } from "../tests/support/scope";
 import { DEFAULT_SETTINGS, type Settings } from "../shared/settings";
 import { Refusal, type CompactOutcome, type ExecutionContext, type Gateway, type Observation,
   type State, type StoredOperation } from "./model";
@@ -212,7 +213,7 @@ test("a fault that clears before the send deadline still sends, however many att
 
 test("the worker wakes itself for a retry instead of waiting for the next tick", async (t) => {
   const f = fixture(), worker = f.make();
-  t.after(() => worker.stop());
+  cleanupScope(t).defer(() => worker.stop());
   const compact = f.gateway.compact;
   f.gateway.compact = async () => { throw new Error("observer preparation timed out"); };
   await worker.reconcile();
@@ -229,7 +230,7 @@ test("the worker wakes itself for a retry instead of waiting for the next tick",
 
 test("a worker stopped while it saves a retry arms no wake-up", async (t) => {
   const f = fixture(), worker = f.make();
-  t.after(() => worker.stop());
+  cleanupScope(t).defer(() => worker.stop());
   let held!: ReturnType<typeof f.holdNextUpdate>;
   let sending!: () => void;
   const sent = new Promise<void>(resolve => { sending = resolve; });

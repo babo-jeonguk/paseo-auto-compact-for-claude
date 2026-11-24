@@ -28,10 +28,16 @@ const countedWait = 'A unit test waits for a condition through a signal, not by 
 const contextMock = 'A unit test mocks through its test context (t.mock), which the runner restores even when the ' +
   'test stops at its bound and its finally never runs; a mock on the shared tracker would outlive it ' +
   '(CODING_STANDARDS.md "Tests").';
-const cleanupInFinally = 'A test stopped at the runner\'s bound never reaches its finally, so it registers the cleanup ' +
-  'of what would outlive it (a timer, process, server or temporary folder) with t.after() right after acquiring it; ' +
-  'the runner still runs those hooks. A finally that must still wait says why it is safe in a disable comment ' +
-  '(CODING_STANDARDS.md "Tests").';
+const cleanupInFinally = 'A test stopped at the runner\'s bound never reaches its finally, so what acquires something ' +
+  'that would outlive the test (a timer, process, server or temporary folder) registers its release with the test\'s ' +
+  'cleanup scope (tests/support/scope.ts) as it acquires it; the runner still runs the scope\'s hook. A finally ' +
+  'that must still wait says why it is safe in a disable comment (CODING_STANDARDS.md "Tests").';
+const temporaryFolder = 'A unit test creates a temporary folder through its cleanup scope (folder() in ' +
+  'tests/support/scope.ts), which registers the removal in the same call, so no step between creating the folder ' +
+  'and registering its removal can leak it (CODING_STANDARDS.md "Tests").';
+const testHook = 'A unit test registers cleanup with its cleanup scope (defer() in tests/support/scope.ts), whose one ' +
+  'hook releases in reverse order of acquisition, runs every release and reports each failure. Hooks registered ' +
+  'one by one run in registration order and stop at the first that throws (CODING_STANDARDS.md "Tests").';
 const turnWait = 'A unit test does not wait for a bare event-loop turn: work can still act after one. Wait on the ' +
   'promise of the call, on a fake\'s change, or with drained() from tests/support/drained.ts, which takes the turn ' +
   'and then fails if Node still lists a real timer, immediate or I/O request as pending (CODING_STANDARDS.md "Tests").';
@@ -119,6 +125,22 @@ const unitTestRules = [
           message: cleanupInFinally,
         },
 ];
+// Cleanup that bypasses the test's scope: a temporary folder made directly,
+// whose removal the caller registers only afterwards, and a hook of the test
+// runner, which runs outside the scope's order. The scope's module is exempt.
+const scopeRules = [
+  {
+    selector: ":matches(ImportSpecifier[imported.name=/^mkdtemp(Sync)?$/], " +
+      "MemberExpression:matches([computed=false][property.name=/^mkdtemp(Sync)?$/], [property.value=/^mkdtemp(Sync)?$/]), " +
+      "ObjectPattern > Property[key.name=/^mkdtemp(Sync)?$/])",
+    message: temporaryFolder,
+  },
+  {
+    selector: `CallExpression > MemberExpression.callee${writtenKey("after")}, ` +
+      "ImportDeclaration[source.value='node:test'] > ImportSpecifier[imported.name=/^(after|afterEach)$/]",
+    message: testHook,
+  },
+];
 // A wait for one event-loop turn: an immediate, a timer or interval with no
 // delay, or setImmediate imported from the timer modules (loading them at run
 // time is a real-time finding already). Test support modules are exempt:
@@ -158,7 +180,7 @@ export const projectRules = [
   {
     files: unitTests,
     ignores: testSupport,
-    rules: { "no-restricted-syntax": ["error", ...unitTestRules, ...turnWaitRules] },
+    rules: { "no-restricted-syntax": ["error", ...unitTestRules, ...turnWaitRules, ...scopeRules] },
   },
   {
     files: testSupport,

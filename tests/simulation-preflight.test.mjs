@@ -2,17 +2,18 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { readFile, rm } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { cleanupScope } from './support/scope.ts';
 
 test('simulation cannot report another operating system as tested or count unrun cases as passed', async (t) => {
-  const reportDir = await mkdtemp(join(tmpdir(), 'compact-preflight-'));
+  const scope = cleanupScope(t);
+  const reportDir = await scope.folder('compact-preflight-');
   let report;
-  t.after(async () => {
+  scope.defer(async () => {
     if (report?.root && dirname(report.root) === tmpdir()) await rm(report.root, { recursive: true, force: true });
-    await rm(reportDir, { recursive: true, force: true });
   });
   const file = join(dirname(fileURLToPath(import.meta.url)), 'simulation/run.mjs');
   const expected = process.platform === 'win32' ? 'linux' : 'win32';

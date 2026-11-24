@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { mkdtemp, writeFile, rm, utimes } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { writeFile, utimes } from 'node:fs/promises';
 import { join } from 'node:path';
+import { cleanupScope } from '../tests/support/scope';
 import { createCacheReader, transcriptTtl, type CacheRequest } from './cache';
 
 const now = Date.parse('2026-10-22T00:00:00Z');
@@ -32,8 +32,7 @@ test('transcript parsing excludes other sessions, sidechains, old context and ma
 });
 
 test('missing TTL uses a disclosed one-hour default; settings and actual transcript override it without blocking 50/55m', async (t) => {
-  const dir = await mkdtemp(join(tmpdir(), 'compact-ttl-'));
-  t.after(() => rm(dir, { recursive: true, force: true }));
+  const dir = await cleanupScope(t).folder('compact-ttl-');
   const path = join(dir, 'session.jsonl'), read = createCacheReader();
   const fallback = await read(request, path, 'session', now, now);
   assert.equal(fallback?.source, 'default'); assert.equal(fallback?.ttlMinutes, 60);
@@ -50,8 +49,7 @@ test('missing TTL uses a disclosed one-hour default; settings and actual transcr
 });
 
 test('read-only replies refresh a recent same-model observation; explicit changed policy overrides an old write', async (t) => {
-  const dir = await mkdtemp(join(tmpdir(), 'compact-ttl-read-'));
-  t.after(() => rm(dir, { recursive: true, force: true }));
+  const dir = await cleanupScope(t).folder('compact-ttl-read-');
   const path = join(dir, 'session.jsonl'), read = createCacheReader();
   await writeFile(path, row(0, 10) + row(0, 0, { timestamp: new Date(now + 60_000).toISOString() }));
   const later = { ...request, startedAt: now + 59_000 };
