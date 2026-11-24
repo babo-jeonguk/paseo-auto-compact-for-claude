@@ -32,9 +32,9 @@ const cleanupInFinally = 'A test stopped at the runner\'s bound never reaches it
   'of what would outlive it (a timer, process, server or temporary folder) with t.after() right after acquiring it; ' +
   'the runner still runs those hooks. A finally that must still wait says why it is safe in a disable comment ' +
   '(CODING_STANDARDS.md "Tests").';
-const turnWait = 'A unit test does not wait for an event-loop turn: work outside its fakes can still act after one. ' +
-  'Wait on the promise of the call, on a fake\'s change, or with drained() from tests/support/drained.ts, which ' +
-  'resolves once nothing is left to run and fails if real work is still pending (CODING_STANDARDS.md "Tests").';
+const turnWait = 'A unit test does not wait for a bare event-loop turn: work can still act after one. Wait on the ' +
+  'promise of the call, on a fake\'s change, or with drained() from tests/support/drained.ts, which takes the turn ' +
+  'and then fails if Node still lists a real timer, immediate or I/O request as pending (CODING_STANDARDS.md "Tests").';
 const serverRealTime = 'Server code waits on time only through the injected timers (Timers), whose one real ' +
   'implementation is systemTimers in server/deadline.ts, so a unit test drives every wait and can tell when ' +
   'processing has ended (CODING_STANDARDS.md "Decisions apart from effects").';
@@ -49,10 +49,21 @@ const globalCall = (names) => `CallExpression:matches([callee.name=${names}], ` 
   `[callee.property.value=${names}], ` +
   `[callee.property.expressions.length=0][callee.property.quasis.0.value.cooked=${names}]))`;
 const timersModule = "/^(node:)?timers(\\/promises)?$/";
-// The same modules loaded at run time, named by a string or a template without
-// interpolation.
-const timersImport = `ImportExpression:matches([source.value=${timersModule}], ` +
-  `[source.expressions.length=0][source.quasis.0.value.cooked=${timersModule}])`;
+// The key of the member expression at `path` ("" for the node itself, or
+// "callee." and "object." for one below it), written as a name, a string or a
+// template without interpolation.
+const writtenKey = (name, path = "") => `:matches([${path}computed=false][${path}property.name='${name}'], ` +
+  `[${path}property.value='${name}'], ` +
+  `[${path}property.expressions.length=0][${path}property.quasis.0.value.cooked='${name}'])`;
+// The timer modules loaded at run time, named by a string or a template
+// without interpolation: import(), require(), or process.getBuiltinModule()
+// (also through the global object).
+const written = (path) => `:matches([${path}value=${timersModule}], ` +
+  `[${path}expressions.length=0][${path}quasis.0.value.cooked=${timersModule}])`;
+const timersLoad = `ImportExpression${written("source.")}, ` +
+  `CallExpression:matches([callee.name='require'], ` +
+  `[callee.type='MemberExpression']${writtenKey("getBuiltinModule", "callee.")}:matches([callee.object.name='process'], ` +
+  `[callee.object.object.name=/^global(This)?$/]${writtenKey("process", "callee.object.")}))${written("arguments.0.")}`;
 // The delay argument when a number is written into it, alone or inside an
 // expression; 0 (the next turn, or a lower bound) is not a duration. A function
 // in that position is a callback; `every` is a timer only on a clock.
@@ -90,7 +101,7 @@ const unitTestRules = [
           message: contextMock,
         },
         {
-          selector: timersImport,
+          selector: timersLoad,
           message: realTime,
         },
         {
@@ -101,8 +112,9 @@ const unitTestRules = [
         },
 ];
 // A wait for one event-loop turn: an immediate, a timer or interval with no
-// delay, or setImmediate from the timer modules. Only tests/support/drained.ts, which checks that
-// nothing real is pending after its turn, may take one.
+// delay, or setImmediate imported from the timer modules (loading them at run
+// time is a real-time finding already). Test support modules are exempt:
+// drained() takes its turn there, and so does the fake timers' tick.
 const turnWaitRules = [
   {
     selector: `${globalCall("/^setImmediate$/")}, ` +
@@ -121,12 +133,6 @@ const namedTimingRules = [{
   ].join(", "),
   message: namedTiming,
 }];
-// The key of the member expression at `path` ("" for the node itself, or
-// "callee." and "object." for one below it), written as a name, a string or a
-// template without interpolation.
-const writtenKey = (name, path = "") => `:matches([${path}computed=false][${path}property.name='${name}'], ` +
-  `[${path}property.value='${name}'], ` +
-  `[${path}property.expressions.length=0][${path}property.quasis.0.value.cooked='${name}'])`;
 // Real time reached in server code: a global timer, a timeout signal (also
 // through the global object), or the timer modules imported, re-exported,
 // required or loaded as a built-in by a written name.
@@ -135,11 +141,7 @@ const serverRealTimeRules = [{
     `CallExpression > MemberExpression.callee${writtenKey("timeout")}:matches([object.name='AbortSignal'], ` +
     `[object.object.name=/^global(This)?$/]${writtenKey("AbortSignal", "object.")}), ` +
     `:matches(ImportDeclaration, ExportNamedDeclaration, ExportAllDeclaration)[source.value=${timersModule}], ` +
-    `${timersImport}, ` +
-    `CallExpression:matches([callee.name='require'], ` +
-    `[callee.object.name='process']${writtenKey("getBuiltinModule", "callee.")}):matches(` +
-    `[arguments.0.value=${timersModule}], ` +
-    `[arguments.0.expressions.length=0][arguments.0.quasis.0.value.cooked=${timersModule}])`,
+    timersLoad,
   message: serverRealTime,
 }];
 

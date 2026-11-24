@@ -39,6 +39,9 @@ test('unit tests start no real timer with a delay', () => {
       "const { setTimeout: sleep } = await import('node:timers/promises');",
       "await import('timers');",
       'await import(`node:timers/promises`);',
+      "await process.getBuiltinModule('node:timers/promises').setImmediate();",
+      "globalThis.process['getBuiltinModule']('timers').setImmediate(fire);",
+      "require('node:timers');",
       "import { setTimeout } from 'node:timers/promises';",
       "import { setInterval as every } from 'timers/promises';",
       "import { scheduler } from 'node:timers/promises';",
@@ -168,6 +171,7 @@ test('server code waits on time only through injected timers', () => {
       "await import('node:timers');",
       "process.getBuiltinModule('node:timers/promises');",
       "process['getBuiltinModule'](`timers`);",
+      "globalThis.process.getBuiltinModule('node:timers/promises').setImmediate();",
       "require('node:timers');",
     ]) flags(file, code, /CODING_STANDARDS\.md "Decisions apart from effects"/);
     for (const code of [
