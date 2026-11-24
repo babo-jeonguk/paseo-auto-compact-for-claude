@@ -24,7 +24,7 @@ Keep decisions as pure functions that take the current time and state as input (
 
 ## Never send twice
 
-Compaction is a side effect that cannot be undone. Work that may have been sent (it has a dispatch marker) is never resent; when the outcome cannot be proven it ends `unknown`, not retried. A timeout bounds waiting; it does not cancel remote work. A change that can resend or report success without native evidence is a blocking finding.
+Compaction is a side effect that cannot be undone. Work that may have been sent (it has a dispatch marker) is never resent; when the outcome cannot be proven it ends `unknown`, not retried. A timeout bounds waiting; it does not cancel remote work, nor end a write: state that a write given up on may still change has no other writer until that write ends, so the next writer waits for the write itself, not for the wait on it. A change that can resend or report success without native evidence is a blocking finding.
 
 ## Durable state stays compatible
 
