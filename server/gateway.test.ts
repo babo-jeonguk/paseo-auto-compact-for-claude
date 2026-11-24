@@ -12,6 +12,7 @@ import { createScheduler } from "./scheduler";
 import { DEFAULT_SETTINGS } from "../shared/settings";
 import { changes } from "../tests/support/changes";
 import { fakeTimers } from "../tests/support/timers";
+import { drainer } from "../tests/support/drained";
 import type {
   PluginHandlerContext,
   PluginLifecycleEvents,
@@ -716,6 +717,7 @@ test("stable identity and durable send marker precede provider dispatch", async 
 
 test("failed marker persistence never sends and late send rejection is consumed", async () => {
   const host = fixture([]);
+  const drained = drainer();
   // A fault before sending is the worker's to retry, so it is thrown, not an outcome.
   await assert.rejects(host.gateway.compact("a", undefined, {
     id: "caller-request", sendBy: host.clock.now() + 1000,
@@ -730,7 +732,8 @@ test("failed marker persistence never sends and late send rejection is consumed"
   await host.clock.tick(40);
   assert.equal((await attempt).status, "unknown");
   reject(new Error("late rejection"));
-  await new Promise<void>(resolve => setImmediate(resolve));
+  // An unhandled rejection would be reported while the test still runs.
+  await drained();
 });
 
 test("recovery requires both the native receipt and the exact message's command boundary", async () => {
@@ -816,16 +819,14 @@ function directory(pageSize = 2, { slow = [] as string[], broken = [] as string[
     { ...base, id: "codex", provider: "codex" },
   ].map(agent => ({ ...agent, persistence: { sessionId: `native-${agent.id}` } }));
   const reads: string[] = [];
-  // Host conversation reads (`host <id>`), native reads (`read <id>`) and the
-  // listed observations a scheduler was given (`observed <id>` as each settles),
-  // in order.
+  // Host conversation reads (`host <id>`) and the listed observations a
+  // scheduler was given (`observed <id>`, see directoryScheduler), in order.
   const calls: string[] = [];
   let listCalls = 0;
   const native = observer(null)!;
   const read = native.read;
   native.read = async (id: string) => {
     reads.push(id);
-    calls.push(`read ${id}`);
     if (slow.includes(id)) await new Promise(() => {});
     await holdRead(id);
     const current = await read(id);
@@ -898,9 +899,11 @@ test("each listed agent's observation settles on its own, so a slow or failing o
 // A scheduler over the real gateway, with state kept in memory. `listing()` is
 // the scheduler's latest agent listing, so a test can wait for paging to end.
 // Its timers run only when a test moves them on, and arming one wakes `until`.
-// Each listed observation is recorded in `dir.calls` as it settles.
+// Each listed observation is recorded in `dir.calls` as it is fulfilled.
+// `drained()` resolves once nothing is left to run but what the test holds.
 function directoryScheduler(dir: ReturnType<typeof directory>) {
   const { host } = dir;
+  const drained = drainer();
   let state: import("./model").State = { version: 1, disabled: [], jobs: [], operations: [] };
   let listing: Promise<void> | undefined;
   const signal = changes();
@@ -909,13 +912,15 @@ function directoryScheduler(dir: ReturnType<typeof directory>) {
     store: { read: async () => structuredClone(state), write: async next => { state = structuredClone(next); } },
     gateway: { ...host.gateway, list: observe => (listing = host.gateway.list(observation => {
       observe(observation);
+      // The scheduler gets the same promise and handles its rejection; a
+      // rejected observation names no conversation to record.
       observation.then(agent => { dir.calls.push(`observed ${agent.agentId}`); }, () => {});
     })) },
     settings: async () => ({ ...DEFAULT_SETTINGS }),
     now: () => 1_000_000,
     timers,
   });
-  return { scheduler, timers, until: signal.until, listing: () => listing,
+  return { scheduler, timers, drained, until: signal.until, listing: () => listing,
     reserved: () => state.jobs.filter(job => job.status === "scheduled").map(job => job.agentId).sort() };
 }
 
@@ -926,19 +931,20 @@ test("a scan whose later listing page fails stays single-flight until reads star
     holdRead: id => id === "a" ? heldA : undefined,
     holdPage: start => { if (start === 1) throw new Error("page failed"); },
   });
-  const { scheduler } = directoryScheduler(dir);
+  const { scheduler, drained } = directoryScheduler(dir);
   t.after(() => { scheduler.stop(); dir.host.stop(); });
   await scheduler.ready;
   await assert.rejects(scheduler.observe({ kind: "full" }), /page failed/);
+  const from = dir.calls.length;
   const next = scheduler.observe({ kind: "agent", agentId: "b" });
+  await drained();
+  assert.deepEqual(dir.calls.slice(from), [], "b is not read while a's read from the failed scan still runs");
   releaseA();
   await next;
-  // The gateway asks the host for b as the scheduler starts b's read, so
-  // whenever that happened, it is recorded before or after a's observation
-  // settled.
+  // The gateway asks the host for b as the scheduler starts b's read, so a
+  // start in the moment after the release is recorded before a's observation.
   const order = ["observed a", "host b"];
-  assert.deepEqual(dir.calls.filter((call, index, all) => order.includes(call) && all.indexOf(call) === index),
-    order, "b is not read while a's read from the failed scan still runs");
+  assert.deepEqual(dir.calls.filter((call, index, all) => order.includes(call) && all.indexOf(call) === index), order);
   assert.deepEqual(dir.reads, ["a", "b"]);
 });
 

@@ -10,6 +10,7 @@ import { INSPECT_TIMEOUT_MS } from "./deadline";
 import { DELIVERY_WINDOW_MS } from "./policy";
 import { changes } from "../tests/support/changes";
 import { fakeTimers } from "../tests/support/timers";
+import { drainer } from "../tests/support/drained";
 import type { Blocked } from "../shared/rpc";
 import { Refusal, type Gateway, type Observation, type State, type StateStore } from "./model";
 
@@ -34,6 +35,8 @@ function fixture(automatic = true) {
   // Host reads and listed observations as they start and end, in order, so a
   // test checks from whole calls what ran while another still did.
   const hostCalls: string[] = [];
+  // Resolves once nothing is left to run but what the test holds.
+  const drained = drainer();
   // Stored states, sends, reads and armed timers wake tests waiting for them.
   const signal = changes();
   // The scheduler's and its worker's timers run only when a test moves them on.
@@ -149,6 +152,7 @@ function fixture(automatic = true) {
     // The most listings that ran at once.
     get peakLists() { return peakLists; },
     hostCalls,
+    drained,
     // Hold agent listings (not refreshes) until released.
     holdList() {
       let release!: () => void;
@@ -1390,8 +1394,8 @@ function held() {
 }
 const readsOf = (f: ReturnType<typeof fixture>, id: string) => f.counts.refreshes.filter(entry => entry === id);
 // The order in which `calls` first appear in the host calls after the first
-// `from`. Once every call has ended, a test checks from it that one call
-// started only after another ended, whenever the code under test started it.
+// `from`. Once every call has ended, a test checks from it that a call started
+// only after another ended, including in the moment after a held one is released.
 const firstAfter = (f: ReturnType<typeof fixture>, from: number, ...calls: string[]) =>
   f.hostCalls.slice(from).filter((call, index, all) => calls.includes(call) && all.indexOf(call) === index);
 // Resolves once the scheduler waits on a host read under its five-second bound
@@ -1528,10 +1532,11 @@ test("an attention pass applies one conversation's newer reply although another'
     f.advance(10_000);
     const from = f.hostCalls.length;
     const next = s.observe({ kind: "periodic" });
+    await f.drained();
+    assert.deepEqual(f.hostCalls.slice(from), [], "observation stays single-flight while a's read is still running");
     a.release();
     await next;
-    assert.deepEqual(firstAfter(f, from, "read a ended", "read b"), ["read a ended", "read b"],
-      "observation stays single-flight while a's read is still running");
+    assert.deepEqual(firstAfter(f, from, "read a ended", "read b"), ["read a ended", "read b"]);
     assert.deepEqual(readsOf(f, "b"), ["b", "b"]);
   } finally {
     a.release();
@@ -1551,10 +1556,12 @@ test("an attention read that never ends stops blocking observation after a minut
   await f.timers.tick(INSPECT_TIMEOUT_MS);
   await assert.rejects(pass);
   f.addAgent("b");
-  // observe() queues the read at once; only the single-flight bound starts it.
+  // Only the end of a's read or the single-flight bound starts b's read.
   const next = s.observe({ kind: "agent", agentId: "b" });
+  await f.drained();
   assert.deepEqual(readsOf(f, "b"), [], "held while a's read runs");
   await f.timers.tick(59_999);
+  await f.drained();
   assert.deepEqual(readsOf(f, "b"), [], "still held a moment before the bound");
   await f.timers.tick(1); // the scheduler's single-flight bound
   await next;
@@ -1577,10 +1584,11 @@ test("a full scan reserves one listed conversation's finished reply although ano
     // a's observation is not cancelled: the next observation waits for it.
     const from = f.hostCalls.length;
     const next = s.observe({ kind: "agent", agentId: "b" });
+    await f.drained();
+    assert.deepEqual(f.hostCalls.slice(from), [], "observation stays single-flight while a's read is still running");
     a.release();
     await next;
-    assert.deepEqual(firstAfter(f, from, "listed a ended", "read b"), ["listed a ended", "read b"],
-      "observation stays single-flight while a's read is still running");
+    assert.deepEqual(firstAfter(f, from, "listed a ended", "read b"), ["listed a ended", "read b"]);
     assert.deepEqual(f.counts.refreshes, ["b"]);
   } finally {
     a.release();
@@ -1660,6 +1668,8 @@ test("overlapping observations never run duplicate scans, and a turn end during 
   f.agents[1] = nativeAgent(f, "b", "2");
   scans.push(s.observe({ kind: "periodic" }), s.observe({ kind: "full" }),
     s.observe({ kind: "agent", agentId: "b" }), s.observe({ kind: "agent", agentId: "b" }));
+  await f.drained();
+  assert.equal(f.counts.lists, 1, "the later requests wait while the listing runs");
   release();
   await Promise.all(scans);
   assert.equal(f.peakLists, 1, "one listing at a time");
@@ -1752,9 +1762,11 @@ test("a scan that times out keeps observation single-flight until its listing ac
   await f.timers.tick(INSPECT_TIMEOUT_MS);
   await assert.rejects(first);
   const second = s.observe({ kind: "full" });
+  await f.drained();
+  assert.equal(f.counts.lists, 1, "no second listing while the first is still running");
   release();
   await second;
-  assert.equal(f.peakLists, 1, "no second listing while the first is still running");
+  assert.equal(f.peakLists, 1, "the queued scan starts only once the first listing has returned");
   assert.equal(f.counts.lists, 2, "the queued scan runs once the listing ends");
 });
 
@@ -1808,10 +1820,11 @@ test("a refresh that fails does not end single-flight while a sibling refresh is
   await assert.rejects(merged[0], /host failed for a/);
   const from = f.hostCalls.length;
   const again = s.observe({ kind: "agent", agentId: "b" });
+  await f.drained();
+  assert.deepEqual(f.hostCalls.slice(from), [], "no second read of b while the first is running");
   b.release();
   await again;
-  assert.deepEqual(firstAfter(f, from, "read b ended", "read b"), ["read b ended", "read b"],
-    "no second read of b while the first is running");
+  assert.deepEqual(firstAfter(f, from, "read b ended", "read b"), ["read b ended", "read b"]);
   assert.deepEqual(refreshed.filter(id => id === "b"), ["b", "b"]);
 });
 
@@ -2183,10 +2196,11 @@ test("a refresh that hangs past the deadline does not drop another conversation'
     assert.deepEqual(reserved(f), ["b"], "b's finished reply is reserved although a's read is still running");
     const from = f.hostCalls.length;
     const again = s.observe({ kind: "agent", agentId: "b" });
+    await f.drained();
+    assert.deepEqual(f.hostCalls.slice(from), [], "observation stays single-flight while a's read is still running");
     a.release();
     await again;
-    assert.deepEqual(firstAfter(f, from, "read a ended", "read b"), ["read a ended", "read b"],
-      "observation stays single-flight while a's read is still running");
+    assert.deepEqual(firstAfter(f, from, "read a ended", "read b"), ["read a ended", "read b"]);
   } finally {
     a.release();
   }

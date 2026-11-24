@@ -1,15 +1,19 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { registerObserver } from '../server/observer-source.mjs';
+import { drainer } from './support/drained.ts';
 
 function fixture(env = {}, settings = {}) {
   let time = 1_000_000, contextTokens = 100_000, usageGate = null, clockGate = null, usageFailures = 0;
   const hooks = new Map(), files = new Map();
   const timers = new Set();
-  // Every context reading the observer started, in order, and those of them
-  // still waiting at the gate `holdUsage` set.
-  const readings = [], waiting = new Set();
+  // Context readings waiting at the gate `holdUsage` set.
+  const waiting = new Set();
   let gateReached = null;
+  // Resolves once nothing is left to run but what the test holds: the readings
+  // the observer started have returned, unless held, and what it saved on them
+  // is written.
+  const drained = drainer();
   const configuration = { launchId: 'launch-1', ledger: '/ledger', request: '/request', receipts: '/receipts' };
   // A held clock read blocks only the next clock read.
   const $ = { clock: { now: async () => { if (clockGate) { const gate = clockGate; clockGate = null; await gate(); } return time; }, every: (_ms, fn) => {
@@ -24,7 +28,6 @@ function fixture(env = {}, settings = {}) {
         const reading = (async () => { await gate;
           if (usageFailures > 0) { usageFailures--; throw new Error('usage unavailable'); }
           return { context: { window: 1_000_000, ...(contextTokens === undefined ? {} : { tokens: contextTokens }) } }; })();
-        readings.push(reading);
         if (gate) { waiting.add(reading); gateReached?.(); }
         return reading;
       } },
@@ -32,21 +35,12 @@ function fixture(env = {}, settings = {}) {
     settings: { read: async () => settings } };
   registerObserver((name, ...rest) => { hooks.set(name, rest.at(-1)); return { catch() {} }; }, configuration);
   const event = (name, input = {}, next = async () => ({})) => hooks.get(name)($, input, next);
-  // Resolves once every reading started so far, except those still held, has
-  // returned and whatever the observer saved on it is written. The observer
-  // decides on a reading as it returns, before this looks, and writes its saves
-  // in the order they start, so a later save (classic.Stop changes no result)
-  // is written after.
-  const readingsSaved = async () => {
-    await Promise.allSettled(readings.filter(reading => !waiting.has(reading)));
-    await event('classic.Stop');
-  };
   // Runs the timers due after `ms` (only those with interval `only`, if given),
-  // then waits for the readings they started, unless held.
+  // then waits until what they started has ended, unless held.
   const tick = async (ms = 500, only) => {
     time += ms;
     for (const timer of [...timers]) if (only === undefined || timer.ms === only) await timer.fn();
-    await readingsSaved();
+    await drained();
   };
   const ledger = () => JSON.parse(files.get('/ledger'));
   const request = (overrides = {}) => {
@@ -65,7 +59,7 @@ function fixture(env = {}, settings = {}) {
   // Paseo's /compact runs as a command around Claude's compaction and hooks.
   const compact = (inner = async () => {}) => event('command.run', { command: 'compact', args: '' },
     async () => { await inner(); return {}; });
-  return { event, step, ledger, request, files, compact, tick, readingsSaved,
+  return { event, step, ledger, request, files, compact, tick, drained,
     // Resolves once a reading waits at the gate `holdUsage` set.
     readingHeld: () => new Promise(resolve => { if (waiting.size) resolve(); else gateReached = resolve; }),
     timers: () => timers.size,
@@ -393,9 +387,7 @@ test('with classic hooks skipped by an organization policy, a reset context wind
   assert.equal(f.ledger().compact.status, 'running');
   f.context(undefined);
   await f.tick();
-  // A save after the completion also records when it was observed.
-  const { id, status, revision, reason } = f.ledger().compact;
-  assert.deepEqual({ id, status, revision, reason }, { id: 'operation-1', status: 'completed', revision: 1, reason: null });
+  assert.deepEqual(f.ledger().compact, { id: 'operation-1', status: 'completed', revision: 1, reason: null });
 });
 
 test('with classic hooks skipped, an unchanged context window fails', async () => {
@@ -458,14 +450,14 @@ test('with classic hooks skipped, a reading that ends after the operation was su
   ]) {
     const f = fixture(); await f.start(); await f.ordinary(); f.request();
     await f.compact();
-    await f.readingsSaved(); // the reading started as the command returned has ended
+    await f.drained(); // the reading started as the command returned has ended
     const release = f.holdUsage();
     await f.tick();
     await f.readingHeld();
     await supersede(f);
     f.context(undefined);
     release();
-    await f.readingsSaved();
+    await f.drained();
     assert.equal(f.ledger().compact.status, 'unknown', name);
   }
 });
@@ -486,14 +478,14 @@ test('with classic hooks skipped, a reading in flight never rewrites a result al
   assert.notEqual(recorded, 'running');
   f.context(undefined);
   release();
-  await f.readingsSaved();
+  await f.drained();
   assert.equal(f.ledger().compact.status, recorded, 'a terminal result is never rewritten');
 });
 
 test('with classic hooks skipped, a reading that ends after the operation was replaced records nothing for it', async () => {
   const f = fixture(); await f.start(); await f.ordinary(); f.request();
   await f.compact();
-  await f.readingsSaved(); // the reading started as the command returned has ended
+  await f.drained(); // the reading started as the command returned has ended
   const release = f.holdUsage();
   await f.tick();
   await f.readingHeld();
@@ -501,7 +493,7 @@ test('with classic hooks skipped, a reading that ends after the operation was re
   await f.event('classic.PreCompact', { trigger: 'auto' });
   f.context(undefined);
   release();
-  await f.readingsSaved();
+  await f.drained();
   assert.equal(f.files.get('/receipts/operation-1.json'), undefined, 'no receipt for the replaced operation');
   assert.deepEqual({ id: f.ledger().compact.id, status: f.ledger().compact.status }, { id: null, status: 'running' });
 });
@@ -540,7 +532,7 @@ test('with classic hooks skipped, a context reading that never settles holds nei
   assert.equal(f.ledger().compact.status, 'failed', 'no reset seen within 10 seconds');
   f.context(undefined);
   release();
-  await f.readingsSaved();
+  await f.drained();
   assert.equal(f.ledger().compact.status, 'failed', 'a late reading cannot change it');
 });
 
