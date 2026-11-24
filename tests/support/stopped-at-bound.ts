@@ -16,8 +16,9 @@ import { DEFAULT_SETTINGS } from "../../shared/settings";
 import { cleanupScope } from "./scope";
 
 // Longer than the runner's bound, so the bound, not the child's own limit,
-// is what stops the test.
-const CHILD_MS = 60_000;
+// is what stops the test; shorter than the run the cleanup-scope test gives
+// this file, so even a scope that releases nothing ends this tree by its limit.
+const CHILD_MS = 20_000;
 
 test("holds what a unit test acquires until the runner's bound stops it", async (t) => {
   const scope = cleanupScope(t);

@@ -6,6 +6,7 @@
 //                folder, and runs until it is killed
 //   orphan       starts a grandchild that shares its output, prints both PIDs
 //                and exits 0, leaving the grandchild holding the output open
+//                where the platform lets it outlive its parent
 //   exit <code>  prints `ran` and exits with that code
 import { spawn } from 'node:child_process';
 import { mkdtemp } from 'node:fs/promises';
@@ -28,11 +29,16 @@ if (mode === 'exit') {
   console.log(`child ${process.pid}`);
   stay();
 } else if (mode === 'orphan') {
-  const leaf = spawn(process.execPath, [fileURLToPath(import.meta.url), 'leaf'], { stdio: 'inherit', windowsHide: true });
-  console.log(`child ${process.pid}`);
-  leaf.once('spawn', () => process.exit(0));
+  // Exits once the grandchild has printed its PID, so the test sees both.
+  const leaf = spawn(process.execPath, [fileURLToPath(import.meta.url), 'leaf'],
+    { stdio: ['inherit', 'inherit', 'inherit', 'ipc'], windowsHide: true });
+  leaf.once('message', () => {
+    console.log(`child ${process.pid}`);
+    process.exit(0);
+  });
 } else if (mode === 'leaf') {
   console.log(`grandchild ${process.pid}`);
+  process.send?.('ready');
   stay();
 } else {
   throw new Error(`Unknown mode: ${mode}`);

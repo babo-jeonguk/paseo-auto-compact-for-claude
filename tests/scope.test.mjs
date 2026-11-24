@@ -18,7 +18,8 @@ function context(t) {
   let ending;
   const c = {
     after: hook => { hooks.push(hook); },
-    diagnostic: note => { notes.push(note); },
+    // Printed under the real test too, where its cleanup failures show.
+    diagnostic: note => { notes.push(note); t?.diagnostic(note); },
     hooks, notes,
     end() { return ending ??= (async () => { for (const hook of hooks) await hook(); })(); },
   };
@@ -35,7 +36,10 @@ const HUNG_CHILD_MS = 2_000;
 // to acquire everything and print its PIDs first.
 const RUNNER_BOUND_MS = 4_000;
 // The end-to-end run as a whole: a fresh Node with tsx and its own runner.
-const RUNNER_RUN_MS = 60_000;
+// Longer than the stopped test's own child limit (20 s), so a scope that
+// failed to release still ends that tree before this run is ended, and
+// shorter than the suite's 60 s bound on this test.
+const RUNNER_RUN_MS = 40_000;
 
 const gone = path => assert.rejects(access(path), { code: 'ENOENT' }, `${path} is left behind`);
 
@@ -171,15 +175,18 @@ test('a child and its grandchild killed at the spawn timeout leave no process, a
   await gone(child.temp);
 });
 
-test('the time limit holds until every process holding the child\'s output has ended, not only the child', async (t) => {
+// POSIX lets the grandchild outlive the child and hold the output open, the
+// hang the limit bounds; Windows ends a Node child's children with it.
+test('a run whose child exits while a grandchild holds its output ends by its limit and leaves no process', async (t) => {
   const probe = cleanupScope(t);
   const c = context(t);
   const scope = cleanupScope(c);
-  const failed = await scope.run(process.execPath, [program, 'orphan'], { timeout: HUNG_CHILD_MS })
-    .then(() => assert.fail('a run stopped at its limit must fail'), error => error);
-  const grandchild = Number(failed.stdout.match(/grandchild (\d+)/)?.[1]);
-  assert.equal(failed.timedOut, true, failed.stdout);
-  assert.equal(await running(probe, grandchild), false, 'the grandchild has ended');
+  const outcome = await scope.run(process.execPath, [program, 'orphan'], { timeout: HUNG_CHILD_MS })
+    .then(ran => ({ ...ran, code: 0 }), error => error);
+  assert.equal(outcome.code, 0, `the child exited on its own:\n${outcome.stdout}`);
+  const [, grandchild, child] = outcome.stdout.match(/grandchild (\d+)\nchild (\d+)/) ?? [];
+  assert.ok(child && grandchild, `both printed their PIDs:\n${outcome.stdout}`);
+  assert.equal(await running(probe, Number(grandchild)), false, 'the grandchild has ended');
 });
 
 test('the end of a test ends the process tree it started before removing the folder it wrote to', async (t) => {
@@ -248,16 +255,10 @@ test('a test stopped at the runner\'s bound releases what it holds: the run exit
       // tsx would otherwise keep its compile cache in the temp directory.
       env: { ...process.env, TSX_DISABLE_CACHE: '1' },
     }).then(() => assert.fail('the stopped test must fail the run'), error => error);
-  // The tree the stopped test held, ended here too if its scope failed to,
-  // before any check below can fail.
-  const [, ...pids] = failed.stdout.match(/holding (\d+) (\d+)/) ?? [];
-  const left = [];
-  for (const pid of pids.map(Number)) if (await running(scope, pid)) left.push(pid);
-  for (const pid of left) process.kill(pid, 'SIGKILL');
   assert.equal(failed.signal, null, `the run exited on its own:\n${failed.stdout}`);
   assert.equal(failed.code, 1, failed.stdout);
   assert.match(failed.stdout, new RegExp(`timed out after ${RUNNER_BOUND_MS}ms`));
-  assert.equal(pids.length, 2, `the test held its tree:\n${failed.stdout}`);
-  assert.deepEqual(left, [], 'the stopped test\'s process tree has ended');
+  const [, ...pids] = failed.stdout.match(/holding (\d+) (\d+)/) ?? assert.fail(`the test never held its tree:\n${failed.stdout}`);
+  for (const pid of pids) assert.equal(await running(scope, Number(pid)), false, `process ${pid} has ended`);
   assert.deepEqual(await readdir(failed.temp), [], 'nothing is left in the run\'s temp directory');
 });

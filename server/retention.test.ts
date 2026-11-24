@@ -46,6 +46,10 @@ test("receipt deletion failure preserves the operation while other expired recor
 
 async function fixture(scope: CleanupScope) {
   const home = await scope.folder("compact-retention-");
+  // A write a scheduler started before it stopped still lands; it ends
+  // before the folder goes, so it cannot recreate it.
+  const writing = new Set<Promise<unknown>>();
+  scope.defer(() => Promise.allSettled(writing));
   const disk = createStore(join(home, "state.json"));
   const old = operation("old");
   const state = stateWith(old);
@@ -63,7 +67,9 @@ async function fixture(scope: CleanupScope) {
   let stored = state;
   const store = { read: disk.read, write: async (next: State) => {
     if (failCommit && !next.operations.some(op => op.id === "old")) throw new Error("disk full");
-    await disk.write(next);
+    const write = disk.write(next);
+    writing.add(write);
+    try { await write; } finally { writing.delete(write); }
     stored = structuredClone(next);
     signal.changed();
   } };
