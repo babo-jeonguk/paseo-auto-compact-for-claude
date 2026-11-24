@@ -178,6 +178,20 @@ test('native receipt must match operation and revision; settling preserves subse
   assert.equal(JSON.parse(await readFile(join(f.directory, 'request.json'), 'utf8')).status, 'settled');
 });
 
+test('retiring one preparation of a request leaves a newer preparation of it in place', async (t) => {
+  const f = await fixture();
+  t.after(() => f.close());
+  const status = async () => JSON.parse(await readFile(join(f.directory, 'request.json'), 'utf8')).status;
+  // A retry prepares the same request again, with the same ID, before an
+  // earlier attempt's cleanup retires what that attempt prepared.
+  const earlier = await f.observer.prepare(f.agent, true, 1_030_000, 'op-retry');
+  const retry = await f.observer.prepare(f.agent, true, 1_030_000, 'op-retry');
+  await f.observer.cancel(earlier, false);
+  assert.equal(await status(), 'prepared', "the earlier attempt's cleanup leaves the retry's request to Claude");
+  await f.observer.cancel(retry, false);
+  assert.equal(await status(), 'settled');
+});
+
 test('release caught in the middle of a ledger write still retires the request', async (t) => {
   const f = await fixture();
   t.after(() => f.close());
