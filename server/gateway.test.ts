@@ -10,11 +10,40 @@ import { createObserver, QUERY_RESTARTED_REFUSAL } from "./observer";
 import { createOperationWorker } from "./operations";
 import { createScheduler } from "./scheduler";
 import { DEFAULT_SETTINGS } from "../shared/settings";
+import { changes } from "../tests/support/changes";
+import { fakeTimers } from "../tests/support/timers";
 import type {
   PluginHandlerContext,
   PluginLifecycleEvents,
   PluginSessionOpenRequest,
 } from "@getpaseo/plugin/server";
+
+// A gateway test's clock and timers. Time moves only with `tick`, which moves
+// the timers on with it. The evidence poll is an attempt waiting for its next
+// check, so the clock lets it pass as soon as it is armed, one poll later; any
+// longer wait, such as the deadline of a stalled call, runs only when the test
+// ticks past it.
+const START = 1_000_000;
+function testClock(pollMs: number) {
+  let time = START;
+  const signal = changes();
+  let moving = false;
+  const timers = fakeTimers(() => { signal.changed(); poll(); });
+  function poll() {
+    if (moving || timers.pendingWithin(pollMs) === 0) return;
+    moving = true;
+    void tick(pollMs).finally(() => { moving = false; poll(); });
+  }
+  async function tick(ms: number) {
+    time += ms;
+    await timers.tick(ms);
+  }
+  return { now: () => time, timers, tick,
+    // Resolves once `done` holds when a timer is armed, or at once.
+    until: signal.until,
+    // Resolves once a timer that `tick(ms)` would run is armed.
+    armed: (ms: number) => signal.until(() => timers.pendingWithin(ms) > 0) };
+}
 
 function fixture(
   items: unknown[],
@@ -23,7 +52,8 @@ function fixture(
   liveItems = items,
   options: Parameters<typeof createGateway>[0] = {}
 ) {
-  const host = createGateway({ timeoutMs: 40, pollMs: 1, ...options });
+  const clock = testClock(options.pollMs ?? 1);
+  const host = createGateway({ timeoutMs: 40, pollMs: 1, now: clock.now, timers: clock.timers, ...options });
   let sends = 0;
   let native = "native-a";
   const agent = {
@@ -93,7 +123,7 @@ function fixture(
     config: { get: async () => ({ config: { providers: {} } }) },
     agents: { ref: () => ref },
   } as unknown as PluginHandlerContext["paseo"]);
-  return Object.assign(host, { ref, sendCount: () => sends,
+  return Object.assign(host, { ref, clock, sendCount: () => sends,
     setAgent: (patch: Record<string, unknown>) => Object.assign(agent, patch) });
 }
 
@@ -109,6 +139,7 @@ test("gateway requires completed manual boundary from command turn and same pers
   ] as const) {
     const host = fixture([...items]);
     assert.equal((await host.gateway.compact("a")).status, expected);
+    assert.equal(host.clock.timers.pending, 0, "an attempt that ends leaves none of its timers armed");
   }
   const changed = fixture(
     [{ type: "compaction", status: "completed", trigger: "manual" }],
@@ -246,7 +277,7 @@ async function overlap({ receipt = { status: 'completed', detail: 'Native PostCo
   };
   const saved: OperationEvidence[] = [];
   const result = await host.gateway.automatic!((await host.gateway.refresh('a'))!, undefined, {
-    id: 'overlap', sendBy: Date.now() + 30_000, checkpoint: async evidence => { saved.push(evidence); }, current: () => true,
+    id: 'overlap', sendBy: host.clock.now() + 30_000, checkpoint: async evidence => { saved.push(evidence); }, current: () => true,
   });
   assert.equal(host.sendCount(), 1, '/compact is never sent twice');
   return { result, evidence: saved.at(-1) };
@@ -288,7 +319,7 @@ test('a boundary in any turn but the command\'s own never completes the attempt'
 
 test('last-moment off policy and expired delivery prevent public send', async () => {
   for (const guard of [
-    { expiresAt: Date.now() + 30000, allowed: async () => false },
+    { expiresAt: START + 30_000, allowed: async () => false },
     { expiresAt: 0, allowed: async () => true },
   ]) {
     const host = fixture([], undefined, false, [], { observer: observer(null) });
@@ -325,8 +356,8 @@ test('Claude admits the compaction for as long as it can be observed, not only u
   let admitted = 0;
   native.prepare = async (agent, cache, expiresAt, id) => { admitted = expiresAt; return prepare(agent, cache, expiresAt, id); };
   const host = fixture([], undefined, false, [], { observer: native });
-  const sendBy = Date.now() + 1_000;
-  await host.gateway.automatic!((await host.gateway.refresh('a'))!, { expiresAt: Date.now() + 500, allowed: async () => true },
+  const sendBy = host.clock.now() + 1_000;
+  await host.gateway.automatic!((await host.gateway.refresh('a'))!, { expiresAt: host.clock.now() + 500, allowed: async () => true },
     { id: 'late-admission', sendBy, checkpoint: async () => {}, current: () => true });
   assert.equal(admitted, sendBy + OBSERVATION_MS);
   assert.equal(host.sendCount(), 1);
@@ -394,7 +425,7 @@ test('observer ownership is rechecked at the dispatch boundary, in memory, and e
   Object.assign(host.ref, { reload: async () => null });
   const saved: OperationEvidence[] = [];
   const result = await host.gateway.compact('a', (await host.gateway.refresh('a'))!, {
-    id: 'ownership-race', sendBy: Date.now() + 30_000,
+    id: 'ownership-race', sendBy: host.clock.now() + 30_000,
     checkpoint: async evidence => { saved.push(evidence); markerPersisted ||= evidence.dispatchStartedAt !== undefined; },
     current: () => true,
   });
@@ -453,7 +484,10 @@ test("every external gateway wait is bounded, including send and release", async
   for (const stalled of ["send", "subscribe", "refresh", "release"] as const) {
     const host = fixture([{ type: "compaction", status: "completed", trigger: "manual" }],
       undefined, false, undefined, { timeoutMs: 50, dispatchTimeoutMs: 5, cleanupTimeoutMs: 5 });
-    const never = () => new Promise<never>(() => {});
+    // The stalled call is reached before the wait on it is armed.
+    let reached = false;
+    const never = () => { reached = true; return new Promise<never>(() => {}); };
+    const bound = (ms: number) => host.clock.until(() => reached && host.clock.timers.pendingWithin(ms) > 0);
     if (stalled === "send") host.ref.send = never;
     if (stalled === "refresh") host.ref.refresh = never;
     if (stalled === "subscribe" || stalled === "release") {
@@ -467,16 +501,66 @@ test("every external gateway wait is bounded, including send and release", async
     }
     // A wait that expires before sending is a fault for the worker to retry.
     if (stalled === "subscribe" || stalled === "refresh") {
-      await assert.rejects(host.gateway.compact("a", undefined, { id: "stalled", sendBy: Date.now() + 50,
-        checkpoint: async () => {}, current: () => true }), /deadline/i, stalled);
+      const attempt = host.gateway.compact("a", undefined, { id: "stalled", sendBy: host.clock.now() + 50,
+        checkpoint: async () => {}, current: () => true });
+      // The stalled call's wait ends at the send deadline, not before.
+      await bound(50);
+      await host.clock.tick(49);
+      assert.equal(host.clock.timers.pending, 1, `${stalled}: still waiting a moment before the deadline`);
+      await host.clock.tick(1);
+      await assert.rejects(attempt, /deadline/i, stalled);
       assert.equal(host.sendCount(), 0, stalled);
+      assert.equal(host.clock.timers.pending, 0, `${stalled}: nothing is left armed`);
       continue;
     }
-    const result = await host.gateway.compact("a");
+    const attempt = host.gateway.compact("a");
+    // The send is bounded by its own timeout and the release by the cleanup's.
+    await bound(5);
+    await host.clock.tick(5);
+    const result = await attempt;
     assert.equal(result.status, stalled === "release" ? "completed" : "unknown", stalled);
     assert.equal(host.ownTurn("a", "compact-1"), false);
+    assert.equal(host.clock.timers.pending, 0, `${stalled}: nothing is left armed`);
     host.stop();
   }
+});
+
+test("stopping the gateway ends a waiting attempt at once and leaves none of its timers armed", async () => {
+  // Before sending, a read that never ends is abandoned and the attempt fails
+  // for the worker to classify.
+  const before = fixture([], undefined, false, [], { observer: observer(null) });
+  let reading!: () => void;
+  const reached = new Promise<void>(resolve => { reading = resolve; });
+  const agent = (await before.gateway.refresh("a"))!;
+  before.ref.refresh = () => { reading(); return new Promise<never>(() => {}); };
+  const unsent = before.gateway.automatic!(agent);
+  await reached;
+  before.stop();
+  await assert.rejects(unsent, /stopped/i);
+  assert.equal(before.sendCount(), 0);
+  assert.equal(before.clock.timers.pending, 0, "the read's deadline is cleared");
+  // After sending, a history read that never ends is abandoned and the outcome
+  // stays unknown for reconciliation.
+  const after = fixture([], undefined, false, [], { observer: observer({ status: "completed", detail: "Native PostCompact" }),
+    timeoutMs: 120_000 });
+  let emit!: (message: unknown) => void;
+  const subscribe = after.ref.timeline.subscribe;
+  after.ref.timeline.subscribe = listener => { emit = listener; return subscribe(listener); };
+  const send = after.ref.send;
+  after.ref.send = async (text, options) => {
+    await send(text, options);
+    emit({ agentId: "a", event: { type: "subscription_restored" }, subscriptionId: "s" });
+  };
+  let refetching!: () => void;
+  const refetched = new Promise<void>(resolve => { refetching = resolve; });
+  after.ref.timeline.refetch = () => { refetching(); return new Promise<never>(() => {}); };
+  const observing = after.gateway.automatic!((await after.gateway.refresh("a"))!);
+  await refetched;
+  after.stop();
+  const result = await observing;
+  assert.equal(result.status, "unknown");
+  assert.equal(after.sendCount(), 1);
+  assert.equal(after.clock.timers.pending, 0, "the history read's deadline is cleared");
 });
 
 test("stable identity and durable send marker precede provider dispatch", async () => {
@@ -489,7 +573,7 @@ test("stable identity and durable send marker precede provider dispatch", async 
     return send(text, options);
   };
   const result = await host.gateway.compact("a", undefined, {
-    id: "caller-request", sendBy: Date.now() + 1000,
+    id: "caller-request", sendBy: host.clock.now() + 1000,
     checkpoint: async evidence => { checkpoints.push(evidence); }, current: () => true,
   });
   assert.equal(result.status, "completed");
@@ -501,13 +585,17 @@ test("failed marker persistence never sends and late send rejection is consumed"
   const host = fixture([]);
   // A fault before sending is the worker's to retry, so it is thrown, not an outcome.
   await assert.rejects(host.gateway.compact("a", undefined, {
-    id: "caller-request", sendBy: Date.now() + 1000,
+    id: "caller-request", sendBy: host.clock.now() + 1000,
     checkpoint: async () => { throw new Error("disk full"); }, current: () => true,
   }), /disk full/);
   assert.equal(host.sendCount(), 0);
   let reject!: (error: Error) => void;
   host.ref.send = async () => new Promise<never>((_resolve, fail) => { reject = fail; });
-  assert.equal((await host.gateway.compact("a")).status, "unknown");
+  const attempt = host.gateway.compact("a");
+  // The send's wait ends with the observation budget.
+  await host.clock.armed(40);
+  await host.clock.tick(40);
+  assert.equal((await attempt).status, "unknown");
   reject(new Error("late rejection"));
   await new Promise<void>(resolve => setImmediate(resolve));
 });
@@ -670,16 +758,20 @@ test("each listed agent's observation settles on its own, so a slow or failing o
 
 // A scheduler over the real gateway, with state kept in memory. `listing()` is
 // the scheduler's latest agent listing, so a test can wait for paging to end.
+// Its timers run only when a test moves them on, and arming one wakes `until`.
 function directoryScheduler(host: ReturnType<typeof directory>["host"]) {
   let state: import("./model").State = { version: 1, disabled: [], jobs: [], operations: [] };
   let listing: Promise<void> | undefined;
+  const signal = changes();
+  const timers = fakeTimers(signal.changed);
   const scheduler = createScheduler({
     store: { read: async () => structuredClone(state), write: async next => { state = structuredClone(next); } },
     gateway: { ...host.gateway, list: observe => (listing = host.gateway.list(observe)) },
     settings: async () => ({ ...DEFAULT_SETTINGS }),
     now: () => 1_000_000,
+    timers,
   });
-  return { scheduler, listing: () => listing,
+  return { scheduler, timers, until: signal.until, listing: () => listing,
     reserved: () => state.jobs.filter(job => job.status === "scheduled").map(job => job.agentId).sort() };
 }
 const turn = () => new Promise<void>(resolve => setImmediate(resolve));
@@ -716,11 +808,10 @@ test("a listed conversation's read is bounded from when it starts, not from when
     holdRead: id => { if (id === "a") { startedA(); return heldA; } },
     holdPage: start => start === 1 ? page : undefined,
   });
-  const { scheduler, listing, reserved } = directoryScheduler(dir.host);
+  const { scheduler, timers, until, listing, reserved } = directoryScheduler(dir.host);
   // Runs even if the test stops early, at a failed assertion or at the test
   // runner's bound.
   t.after(() => { scheduler.stop(); dir.host.stop(); });
-  t.mock.timers.enable({ apis: ["setTimeout"] });
   try {
     await scheduler.ready;
     let settled: unknown = "pending";
@@ -730,12 +821,13 @@ test("a listed conversation's read is bounded from when it starts, not from when
     const ended = scan.then(() => { settled = "resolved"; }, error => { settled = error; });
     await readingA;
     assert.deepEqual(dir.reads, ["a"], "a's read starts with the first page");
+    await until(() => timers.pendingWithin(5_000) > 0);
     // Paging takes four of the five seconds; a's read never ends.
-    t.mock.timers.tick(4_000);
+    await timers.tick(4_000);
     releasePage();
     await listing();
     assert.equal(outcome(), "pending", "a's read is not timed out when paging ends");
-    t.mock.timers.tick(1_000);
+    await timers.tick(1_000);
     await ended;
     assert.ok(outcome() instanceof Error, "a's read timed out five seconds after it started");
     assert.deepEqual(reserved(), ["b", "c"], "every other listed reply is still reserved");
@@ -795,7 +887,7 @@ test("a live view lost while completion is verified is proved again from history
   let reads = 0;
   host.ref.timeline.refetch = async () => { reads++; return { entries: [command("verify"), { turnId: "compact-1", item: BOUNDARY_ITEM }] }; };
   const result = await host.gateway.automatic!((await refresh().then(() => host.gateway.refresh("a")))!, undefined, {
-    id: "verify", sendBy: Date.now() + 30_000, checkpoint: async () => {}, current: () => true,
+    id: "verify", sendBy: host.clock.now() + 30_000, checkpoint: async () => {}, current: () => true,
   });
   assert.equal(result.status, "completed");
   assert.ok(reads > 0, "the proof seen before the loss was not trusted on its own");
@@ -810,13 +902,15 @@ interface LostViewOptions {
   live?: readonly unknown[]; before?: readonly unknown[];
   history?: (id: string, lose: () => void) => HistoryEntry[];
   receipt?: { status: "completed" | "unknown"; detail: string } | null;
-  timeoutMs?: number; now?: () => number;
+  // The gateway's clock, read through the test's clock time.
+  timeoutMs?: number; now?: (time: number) => number;
 }
 async function lostView(lost: typeof LOST_VIEW[number], { live = [], before = [],
   history = (id: string) => [command(id), { turnId: "compact-1", item: BOUNDARY }],
   receipt = { status: "completed", detail: "Native PostCompact" },
-  timeoutMs = 1_000, now = Date.now }: LostViewOptions = {}) {
-  const host = fixture([], undefined, false, [...before], { observer: observer(receipt), timeoutMs, now });
+  timeoutMs = 1_000, now = time => time }: LostViewOptions = {}) {
+  const host = fixture([], undefined, false, [...before], { observer: observer(receipt), timeoutMs,
+    now: () => now(host.clock.now()) });
   const send = host.ref.send;
   let emit!: (message: unknown) => void;
   const subscribe = host.ref.timeline.subscribe;
@@ -833,7 +927,7 @@ async function lostView(lost: typeof LOST_VIEW[number], { live = [], before = []
   const id = `lost-${lost}`;
   const saved: OperationEvidence[] = [];
   const result = await host.gateway.automatic!((await host.gateway.refresh("a"))!, undefined, {
-    id, sendBy: now() + 30_000, checkpoint: async evidence => { saved.push(evidence); }, current: () => true,
+    id, sendBy: now(host.clock.now()) + 30_000, checkpoint: async evidence => { saved.push(evidence); }, current: () => true,
   });
   assert.equal(host.sendCount(), 1, "/compact is never sent twice");
   return { result, evidence: saved.at(-1), reads };
@@ -904,7 +998,7 @@ test("a history page read across another lost live view proves nothing, not even
       offset += 1_000; // the next poll may read history again
       return [command(id), other, boundary];
     };
-    const { result, evidence, reads } = await lostView(lost, { history, timeoutMs: 5_000, now: () => Date.now() + offset });
+    const { result, evidence, reads } = await lostView(lost, { history, timeoutMs: 5_000, now: time => time + offset });
     assert.equal(reads, 2, lost);
     assert.equal(result.status, "completed", lost);
     assert.equal(evidence?.invalidated, false, lost);
@@ -991,7 +1085,7 @@ test("an attempt that ends unknown after a lost live view stays open for reconci
     emit({ agentId: "a", event: { type: "replacement", epoch: "epoch-2" } });
   };
   const agent = (await host.gateway.refresh("a"))!;
-  const time = Date.now();
+  const time = host.clock.now();
   let state: import("./model").State = { version: 1, disabled: [], jobs: [], operations: [{
     id: "lost-view", agentId: "a", revision: agent.revision!, target: { sessionId: agent.sessionId, activityKey: agent.activityKey ?? null },
     kind: "manual", state: "requested", createdAt: time, updatedAt: time, result: null, inputFingerprint: "lost-view",
@@ -1005,7 +1099,7 @@ test("an attempt that ends unknown after a lost live view stays open for reconci
       tail = result.catch(() => {});
       return result;
     },
-    gateway: host.gateway, settings: async () => ({ ...DEFAULT_SETTINGS }), now: Date.now, onError: error => errors.push(error),
+    gateway: host.gateway, settings: async () => ({ ...DEFAULT_SETTINGS }), now: host.clock.now, timers: host.clock.timers, onError: error => errors.push(error),
   });
   await worker.reconcile();
   worker.stop();
