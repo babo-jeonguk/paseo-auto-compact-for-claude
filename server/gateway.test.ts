@@ -816,8 +816,9 @@ function directory(pageSize = 2, { slow = [] as string[], broken = [] as string[
     { ...base, id: "codex", provider: "codex" },
   ].map(agent => ({ ...agent, persistence: { sessionId: `native-${agent.id}` } }));
   const reads: string[] = [];
-  // Host conversation reads (`host <id>`) and native reads (`read <id>`, then
-  // `read <id> ended`) as they start and end, in order.
+  // Host conversation reads (`host <id>`), native reads (`read <id>`) and the
+  // listed observations a scheduler was given (`observed <id>` as each settles),
+  // in order.
   const calls: string[] = [];
   let listCalls = 0;
   const native = observer(null)!;
@@ -825,14 +826,10 @@ function directory(pageSize = 2, { slow = [] as string[], broken = [] as string[
   native.read = async (id: string) => {
     reads.push(id);
     calls.push(`read ${id}`);
-    try {
-      if (slow.includes(id)) await new Promise(() => {});
-      await holdRead(id);
-      const current = await read(id);
-      return current?.ledger ? { ...current, ledger: { ...current.ledger, sessionId: `native-${id}` } } : current;
-    } finally {
-      calls.push(`read ${id} ended`);
-    }
+    if (slow.includes(id)) await new Promise(() => {});
+    await holdRead(id);
+    const current = await read(id);
+    return current?.ledger ? { ...current, ledger: { ...current.ledger, sessionId: `native-${id}` } } : current;
   };
   const host = createGateway({ observer: native });
   host.attach({
@@ -901,14 +898,19 @@ test("each listed agent's observation settles on its own, so a slow or failing o
 // A scheduler over the real gateway, with state kept in memory. `listing()` is
 // the scheduler's latest agent listing, so a test can wait for paging to end.
 // Its timers run only when a test moves them on, and arming one wakes `until`.
-function directoryScheduler(host: ReturnType<typeof directory>["host"]) {
+// Each listed observation is recorded in `dir.calls` as it settles.
+function directoryScheduler(dir: ReturnType<typeof directory>) {
+  const { host } = dir;
   let state: import("./model").State = { version: 1, disabled: [], jobs: [], operations: [] };
   let listing: Promise<void> | undefined;
   const signal = changes();
   const timers = fakeTimers(signal.changed);
   const scheduler = createScheduler({
     store: { read: async () => structuredClone(state), write: async next => { state = structuredClone(next); } },
-    gateway: { ...host.gateway, list: observe => (listing = host.gateway.list(observe)) },
+    gateway: { ...host.gateway, list: observe => (listing = host.gateway.list(observation => {
+      observe(observation);
+      observation.then(agent => { dir.calls.push(`observed ${agent.agentId}`); }, () => {});
+    })) },
     settings: async () => ({ ...DEFAULT_SETTINGS }),
     now: () => 1_000_000,
     timers,
@@ -924,7 +926,7 @@ test("a scan whose later listing page fails stays single-flight until reads star
     holdRead: id => id === "a" ? heldA : undefined,
     holdPage: start => { if (start === 1) throw new Error("page failed"); },
   });
-  const { scheduler } = directoryScheduler(dir.host);
+  const { scheduler } = directoryScheduler(dir);
   t.after(() => { scheduler.stop(); dir.host.stop(); });
   await scheduler.ready;
   await assert.rejects(scheduler.observe({ kind: "full" }), /page failed/);
@@ -932,8 +934,9 @@ test("a scan whose later listing page fails stays single-flight until reads star
   releaseA();
   await next;
   // The gateway asks the host for b as the scheduler starts b's read, so
-  // whenever that happened, it is recorded before or after a's read ended.
-  const order = ["read a ended", "host b"];
+  // whenever that happened, it is recorded before or after a's observation
+  // settled.
+  const order = ["observed a", "host b"];
   assert.deepEqual(dir.calls.filter((call, index, all) => order.includes(call) && all.indexOf(call) === index),
     order, "b is not read while a's read from the failed scan still runs");
   assert.deepEqual(dir.reads, ["a", "b"]);
@@ -950,7 +953,7 @@ test("a listed conversation's read is bounded from when it starts, not from when
     holdRead: id => { if (id === "a") { startedA(); return heldA; } },
     holdPage: start => start === 1 ? page : undefined,
   });
-  const { scheduler, timers, until, listing, reserved } = directoryScheduler(dir.host);
+  const { scheduler, timers, until, listing, reserved } = directoryScheduler(dir);
   // Runs even if the test stops early, at a failed assertion or at the test
   // runner's bound.
   t.after(() => { scheduler.stop(); dir.host.stop(); });

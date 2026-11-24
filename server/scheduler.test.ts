@@ -31,8 +31,8 @@ function fixture(automatic = true) {
   // Listings waiting at the gate `holdList` set, and listings running now and
   // at most at once, counted from each call's start to its return.
   let heldLists = 0, activeLists = 0, peakLists = 0;
-  // Host reads, listings and listed observations as they start and end, in
-  // order, so a test checks from whole calls what ran while another still did.
+  // Host reads and listed observations as they start and end, in order, so a
+  // test checks from whole calls what ran while another still did.
   const hostCalls: string[] = [];
   // Stored states, sends, reads and armed timers wake tests waiting for them.
   const signal = changes();
@@ -84,7 +84,6 @@ function fixture(automatic = true) {
     list: async (observe) => {
       counts.lists++;
       peakLists = Math.max(peakLists, ++activeLists);
-      hostCalls.push("list");
       try {
         const listed = structuredClone(agents);
         if (listGate) {
@@ -106,7 +105,6 @@ function fixture(automatic = true) {
         }
       } finally {
         activeLists--;
-        hostCalls.push("list ended");
       }
     },
     refresh,
