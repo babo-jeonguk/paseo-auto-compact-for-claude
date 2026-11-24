@@ -53,9 +53,11 @@ function fixture(env = {}, settings = {}) {
   const compact = (inner = async () => {}) => event('command.run', { command: 'compact', args: '' },
     async () => { await inner(); return {}; });
   return { event, step, ledger, request, files, compact, tick,
-    // Resolves once every reading started so far has returned. The observer
-    // acts on a reading before this resolves, since it waited on it first.
-    readingsReturned: () => Promise.allSettled([...readings]),
+    // Resolves once every reading started so far has returned and whatever the
+    // observer saved on it is written. The observer decides on a reading as it
+    // returns, before this looks, and writes its saves in the order they
+    // start, so a later save (classic.Stop changes no result) is written after.
+    readingsSaved: async () => { await Promise.allSettled([...readings]); await event('classic.Stop'); },
     timers: () => timers.size,
     intervals: () => [...timers].map(timer => timer.ms),
     failUsage(count = 1) { usageFailures = count; },
@@ -457,6 +459,7 @@ test('with classic hooks skipped, a reading that ends after the operation was su
     f.context(undefined);
     release();
     await reading;
+    await f.readingsSaved();
     assert.equal(f.ledger().compact.status, 'unknown', name);
   }
 });
@@ -490,6 +493,7 @@ test('with classic hooks skipped, a reading that ends after the operation was re
   f.context(undefined);
   release();
   await reading;
+  await f.readingsSaved();
   assert.equal(f.files.get('/receipts/operation-1.json'), undefined, 'no receipt for the replaced operation');
   assert.deepEqual({ id: f.ledger().compact.id, status: f.ledger().compact.status }, { id: null, status: 'running' });
 });
@@ -528,10 +532,7 @@ test('with classic hooks skipped, a context reading that never settles holds nei
   assert.equal(f.ledger().compact.status, 'failed', 'no reset seen within 10 seconds');
   f.context(undefined);
   release();
-  // The late readings have returned and the observer has acted on them; the
-  // heartbeat's save is written after any save that action started.
-  await f.readingsReturned();
-  await f.tick(5_000, 5_000);
+  await f.readingsSaved();
   assert.equal(f.ledger().compact.status, 'failed', 'a late reading cannot change it');
 });
 

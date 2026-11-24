@@ -816,15 +816,23 @@ function directory(pageSize = 2, { slow = [] as string[], broken = [] as string[
     { ...base, id: "codex", provider: "codex" },
   ].map(agent => ({ ...agent, persistence: { sessionId: `native-${agent.id}` } }));
   const reads: string[] = [];
+  // Host conversation reads (`host <id>`) and native reads (`read <id>`, then
+  // `read <id> ended`) as they start and end, in order.
+  const calls: string[] = [];
   let listCalls = 0;
   const native = observer(null)!;
   const read = native.read;
   native.read = async (id: string) => {
     reads.push(id);
-    if (slow.includes(id)) await new Promise(() => {});
-    await holdRead(id);
-    const current = await read(id);
-    return current?.ledger ? { ...current, ledger: { ...current.ledger, sessionId: `native-${id}` } } : current;
+    calls.push(`read ${id}`);
+    try {
+      if (slow.includes(id)) await new Promise(() => {});
+      await holdRead(id);
+      const current = await read(id);
+      return current?.ledger ? { ...current, ledger: { ...current.ledger, sessionId: `native-${id}` } } : current;
+    } finally {
+      calls.push(`read ${id} ended`);
+    }
   };
   const host = createGateway({ observer: native });
   host.attach({
@@ -841,6 +849,7 @@ function directory(pageSize = 2, { slow = [] as string[], broken = [] as string[
         };
       },
       ref: (id: string) => {
+        calls.push(`host ${id}`);
         if (broken.includes(id)) throw new Error(`host failed for ${id}`);
         return { refresh: async () => {
           const agent = agents.find(entry => entry.id === id);
@@ -849,7 +858,7 @@ function directory(pageSize = 2, { slow = [] as string[], broken = [] as string[
       },
     },
   } as unknown as PluginHandlerContext["paseo"]);
-  return { host, reads, get listCalls() { return listCalls; } };
+  return { host, reads, calls, get listCalls() { return listCalls; } };
 }
 const INELIGIBLE = ["archived", "internal", "child", "unavailable", "closed", "codex"];
 
@@ -911,22 +920,22 @@ function directoryScheduler(host: ReturnType<typeof directory>["host"]) {
 test("a scan whose later listing page fails stays single-flight until reads started on earlier pages end", async (t) => {
   let releaseA!: () => void;
   const heldA = new Promise<void>(resolve => { releaseA = resolve; });
-  // The reads started by the time a's read ends.
-  let seen: string[] | undefined;
   const dir = directory(1, {
-    holdRead: id => id === "a" ? heldA.then(() => { seen ??= [...dir.reads]; }) : undefined,
+    holdRead: id => id === "a" ? heldA : undefined,
     holdPage: start => { if (start === 1) throw new Error("page failed"); },
   });
   const { scheduler } = directoryScheduler(dir.host);
   t.after(() => { scheduler.stop(); dir.host.stop(); });
   await scheduler.ready;
   await assert.rejects(scheduler.observe({ kind: "full" }), /page failed/);
-  // observe() queues the read at once, and only the end of a's read starts it.
   const next = scheduler.observe({ kind: "agent", agentId: "b" });
-  assert.deepEqual(dir.reads, ["a"], "b's read is queued, not started");
   releaseA();
   await next;
-  assert.deepEqual(seen, ["a"], "b is not read while a's read from the failed scan still runs");
+  // The gateway asks the host for b as the scheduler starts b's read, so
+  // whenever that happened, it is recorded before or after a's read ended.
+  const order = ["read a ended", "host b"];
+  assert.deepEqual(dir.calls.filter((call, index, all) => order.includes(call) && all.indexOf(call) === index),
+    order, "b is not read while a's read from the failed scan still runs");
   assert.deepEqual(dir.reads, ["a", "b"]);
 });
 
