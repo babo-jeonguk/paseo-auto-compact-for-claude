@@ -21,29 +21,17 @@ test('snapshot keeps testing its recorded commit while the source advances, prop
   for (const path of ['package-lock.json', 'tests/simulation/package-lock.json'])
     await writeFile(join(repo, path), '{}\n');
   await writeFile(join(repo, 'value'), 'before');
-  await writeFile(join(repo, 'check.mjs'), `
-    import { readFile, writeFile, access } from 'node:fs/promises';
-    import { setTimeout } from 'node:timers/promises';
-    console.log('${STARTED}');
-    let ready = false;
-    for (let i = 0; i < 1000; i++) {
-      try { await access(process.env.SNAPSHOT_CONTINUE); ready = true; break; } catch {}
-      await setTimeout(20);
-    }
-    if (!ready || await readFile('value', 'utf8') !== 'before') process.exit(2);
-    process.exit(7);
-  `);
+  await copyFile(new URL('./support/snapshot-check.mjs', import.meta.url), join(repo, 'check.mjs'));
   const git = (...args) => scope.run('git', ['-C', repo, ...args], { timeout: 15_000 });
   await git('init');
   await git('add', '.');
   await git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', '-c', 'commit.gpgsign=false', 'commit', '-m', 'initial');
   const revision = (await git('rev-parse', 'HEAD')).stdout.trim();
-  const proceed = join(root, 'continue');
   // The wrapper makes its worktree in its temp directory, which the scope
   // removes once the wrapper and the check it started have ended.
   const child = await scope.spawn(process.execPath, ['scripts/test-snapshot.mjs'], {
-    cwd: repo, timeout: 40_000, stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env, SNAPSHOT_CONTINUE: proceed },
+    // The check inherits the wrapper's input through npm and waits on it.
+    cwd: repo, timeout: 40_000, stdio: ['pipe', 'pipe', 'pipe'],
   });
   // Rejects on a spawn error as well as resolving on exit.
   const running = once(child, 'exit');
@@ -62,7 +50,7 @@ test('snapshot keeps testing its recorded commit while the source advances, prop
   await writeFile(join(repo, 'value'), 'after');
   await git('add', 'value');
   await git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', '-c', 'commit.gpgsign=false', 'commit', '-m', 'advance original');
-  await writeFile(proceed, 'continue');
+  child.stdin.end('continue\n');
   const [code] = await running;
   assert.equal(code, 1, `the wrapper must fail when a snapshot check fails:\n${output}`);
   const reports = join(repo, 'test-results/snapshots');
