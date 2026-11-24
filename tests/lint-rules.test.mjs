@@ -56,7 +56,6 @@ test('unit tests start no real timer with a delay', () => {
     ]) flags(file, code, /CODING_STANDARDS\.md "Tests"/);
     for (const code of [
       'clock.setTimeout(fire, 5_000);',
-      't.mock.timers.tick(5_000);',
       // A key built at run time is left to review: lint cannot tell what it names.
       'globalThis[`setTimeout${suffix}`](fire, 50);',
       "const setTimeout = 'setImmediate'; globalThis[setTimeout](fire, 50);",
@@ -116,12 +115,27 @@ test('unit tests mock through their test context, not the shared tracker', () =>
       "mock.method(console, 'error');",
     ]) flags(file, code, /CODING_STANDARDS\.md "Tests"/);
     for (const code of [
-      "t.mock.timers.enable({ apis: ['setTimeout'] });",
-      't.mock.timers.tick(5_000);',
       "t.mock.method(console, 'error');",
       'const fake = mock.fn();',
     ]) passes(file, code);
   }
+});
+
+// Product timers take injected Timers, and fakeTimers() is their one fake in
+// unit tests; Node's mock timers replace the globals with other semantics.
+test('unit tests outside tests/support move product time only through fakeTimers()', () => {
+  const mockTimers = [
+    "t.mock.timers.enable({ apis: ['setTimeout'] });",
+    't.mock.timers.tick(5_000);',
+    "t.mock['timers'].runAll();",
+    "context.mock.timers.setTime(1_000);",
+    "mock.timers.enable({ apis: ['setTimeout'] });",
+  ];
+  for (const file of ['server/a.test.ts', 'scripts/a.test.ts', 'tests/a.test.mjs'])
+    for (const code of mockTimers) flags(file, code, /fakeTimers\(\)[^]*CODING_STANDARDS\.md "Tests"/);
+  for (const code of ["t.mock.timers.enable({ apis: ['setTimeout'] });", 't.mock.timers.tick(5_000);'])
+    passes('tests/support/a.ts', code);
+  for (const code of ['await timers.tick(5_000);', "t.mock.method(console, 'error');"]) passes('server/a.test.ts', code);
 });
 
 // A test stopped at the runner's bound never reaches its finally, so cleanup
