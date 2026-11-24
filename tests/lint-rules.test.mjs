@@ -125,8 +125,9 @@ test('unit tests mock through their test context, not the shared tracker', () =>
 });
 
 // A test stopped at the runner's bound never reaches its finally, so cleanup
-// that waits is registered with t.after(), which the runner still runs.
-test('unit tests register cleanup that waits with t.after(), not in finally', () => {
+// that waits is registered with the test's cleanup scope, whose hook the
+// runner still runs.
+test('unit tests register cleanup that waits with their scope, not in finally', () => {
   for (const file of ['server/a.test.ts', 'scripts/a.test.ts', 'tests/a.test.mjs', 'tests/support/a.ts']) {
     for (const code of [
       'try { await run(); } finally { await rm(dir, { recursive: true, force: true }); }',
@@ -136,12 +137,53 @@ test('unit tests register cleanup that waits with t.after(), not in finally', ()
     ]) flags(file, code, /CODING_STANDARDS\.md "Tests"/);
     for (const code of [
       'try { await run(); } finally { release(); }',
-      't.after(async () => { await rm(dir, { recursive: true, force: true }); });',
+      'scope.defer(async () => { await rm(dir, { recursive: true, force: true }); });',
       'try { await run(); } catch { await report(); }',
     ]) passes(file, code);
   }
   for (const file of ['server/a.ts', 'tests/simulation/run.mjs', 'tests/e2e/run.mjs'])
     passes(file, 'try { await run(); } finally { await rm(dir); }');
+});
+
+// A folder created anywhere but the scope's helper is removed only if the
+// caller registers it afterwards, and a step that throws in between leaks it.
+test('unit tests create temporary folders through their cleanup scope', () => {
+  const created = [
+    "import { mkdtemp } from 'node:fs/promises';",
+    "import { mkdtempSync } from 'node:fs';",
+    "import { mkdtemp as temporary } from 'fs/promises';",
+    'await fs.mkdtemp(prefix);',
+    'fs.mkdtempSync(prefix);',
+    "await fs['mkdtemp'](prefix);",
+    "const { mkdtemp } = await import('node:fs/promises');",
+  ];
+  for (const file of ['server/a.test.ts', 'scripts/a.test.ts', 'tests/a.test.mjs'])
+    for (const code of created) flags(file, code, /CODING_STANDARDS\.md "Tests"/);
+  for (const code of created) passes('tests/support/a.ts', code);
+  for (const file of ['tests/simulation/run.mjs', 'tests/e2e/run.mjs', 'scripts/a.mjs'])
+    passes(file, "import { mkdtemp } from 'node:fs/promises';");
+  passes('server/a.test.ts', "const home = await scope.folder('compact-observer-');");
+});
+
+// A t.after() hook runs in registration order and stops at the first that
+// throws; the scope's one hook releases in reverse order and runs every release.
+test('unit tests register cleanup with their scope, not with test hooks', () => {
+  const hooks = [
+    't.after(() => rm(dir, { recursive: true, force: true }));',
+    't.after(async () => { host.stop(); await obs.close(); });',
+    'context.after(stop);',
+    "t['after'](stop);",
+    "import { after } from 'node:test';",
+    "import { afterEach, test } from 'node:test';",
+  ];
+  for (const file of ['server/a.test.ts', 'scripts/a.test.ts', 'tests/a.test.mjs'])
+    for (const code of hooks) flags(file, code, /CODING_STANDARDS\.md "Tests"/);
+  for (const code of hooks) passes('tests/support/a.ts', code);
+  for (const code of [
+    'scope.defer(() => host.stop());',
+    "hooks.on('agent.turn.after', handler);",
+    "const event = 'agent.turn.after';",
+  ]) passes('server/a.test.ts', code);
 });
 
 test('the unit-test real-time rule leaves process suites and product code alone', () => {
