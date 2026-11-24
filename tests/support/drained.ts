@@ -1,15 +1,18 @@
 // A unit test's code under test waits only on its fakes and injected timers
-// (lint keeps real timers out of server/ and shared/), so once every queued
-// callback has run, nothing more happens until the test acts: a held step is
-// released, a fake timer is moved on. The `drained()` that `drainer()` returns
-// resolves at that point. It fails if a real timer, immediate or I/O request is
-// still pending, or a handle (a socket, a child process) opened since the
-// fixture started is still open, since work outside the test's control could
-// then act after the check. A check that something did not happen while a step
-// is held asserts after it.
+// (lint keeps real timers out of server/ and shared/), so once the callbacks
+// queued now have run, nothing more happens until the test acts: a held step
+// is released, a fake timer is moved on. The `drained()` that `drainer()`
+// returns resolves after one event-loop turn and checks what Node lists as
+// still pending: it fails on a timer, an immediate or an I/O request, or on more
+// handles of a kind (a socket, a child process) than were open as the fixture
+// started, since work outside the test's control could then act after the
+// check. A check that something did not happen while a step is held asserts
+// after it.
 //
-// Node lists only work that keeps the process alive, so an unref'd timer is
-// not seen here; injecting timers is what keeps those out.
+// Node lists neither unref'd timers nor thread-pool work such as compression,
+// and counts handles only by kind, so one closed and another opened looks the
+// same. Injected timers keep the first out; code under test that does the rest
+// is checked after the promise of its call instead.
 export function drainer() {
   // Handles the runner and the process already hold, such as the runner's pipes.
   const baseline = pendingByType();

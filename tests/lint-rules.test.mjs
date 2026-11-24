@@ -66,6 +66,8 @@ test('unit tests do not wait for an event-loop turn outside the drained() helper
     'globalThis.setImmediate(fire);',
     'setTimeout(resolve, 0);',
     'setTimeout(resolve);',
+    'const interval = setInterval(() => { clearInterval(interval); resolve(); }, 0);',
+    'setInterval(fire);',
     "import { setImmediate } from 'node:timers/promises';",
     "import { setImmediate } from 'node:timers';",
     "import { 'setImmediate' as immediate } from 'node:timers/promises';",
@@ -156,9 +158,17 @@ test('server code waits on time only through injected timers', () => {
       'globalThis.setTimeout(fire, POLL_MS);',
       "globalThis['setImmediate'](fire);",
       'AbortSignal.timeout(REGISTRY_TIMEOUT_MS);',
+      "AbortSignal['timeout'](REGISTRY_TIMEOUT_MS);",
+      'globalThis.AbortSignal.timeout(REGISTRY_TIMEOUT_MS);',
+      "globalThis['AbortSignal'][`timeout`](REGISTRY_TIMEOUT_MS);",
       "import { setTimeout } from 'node:timers/promises';",
       "import { setImmediate } from 'node:timers';",
+      "export { setTimeout } from 'node:timers/promises';",
+      "export * from 'timers';",
       "await import('node:timers');",
+      "process.getBuiltinModule('node:timers/promises');",
+      "process['getBuiltinModule'](`timers`);",
+      "require('node:timers');",
     ]) flags(file, code, /CODING_STANDARDS\.md "Decisions apart from effects"/);
     for (const code of [
       'timers.setTimeout(fire, POLL_MS);',
@@ -166,6 +176,9 @@ test('server code waits on time only through injected timers', () => {
       'timers.clearTimeout(handle);',
       'clearTimeout(handle);',
       'bounded(work, INSPECT_TIMEOUT_MS, timers);',
+      'signal.timeout(REGISTRY_TIMEOUT_MS);',
+      "process.getBuiltinModule('node:fs');",
+      "export { systemTimers } from './deadline';",
     ]) passes(file, code);
   }
 });

@@ -100,13 +100,13 @@ const unitTestRules = [
           message: cleanupInFinally,
         },
 ];
-// A wait for one event-loop turn: an immediate, a timer with no delay, or the
-// promise forms of either. Only tests/support/drained.ts, which checks that
+// A wait for one event-loop turn: an immediate, a timer or interval with no
+// delay, or setImmediate from the timer modules. Only tests/support/drained.ts, which checks that
 // nothing real is pending after its turn, may take one.
 const turnWaitRules = [
   {
     selector: `${globalCall("/^setImmediate$/")}, ` +
-      `${globalCall("/^setTimeout$/")}:matches([arguments.length<2], [arguments.1.value=0]), ` +
+      `${globalCall("/^(setTimeout|setInterval)$/")}:matches([arguments.length<2], [arguments.1.value=0]), ` +
       `ImportDeclaration[source.value=${timersModule}] > ImportSpecifier:matches([imported.name='setImmediate'], ` +
       "[imported.value='setImmediate'])",
     message: turnWait,
@@ -121,12 +121,25 @@ const namedTimingRules = [{
   ].join(", "),
   message: namedTiming,
 }];
-// Real time reached in server code: a global timer, a timeout signal, or the
-// timer modules.
+// The key of the member expression at `path` ("" for the node itself, or
+// "callee." and "object." for one below it), written as a name, a string or a
+// template without interpolation.
+const writtenKey = (name, path = "") => `:matches([${path}computed=false][${path}property.name='${name}'], ` +
+  `[${path}property.value='${name}'], ` +
+  `[${path}property.expressions.length=0][${path}property.quasis.0.value.cooked='${name}'])`;
+// Real time reached in server code: a global timer, a timeout signal (also
+// through the global object), or the timer modules imported, re-exported,
+// required or loaded as a built-in by a written name.
 const serverRealTimeRules = [{
   selector: `${globalCall("/^(setTimeout|setInterval|setImmediate)$/")}, ` +
-    "CallExpression[callee.object.name='AbortSignal'][callee.property.name='timeout'], " +
-    `ImportDeclaration[source.value=${timersModule}], ${timersImport}`,
+    `CallExpression > MemberExpression.callee${writtenKey("timeout")}:matches([object.name='AbortSignal'], ` +
+    `[object.object.name=/^global(This)?$/]${writtenKey("AbortSignal", "object.")}), ` +
+    `:matches(ImportDeclaration, ExportNamedDeclaration, ExportAllDeclaration)[source.value=${timersModule}], ` +
+    `${timersImport}, ` +
+    `CallExpression:matches([callee.name='require'], ` +
+    `[callee.object.name='process']${writtenKey("getBuiltinModule", "callee.")}):matches(` +
+    `[arguments.0.value=${timersModule}], ` +
+    `[arguments.0.expressions.length=0][arguments.0.quasis.0.value.cooked=${timersModule}])`,
   message: serverRealTime,
 }];
 
