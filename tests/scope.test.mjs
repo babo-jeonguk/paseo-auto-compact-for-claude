@@ -243,6 +243,15 @@ test('a child that cannot start fails the call and leaves no folder', async (t) 
   await gone(temp);
 });
 
+test('a child cannot be given an IPC channel, which the scope could not close for it', async (t) => {
+  const c = context(t);
+  const scope = cleanupScope(c);
+  await assert.rejects(scope.spawn(process.execPath, [program, 'exit', '0'],
+    { timeout: CHILD_MS, stdio: ['ignore', 'pipe', 'pipe', 'ipc'] }), /no IPC channel/);
+  await c.end();
+  assert.deepEqual(c.notes, []);
+});
+
 // The property every test relies on, checked once end to end: a test file whose
 // test the runner stops at its bound while it holds folders, a scheduler and a
 // process tree. Run as the suite runs, in one process.

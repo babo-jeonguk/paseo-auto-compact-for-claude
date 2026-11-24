@@ -86,6 +86,9 @@ export function cleanupScope(t: ScopeContext): CleanupScope {
   const scope: CleanupScope = {
     defer,
     async spawn(command, args, { timeout, env = process.env, ...options }) {
+      // An IPC channel is not a pipe the scope can close when it cannot reach
+      // a process holding it, and no test needs one.
+      if ([options.stdio].flat().includes("ipc")) throw new Error("A child started through the scope takes no IPC channel");
       // Acquired first, so it goes only once the tree has ended.
       const temp = await scope.folder("compact-child-");
       const child = Object.assign(start(command, args, {
@@ -109,10 +112,14 @@ export function cleanupScope(t: ScopeContext): CleanupScope {
       // comes first. A descendant the tree end could not reach would hold the
       // child's pipes open, so the scope closes its ends instead of waiting.
       let ending: Promise<void> | undefined;
+      const close = () => { for (const pipe of child.stdio) pipe?.destroy(); };
       const end = () => ending ??= (async () => {
-        const reached = endTree(child);
+        let reached;
+        // A tree that cannot be ended still leaves the scope's own pipe ends
+        // to close, so they do not keep the test's process running.
+        try { reached = endTree(child); } catch (error) { close(); throw error; }
         await exited;
-        if (!reached) for (const pipe of child.stdio) pipe?.destroy();
+        if (!reached) close();
       })();
       // The limit holds until the output closes, not only until the child
       // exits: a descendant left holding it is the hang it bounds. A tree it
@@ -139,13 +146,21 @@ export function cleanupScope(t: ScopeContext): CleanupScope {
       let stdout = "", stderr = "";
       child.stdout!.setEncoding("utf8").on("data", (chunk: string) => { stdout += chunk; });
       child.stderr!.setEncoding("utf8").on("data", (chunk: string) => { stderr += chunk; });
-      const [code, signal] = await Promise.race([new Promise<[number | null, NodeJS.Signals | null]>((resolve, reject) => {
-        child.once("error", error => reject(Object.assign(error, { temp: child.temp })));
-        child.once("close", (exitCode: number | null, exitSignal: NodeJS.Signals | null) => resolve([exitCode, exitSignal]));
-      }), limitFailures.get(child)!]);
+      // Ends when the output closes, or at once when the time limit could not
+      // end the tree, which leaves the output open.
+      const ended = await Promise.race([
+        new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+          child.once("error", error => reject(Object.assign(error, { temp: child.temp })));
+          child.once("close", (code: number | null, signal: NodeJS.Signals | null) => resolve({ code, signal }));
+        }),
+        limitFailures.get(child)!.catch((cause: unknown) => ({ code: child.exitCode, signal: child.signalCode, cause })),
+      ]);
+      const { code, signal } = ended;
       if (code === 0 && !child.timedOut) return { stdout, stderr, temp: child.temp };
-      const failure = child.timedOut ? `timed out after ${options.timeout} ms` : "failed";
-      throw Object.assign(new Error(`Command ${failure}: ${[command, ...args].join(" ")}\n${stderr}`),
+      const failure = !child.timedOut ? "failed"
+        : `timed out after ${options.timeout} ms${"cause" in ended ? " and its process tree could not be ended" : ""}`;
+      throw Object.assign(new Error(`Command ${failure}: ${[command, ...args].join(" ")}\n${stderr}`,
+        "cause" in ended ? { cause: ended.cause } : undefined),
         { code, signal, timedOut: child.timedOut, stdout, stderr, temp: child.temp });
     },
     async folder(prefix) {
@@ -166,7 +181,9 @@ export function cleanupScope(t: ScopeContext): CleanupScope {
 // it. On POSIX the child leads its own process group, which outlives the
 // child while any descendant is alive, so signalling the group reaches them
 // even after the child itself has exited (a descendant that left the group
-// for one of its own is neither reached nor detected). Windows has no such group: the tree is ended through the child
+// for one of its own is neither reached nor detected; nor can the scope tell a
+// group that has ended from a new one that took its ID, which needs another
+// process to start its own group with that ID first). Windows has no such group: the tree is ended through the child
 // while it still runs. A child that has exited is not signalled, since its PID
 // may belong to another process by then; Node usually ends a Node child's own
 // children with it on Windows, but another program's descendants (such as a
@@ -185,10 +202,13 @@ function endTree(child: ChildProcess): boolean {
   const ended = spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"],
     { windowsHide: true, encoding: "utf8", timeout: TASKKILL_MS });
   if (ended.status === 0) return true;
-  // The child exited on its own before taskkill reached it: still our child's
-  // PID, since its handle is still open, and no longer running.
-  try { process.kill(child.pid, 0); } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
+  // taskkill ran, but the child exited on its own before it reached it: still
+  // our child's PID, since its handle is still open, and no longer running.
+  // A taskkill that could not start or timed out is reported either way.
+  if (!ended.error) {
+    try { process.kill(child.pid, 0); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
+    }
   }
   throw ended.error ?? new Error(`taskkill could not end process tree ${child.pid} (exit ${ended.status}): ${ended.stderr}`);
 }

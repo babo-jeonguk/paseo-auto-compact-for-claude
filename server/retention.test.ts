@@ -93,9 +93,12 @@ async function fixture(scope: CleanupScope) {
     // Each scheduler runs on real timers, so it stops when the test ends,
     // before the folder its store writes to is removed.
     make() {
-      const scheduler = createScheduler({ store, gateway, receipts, now: () => time,
+      // Registered first, so a test body still running after its test ended
+      // cannot start a scheduler the scope would not stop.
+      let scheduler: ReturnType<typeof createScheduler> | undefined;
+      scope.defer(() => scheduler?.stop());
+      scheduler = createScheduler({ store, gateway, receipts, now: () => time,
         settings: async () => ({ ...DEFAULT_SETTINGS, enabled: false }), onError: error => errors.push(error) });
-      scope.defer(() => scheduler.stop());
       return scheduler;
     },
     get sends() { return sends; }, get sweeps() { return sweeps; },
