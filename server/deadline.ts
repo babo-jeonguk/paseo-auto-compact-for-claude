@@ -70,19 +70,22 @@ export const observationEndBy = (sendBy: number) => sendBy + OBSERVATION_MS;
 export function bounded<T>(work: Promise<T>, milliseconds: number, timers: Timers, stop?: AbortSignal): Promise<T> {
   return new Promise((resolve, reject) => {
     let ended = false;
+    let armed = false;
     let timer: unknown;
     const end = (settle: () => void) => {
       if (ended) return;
       ended = true;
-      if (timer !== undefined) timers.clearTimeout(timer);
+      if (armed) timers.clearTimeout(timer);
       stop?.removeEventListener("abort", stopped);
       settle();
     };
     const stopped = () => end(() => reject(new Stopped()));
     // Never hand Infinity to setTimeout: Node turns it into 1 ms. A wait after
     // stop arms nothing, since it ends at once.
-    if (milliseconds !== Infinity && !stop?.aborted)
+    if (milliseconds !== Infinity && !stop?.aborted) {
       timer = timers.setTimeout(() => end(() => reject(new DeadlineExceeded())), Math.max(0, milliseconds));
+      armed = true;
+    }
     work.then(value => end(() => resolve(value)), error => end(() => reject(error)));
     if (stop?.aborted) stopped();
     else stop?.addEventListener("abort", stopped, { once: true });
