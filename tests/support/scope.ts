@@ -1,4 +1,4 @@
-import { spawn as start, type ChildProcess, type SpawnOptions } from "node:child_process";
+import { spawn as start, spawnSync, type ChildProcess, type SpawnOptions } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -39,6 +39,12 @@ export interface Output { stdout: string; stderr: string; temp: string }
 // process takes to close its handles.
 const REMOVE_RETRIES = 10;
 const REMOVE_RETRY_DELAY_MS = 20;
+// How long taskkill may take to end a tree: it normally returns within a
+// second, so this bounds only a taskkill that hangs.
+const TASKKILL_MS = 10_000;
+
+// A tree end that failed at a child's time limit, for run() to fail with.
+const limitFailures = new WeakMap<ChildProcess, Promise<never>>();
 
 const scopes = new WeakMap<ScopeContext, CleanupScope>();
 
@@ -101,18 +107,22 @@ export function cleanupScope(t: ScopeContext): CleanupScope {
       });
       // Ends the tree once, at the limit or when the test ends, whichever
       // comes first. A descendant the tree end could not reach would hold the
-      // output open, so the scope stops reading it instead of waiting on it.
+      // child's pipes open, so the scope closes its ends instead of waiting.
       let ending: Promise<void> | undefined;
       const end = () => ending ??= (async () => {
-        const reached = await endTree(child);
+        const reached = endTree(child);
         await exited;
-        if (!reached) { child.stdout?.destroy(); child.stderr?.destroy(); }
+        if (!reached) for (const pipe of child.stdio) pipe?.destroy();
       })();
       // The limit holds until the output closes, not only until the child
       // exits: a descendant left holding it is the hang it bounds. A tree it
-      // cannot end is reported when the test ends, by the release below.
+      // cannot end fails run() at once and is reported again by the release.
+      let failAtLimit!: (error: unknown) => void;
+      const limitFailure = new Promise<never>((_, reject) => { failAtLimit = reject; });
+      limitFailure.catch(() => {}); // a spawn() caller learns of it from the release
+      limitFailures.set(child, limitFailure);
       // eslint-disable-next-line no-restricted-syntax -- the time limit a real process keeps (CODING_STANDARDS.md "Tests"); spawn's own would end only the direct child
-      const limit = setTimeout(() => { child.timedOut = true; end().catch(() => {}); }, timeout);
+      const limit = setTimeout(() => { child.timedOut = true; end().catch(failAtLimit); }, timeout);
       void closed.then(() => clearTimeout(limit));
       defer(async () => {
         clearTimeout(limit);
@@ -129,10 +139,10 @@ export function cleanupScope(t: ScopeContext): CleanupScope {
       let stdout = "", stderr = "";
       child.stdout!.setEncoding("utf8").on("data", (chunk: string) => { stdout += chunk; });
       child.stderr!.setEncoding("utf8").on("data", (chunk: string) => { stderr += chunk; });
-      const [code, signal] = await new Promise<[number | null, NodeJS.Signals | null]>((resolve, reject) => {
+      const [code, signal] = await Promise.race([new Promise<[number | null, NodeJS.Signals | null]>((resolve, reject) => {
         child.once("error", error => reject(Object.assign(error, { temp: child.temp })));
         child.once("close", (exitCode: number | null, exitSignal: NodeJS.Signals | null) => resolve([exitCode, exitSignal]));
-      });
+      }), limitFailures.get(child)!]);
       if (code === 0 && !child.timedOut) return { stdout, stderr, temp: child.temp };
       const failure = child.timedOut ? `timed out after ${options.timeout} ms` : "failed";
       throw Object.assign(new Error(`Command ${failure}: ${[command, ...args].join(" ")}\n${stderr}`),
@@ -155,12 +165,13 @@ export function cleanupScope(t: ScopeContext): CleanupScope {
 // Ends a child's process tree, and says whether that reached every process in
 // it. On POSIX the child leads its own process group, which outlives the
 // child while any descendant is alive, so signalling the group reaches them
-// even after the child itself has exited (a descendant that left the group is
-// not reached). Windows has no such group: the tree is ended through the child
-// while it still runs. Once the child has exited, its PID may belong to
-// another process, so it is not signalled; Node ends a Node child's own
-// children when it exits, but another program's descendants may be left.
-async function endTree(child: ChildProcess): Promise<boolean> {
+// even after the child itself has exited (a descendant that left the group
+// for one of its own is neither reached nor detected). Windows has no such group: the tree is ended through the child
+// while it still runs. A child that has exited is not signalled, since its PID
+// may belong to another process by then; Node usually ends a Node child's own
+// children with it on Windows, but another program's descendants (such as a
+// command npm starts through cmd.exe) can be left, unreached.
+function endTree(child: ChildProcess): boolean {
   if (child.pid === undefined) return true;
   if (process.platform !== "win32") {
     try { process.kill(-child.pid, "SIGKILL"); } catch (error) {
@@ -168,17 +179,16 @@ async function endTree(child: ChildProcess): Promise<boolean> {
     }
     return true;
   }
-  const gone = () => child.exitCode !== null || child.signalCode !== null;
-  if (gone()) return false;
-  const killer = start("taskkill", ["/pid", String(child.pid), "/T", "/F"], { windowsHide: true, stdio: ["ignore", "ignore", "pipe"] });
-  let stderr = "";
-  killer.stderr.setEncoding("utf8").on("data", (chunk: string) => { stderr += chunk; });
-  const status = await new Promise<number | null>((resolve, reject) => {
-    killer.once("error", reject);
-    killer.once("close", resolve);
-  });
-  if (status === 0) return true;
-  // The child exited on its own before taskkill reached it.
-  if (gone()) return false;
-  throw new Error(`taskkill could not end process tree ${child.pid} (exit ${status}): ${stderr}`);
+  if (child.exitCode !== null || child.signalCode !== null) return false;
+  // Synchronous, so Node keeps the child's process handle open throughout and
+  // its PID cannot pass to another process before taskkill looks it up.
+  const ended = spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"],
+    { windowsHide: true, encoding: "utf8", timeout: TASKKILL_MS });
+  if (ended.status === 0) return true;
+  // The child exited on its own before taskkill reached it: still our child's
+  // PID, since its handle is still open, and no longer running.
+  try { process.kill(child.pid, 0); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
+  }
+  throw ended.error ?? new Error(`taskkill could not end process tree ${child.pid} (exit ${ended.status}): ${ended.stderr}`);
 }
