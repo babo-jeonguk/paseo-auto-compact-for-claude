@@ -90,38 +90,36 @@ async function fixture() {
   };
 }
 
-test("cleanup survives a state commit failure and restart after receipt deletion", async () => {
+test("cleanup survives a state commit failure and restart after receipt deletion", async (t) => {
   const f = await fixture();
-  try {
-    f.failCommit(true);
-    const first = f.make(); await first.ready;
-    assert.deepEqual(f.removed, ["old"]);
-    assert.equal((await first.operation("old"))?.state, "succeeded");
-    assert.equal(f.sweeps, 0);
-    first.stop(); f.failCommit(false);
-    const second = f.make(); await second.ready;
-    assert.equal(await second.operation("old"), null);
-    assert.deepEqual(f.removed, ["old", "old"]);
-    assert.equal(f.sweeps, 1);
-    assert.equal(f.errors.length, 1);
-    second.stop();
-  } finally { await f.close(); }
+  t.after(() => f.close());
+  f.failCommit(true);
+  const first = f.make(); await first.ready;
+  assert.deepEqual(f.removed, ["old"]);
+  assert.equal((await first.operation("old"))?.state, "succeeded");
+  assert.equal(f.sweeps, 0);
+  first.stop(); f.failCommit(false);
+  const second = f.make(); await second.ready;
+  assert.equal(await second.operation("old"), null);
+  assert.deepEqual(f.removed, ["old", "old"]);
+  assert.equal(f.sweeps, 1);
+  assert.equal(f.errors.length, 1);
+  second.stop();
 });
 
-test("offline ticks retry removal failures; successful sweeps run hourly and tolerate clock rollback", async () => {
+test("offline ticks retry removal failures; successful sweeps run hourly and tolerate clock rollback", async (t) => {
   const f = await fixture();
-  try {
-    f.failRemoval(true);
-    const s = f.make(); await s.ready;
-    assert(await s.operation("old"));
-    f.failRemoval(false); await s.tick(false);
-    assert.equal(await s.operation("old"), null);
-    const sweeps = f.sweeps;
-    await s.tick(false); assert.equal(f.sweeps, sweeps);
-    f.advance(HISTORY_SWEEP_INTERVAL_MS); await s.tick(false); assert.equal(f.sweeps, sweeps + 1);
-    f.advance(-2 * HISTORY_SWEEP_INTERVAL_MS); await s.tick(false); assert.equal(f.sweeps, sweeps + 2);
-    s.stop();
-  } finally { await f.close(); }
+  t.after(() => f.close());
+  f.failRemoval(true);
+  const s = f.make(); await s.ready;
+  assert(await s.operation("old"));
+  f.failRemoval(false); await s.tick(false);
+  assert.equal(await s.operation("old"), null);
+  const sweeps = f.sweeps;
+  await s.tick(false); assert.equal(f.sweeps, sweeps);
+  f.advance(HISTORY_SWEEP_INTERVAL_MS); await s.tick(false); assert.equal(f.sweeps, sweeps + 1);
+  f.advance(-2 * HISTORY_SWEEP_INTERVAL_MS); await s.tick(false); assert.equal(f.sweeps, sweeps + 2);
+  s.stop();
 });
 
 test("cleanup preserves same-activity protection across restart and allows a new native generation", async (t) => {

@@ -684,7 +684,7 @@ function directoryScheduler(host: ReturnType<typeof directory>["host"]) {
 }
 const turn = () => new Promise<void>(resolve => setImmediate(resolve));
 
-test("a scan whose later listing page fails stays single-flight until reads started on earlier pages end", async () => {
+test("a scan whose later listing page fails stays single-flight until reads started on earlier pages end", async (t) => {
   let releaseA!: () => void;
   const heldA = new Promise<void>(resolve => { releaseA = resolve; });
   const dir = directory(1, {
@@ -692,20 +692,17 @@ test("a scan whose later listing page fails stays single-flight until reads star
     holdPage: start => { if (start === 1) throw new Error("page failed"); },
   });
   const { scheduler } = directoryScheduler(dir.host);
-  try {
-    await scheduler.ready;
-    await assert.rejects(scheduler.observe({ kind: "full" }), /page failed/);
-    const next = scheduler.observe({ kind: "agent", agentId: "b" });
-    await turn();
-    assert.deepEqual(dir.reads, ["a"], "b is not read while a's read from the failed scan still runs");
-    releaseA();
-    await next;
-    assert.deepEqual(dir.reads, ["a", "b"]);
-  } finally {
-    releaseA();
-    scheduler.stop();
-    dir.host.stop();
-  }
+  // a's held read runs under the gateway's real per-read bound, so a test that
+  // stops before releasing it would keep that timer running.
+  t.after(() => { releaseA(); scheduler.stop(); dir.host.stop(); });
+  await scheduler.ready;
+  await assert.rejects(scheduler.observe({ kind: "full" }), /page failed/);
+  const next = scheduler.observe({ kind: "agent", agentId: "b" });
+  await turn();
+  assert.deepEqual(dir.reads, ["a"], "b is not read while a's read from the failed scan still runs");
+  releaseA();
+  await next;
+  assert.deepEqual(dir.reads, ["a", "b"]);
 });
 
 test("a listed conversation's read is bounded from when it starts, not from when paging ends", async (t) => {
@@ -1051,60 +1048,61 @@ async function realObserverFixture(now = () => Date.now()) {
   };
 }
 
-test("live observation reports a confirmed query-restart refusal promptly for both Compact now and automatic compaction", async () => {
+test("live observation reports a confirmed query-restart refusal promptly for both Compact now and automatic compaction", async (t) => {
   for (const kind of ["manual", "automatic"] as const) {
     const time = 1_000_000;
     const obs = await realObserverFixture(() => time);
-    try {
-      const host = fixture([], undefined, false, [], {
-        observer: obs.native, now: () => time, timeoutMs: 120_000, pollMs: 1,
-      });
-      const send = host.ref.send;
-      let sawGenerationChange!: () => void;
-      const generationChanged = new Promise<void>(resolve => { sawGenerationChange = resolve; });
-      const originalResult = obs.native.result;
-      let pollsOnNewGeneration = 0;
-      obs.native.result = async (agentId, op) => {
-        const res = await originalResult(agentId, op);
-        if (obs.ledger.generation === "gen-2" && ++pollsOnNewGeneration === 2) sawGenerationChange();
-        return res;
-      };
-      host.ref.send = async (text, options) => {
-        await send(text, options);
-        // First, the restarted query starts with a new generation before /compact is admitted.
-        obs.ledger.generation = "gen-2";
-        obs.ledger.revision = 0;
-        obs.ledger.compact = null;
+    const host = fixture([], undefined, false, [], {
+      observer: obs.native, now: () => time, timeoutMs: 120_000, pollMs: 1,
+    });
+    // On a frozen clock the live poll never reaches its deadline, so a test that
+    // stops early stops the gateway before its observer folder is removed.
+    t.after(async () => { host.stop(); await obs.close(); });
+    const send = host.ref.send;
+    let sawGenerationChange!: () => void;
+    const generationChanged = new Promise<void>(resolve => { sawGenerationChange = resolve; });
+    const originalResult = obs.native.result;
+    let pollsOnNewGeneration = 0;
+    obs.native.result = async (agentId, op) => {
+      const res = await originalResult(agentId, op);
+      if (obs.ledger.generation === "gen-2" && ++pollsOnNewGeneration === 2) sawGenerationChange();
+      return res;
+    };
+    host.ref.send = async (text, options) => {
+      await send(text, options);
+      // First, the restarted query starts with a new generation before /compact is admitted.
+      obs.ledger.generation = "gen-2";
+      obs.ledger.revision = 0;
+      obs.ledger.compact = null;
+      await obs.saveLedger();
+      // Wait until live observation has polled across the generation change without cancelling request.json.
+      void generationChanged.then(async () => {
+        const req = await obs.readRequest();
+        assert.equal(req.status, "prepared", `${kind}: live observation must not cancel request.json on generation change alone`);
+        const prepared = { launchId: req.launchId, generation: req.generation, sessionId: req.sessionId, revision: req.revision };
+        const record = {
+          id: req.id, launchId: obs.launchId, generation: "gen-2", sessionId: "native-a", revision: 0,
+          status: "failed", reason: "Claude query restarted before compaction ran", observedAt: time + 50,
+          refusal: QUERY_RESTARTED_REFUSAL, prepared,
+        };
+        await obs.writeReceipt(req.id, record);
+        obs.ledger.compact = {
+          id: req.id, revision: 0, status: "failed", reason: record.reason,
+          refusal: QUERY_RESTARTED_REFUSAL, prepared,
+        };
         await obs.saveLedger();
-        // Wait until live observation has polled across the generation change without cancelling request.json.
-        void generationChanged.then(async () => {
-          const req = await obs.readRequest();
-          assert.equal(req.status, "prepared", `${kind}: live observation must not cancel request.json on generation change alone`);
-          const prepared = { launchId: req.launchId, generation: req.generation, sessionId: req.sessionId, revision: req.revision };
-          const record = {
-            id: req.id, launchId: obs.launchId, generation: "gen-2", sessionId: "native-a", revision: 0,
-            status: "failed", reason: "Claude query restarted before compaction ran", observedAt: time + 50,
-            refusal: QUERY_RESTARTED_REFUSAL, prepared,
-          };
-          await obs.writeReceipt(req.id, record);
-          obs.ledger.compact = {
-            id: req.id, revision: 0, status: "failed", reason: record.reason,
-            refusal: QUERY_RESTARTED_REFUSAL, prepared,
-          };
-          await obs.saveLedger();
-        });
-      };
-      const agent = (await host.gateway.refresh("a"))!;
-      const execution = { id: `op-${kind}`, sendBy: time + 30_000, checkpoint: async () => {}, current: () => true };
-      const outcome = kind === "automatic"
-        ? await host.gateway.automatic!(agent, { expiresAt: time + 30_000, allowed: async () => true }, execution)
-        : await host.gateway.compact("a", agent, execution);
-      assert.equal(outcome.status, "failed", kind);
-      assert.match(outcome.detail, /query restarted/i, kind);
-      assert.equal(host.sendCount(), 1, kind);
-      assert.equal((await obs.readRequest()).status, "settled", `${kind}: consumed refusal is settled on cleanup`);
-      host.stop();
-    } finally { await obs.close(); }
+      });
+    };
+    const agent = (await host.gateway.refresh("a"))!;
+    const execution = { id: `op-${kind}`, sendBy: time + 30_000, checkpoint: async () => {}, current: () => true };
+    const outcome = kind === "automatic"
+      ? await host.gateway.automatic!(agent, { expiresAt: time + 30_000, allowed: async () => true }, execution)
+      : await host.gateway.compact("a", agent, execution);
+    assert.equal(outcome.status, "failed", kind);
+    assert.match(outcome.detail, /query restarted/i, kind);
+    assert.equal(host.sendCount(), 1, kind);
+    assert.equal((await obs.readRequest()).status, "settled", `${kind}: consumed refusal is settled on cleanup`);
+    host.stop();
   }
 });
 
@@ -1163,93 +1161,91 @@ test("a generation change without a matching refusal stays pending until the obs
   assert.equal((await obs.readRequest()).status, "cancelled");
 });
 
-test("stopping the plugin after dispatch preserves request.json so a query-restart refusal remains recoverable", async () => {
+test("stopping the plugin after dispatch preserves request.json so a query-restart refusal remains recoverable", async (t) => {
   const time = 1_000_000;
   const obs = await realObserverFixture(() => time);
-  try {
-    const host = fixture([], undefined, false, [], { observer: obs.native, now: () => time, timeoutMs: 120_000, pollMs: 1 });
-    const send = host.ref.send;
-    let saved: OperationEvidence | undefined;
-    host.ref.send = async (text, options) => {
-      await send(text, options);
-      host.stop();
-    };
-    const agent = (await host.gateway.refresh("a"))!;
-    const outcome = await host.gateway.compact("a", agent, {
-      id: "stop-after-dispatch", sendBy: time + 30_000,
-      checkpoint: async evidence => { saved = evidence; }, current: () => true,
-    });
-    assert.equal(outcome.status, "unknown");
-    assert.equal(host.sendCount(), 1);
-    const req = await obs.readRequest();
-    assert.equal(req.status, "prepared", "plugin stop after dispatch must not overwrite prepared request with cancelled");
+  t.after(() => obs.close());
+  const host = fixture([], undefined, false, [], { observer: obs.native, now: () => time, timeoutMs: 120_000, pollMs: 1 });
+  const send = host.ref.send;
+  let saved: OperationEvidence | undefined;
+  host.ref.send = async (text, options) => {
+    await send(text, options);
+    host.stop();
+  };
+  const agent = (await host.gateway.refresh("a"))!;
+  const outcome = await host.gateway.compact("a", agent, {
+    id: "stop-after-dispatch", sendBy: time + 30_000,
+    checkpoint: async evidence => { saved = evidence; }, current: () => true,
+  });
+  assert.equal(outcome.status, "unknown");
+  assert.equal(host.sendCount(), 1);
+  const req = await obs.readRequest();
+  assert.equal(req.status, "prepared", "plugin stop after dispatch must not overwrite prepared request with cancelled");
 
-    // Restarted query now admits and refuses the prepared request.
-    const prepared = { launchId: req.launchId, generation: req.generation, sessionId: req.sessionId, revision: req.revision };
-    await obs.writeReceipt(req.id, {
-      id: req.id, launchId: obs.launchId, generation: "gen-2", sessionId: "native-a", revision: 0,
-      status: "failed", reason: "Claude query restarted before compaction ran", observedAt: time + 500,
-      refusal: QUERY_RESTARTED_REFUSAL, prepared,
-    });
-    const restarted = fixture([], undefined, false, [], { observer: obs.native, now: () => time });
-    const stored: StoredOperation = {
-      id: req.id, agentId: "a", revision: agent.revision!, target: { sessionId: "native-a", activityKey: agent.activityKey ?? null },
-      kind: "manual", state: "observing", createdAt: time, updatedAt: time, result: null, inputFingerprint: null,
-      evidence: saved,
-    };
-    const recovered = await restarted.gateway.inspect!(stored);
-    assert.equal(recovered?.status, "failed");
-    assert.match(recovered.detail, /query restarted/i);
-    assert.equal(restarted.sendCount(), 0);
-    restarted.stop();
-  } finally { await obs.close(); }
+  // Restarted query now admits and refuses the prepared request.
+  const prepared = { launchId: req.launchId, generation: req.generation, sessionId: req.sessionId, revision: req.revision };
+  await obs.writeReceipt(req.id, {
+    id: req.id, launchId: obs.launchId, generation: "gen-2", sessionId: "native-a", revision: 0,
+    status: "failed", reason: "Claude query restarted before compaction ran", observedAt: time + 500,
+    refusal: QUERY_RESTARTED_REFUSAL, prepared,
+  });
+  const restarted = fixture([], undefined, false, [], { observer: obs.native, now: () => time });
+  const stored: StoredOperation = {
+    id: req.id, agentId: "a", revision: agent.revision!, target: { sessionId: "native-a", activityKey: agent.activityKey ?? null },
+    kind: "manual", state: "observing", createdAt: time, updatedAt: time, result: null, inputFingerprint: null,
+    evidence: saved,
+  };
+  const recovered = await restarted.gateway.inspect!(stored);
+  assert.equal(recovered?.status, "failed");
+  assert.match(recovered.detail, /query restarted/i);
+  assert.equal(restarted.sendCount(), 0);
+  restarted.stop();
 });
 
-test("recovery accepts a confirmed query-restart refusal within the deadline and ignores late or ambiguous receipts", async () => {
+test("recovery accepts a confirmed query-restart refusal within the deadline and ignores late or ambiguous receipts", async (t) => {
   const obs = await realObserverFixture(() => 1_000_000);
-  try {
-    const host = fixture([], undefined, false, [], { observer: obs.native, now: () => 1_000_000 });
-    const native = { id: "recover-restart", launchId: obs.launchId, generation: "gen-1", sessionId: "native-a", revision: 2 };
-    const operation: StoredOperation = {
-      id: native.id, agentId: "a", revision: "rev", target: { sessionId: "native-a", activityKey: null },
-      kind: "automatic", state: "observing", createdAt: 1_000_000, updatedAt: 1_000_000, result: null, inputFingerprint: null,
-      evidence: { dispatchStartedAt: 1_000_000, native },
-    };
-    const prepared = { launchId: native.launchId, generation: native.generation, sessionId: native.sessionId, revision: native.revision };
-    await obs.writeReceipt(native.id, {
-      id: native.id, launchId: obs.launchId, generation: "gen-2", sessionId: "native-a", revision: 0,
-      status: "failed", reason: "Claude query restarted before compaction ran", observedAt: 1_000_500,
-      refusal: QUERY_RESTARTED_REFUSAL, prepared,
-    });
-    const recovered = await host.gateway.inspect!(operation);
-    assert.equal(recovered?.status, "failed");
-    assert.match(recovered.detail, /query restarted/i);
+  t.after(() => obs.close());
+  const host = fixture([], undefined, false, [], { observer: obs.native, now: () => 1_000_000 });
+  const native = { id: "recover-restart", launchId: obs.launchId, generation: "gen-1", sessionId: "native-a", revision: 2 };
+  const operation: StoredOperation = {
+    id: native.id, agentId: "a", revision: "rev", target: { sessionId: "native-a", activityKey: null },
+    kind: "automatic", state: "observing", createdAt: 1_000_000, updatedAt: 1_000_000, result: null, inputFingerprint: null,
+    evidence: { dispatchStartedAt: 1_000_000, native },
+  };
+  const prepared = { launchId: native.launchId, generation: native.generation, sessionId: native.sessionId, revision: native.revision };
+  await obs.writeReceipt(native.id, {
+    id: native.id, launchId: obs.launchId, generation: "gen-2", sessionId: "native-a", revision: 0,
+    status: "failed", reason: "Claude query restarted before compaction ran", observedAt: 1_000_500,
+    refusal: QUERY_RESTARTED_REFUSAL, prepared,
+  });
+  const recovered = await host.gateway.inspect!(operation);
+  assert.equal(recovered?.status, "failed");
+  assert.match(recovered.detail, /query restarted/i);
 
-    // Late receipt past the observation deadline is ignored.
-    await obs.writeReceipt(native.id, {
-      id: native.id, launchId: obs.launchId, generation: "gen-2", sessionId: "native-a", revision: 0,
-      status: "failed", reason: "Claude query restarted before compaction ran",
-      observedAt: 1_000_000 + OBSERVATION_MS + 1, refusal: QUERY_RESTARTED_REFUSAL, prepared,
-    });
-    assert.equal(await host.gateway.inspect!(operation), null);
+  // Late receipt past the observation deadline is ignored.
+  await obs.writeReceipt(native.id, {
+    id: native.id, launchId: obs.launchId, generation: "gen-2", sessionId: "native-a", revision: 0,
+    status: "failed", reason: "Claude query restarted before compaction ran",
+    observedAt: 1_000_000 + OBSERVATION_MS + 1, refusal: QUERY_RESTARTED_REFUSAL, prepared,
+  });
+  assert.equal(await host.gateway.inspect!(operation), null);
 
-    // Foreign-generation completion never completes recovery, even with a matching timeline boundary.
-    host.ref.timeline.refetch = async () => ({ entries: [
-      { turnId: "our-turn", item: { type: "user_message", clientMessageId: native.id } },
-      { turnId: "our-turn", item: { type: "compaction", status: "completed", trigger: "manual" } },
-    ] });
-    await obs.writeReceipt(native.id, {
-      id: native.id, launchId: obs.launchId, generation: "gen-2", sessionId: "native-a", revision: 0,
-      status: "completed", reason: null, observedAt: 1_000_500, refusal: QUERY_RESTARTED_REFUSAL, prepared,
-    });
-    assert.equal(await host.gateway.inspect!(operation), null);
+  // Foreign-generation completion never completes recovery, even with a matching timeline boundary.
+  host.ref.timeline.refetch = async () => ({ entries: [
+    { turnId: "our-turn", item: { type: "user_message", clientMessageId: native.id } },
+    { turnId: "our-turn", item: { type: "compaction", status: "completed", trigger: "manual" } },
+  ] });
+  await obs.writeReceipt(native.id, {
+    id: native.id, launchId: obs.launchId, generation: "gen-2", sessionId: "native-a", revision: 0,
+    status: "completed", reason: null, observedAt: 1_000_500, refusal: QUERY_RESTARTED_REFUSAL, prepared,
+  });
+  assert.equal(await host.gateway.inspect!(operation), null);
 
-    // Normal matching completion with matching boundary still succeeds.
-    await obs.writeReceipt(native.id, {
-      id: native.id, launchId: obs.launchId, generation: "gen-1", sessionId: "native-a", revision: 2,
-      status: "completed", reason: null, observedAt: 1_000_500,
-    });
-    assert.equal((await host.gateway.inspect!(operation))?.status, "completed");
-    host.stop();
-  } finally { await obs.close(); }
+  // Normal matching completion with matching boundary still succeeds.
+  await obs.writeReceipt(native.id, {
+    id: native.id, launchId: obs.launchId, generation: "gen-1", sessionId: "native-a", revision: 2,
+    status: "completed", reason: null, observedAt: 1_000_500,
+  });
+  assert.equal((await host.gateway.inspect!(operation))?.status, "completed");
+  host.stop();
 });

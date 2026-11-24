@@ -441,16 +441,13 @@ test("conversations run independently: a held send does not delay another conver
     return { status: "completed", detail: "A completed" };
   });
   const running = f.make().reconcile();
-  try {
-    await f.until(() => f.operationById("operation-b").state === "succeeded");
-    assert.equal(f.operationById("operation-a").state, "observing");
-    assert.equal(f.sends, 1, "only B has completed its send while A is held");
-    assert.ok(f.events.includes("b:send"), "B is sent while A is still held");
-    assert.ok(!f.events.includes("a:release"), "A has not been released yet");
-  } finally {
-    releaseA();
-    await running;
-  }
+  await f.until(() => f.operationById("operation-b").state === "succeeded");
+  assert.equal(f.operationById("operation-a").state, "observing");
+  assert.equal(f.sends, 1, "only B has completed its send while A is held");
+  assert.ok(f.events.includes("b:send"), "B is sent while A is still held");
+  assert.ok(!f.events.includes("a:release"), "A has not been released yet");
+  releaseA();
+  await running;
   assert.equal(f.operationById("operation-a").state, "succeeded");
   assert.equal(f.sends, 2, "exactly one send per operation");
   assert.deepEqual(f.calls.toSorted(), ["a", "b"]);
@@ -509,17 +506,14 @@ test("overlapping checkpoints and completions of two conversations keep both evi
     return { status: "completed", detail: "B completed" };
   });
   const running = f.make().reconcile();
-  try {
-    await f.until(() => f.events.includes("a:checkpointed") && f.events.includes("b:checkpointed"));
-    assert.equal(f.operationById("operation-a").state, "observing");
-    assert.equal(f.operationById("operation-b").state, "observing");
-    releaseA();
-    await f.until(() => f.operationById("operation-a").state === "succeeded");
-    assert.equal(f.operationById("operation-b").state, "observing", "B is still held");
-  } finally {
-    releaseA(); releaseB();
-    await running;
-  }
+  await f.until(() => f.events.includes("a:checkpointed") && f.events.includes("b:checkpointed"));
+  assert.equal(f.operationById("operation-a").state, "observing");
+  assert.equal(f.operationById("operation-b").state, "observing");
+  releaseA();
+  await f.until(() => f.operationById("operation-a").state === "succeeded");
+  assert.equal(f.operationById("operation-b").state, "observing", "B is still held");
+  releaseB();
+  await running;
   assert.equal(f.operationById("operation-a").state, "succeeded");
   assert.equal(f.operationById("operation-b").state, "succeeded");
   assert.deepEqual(f.operationById("operation-a").evidence,
@@ -541,14 +535,11 @@ test("concurrent reconciles start each operation only once", async () => {
   });
   const worker = f.make();
   const first = worker.reconcile(), second = worker.reconcile();
-  try {
-    // Both reconciles have passed the claim point by the time the run observes.
-    await f.until(() => f.operation.state === "observing");
-    assert.equal(f.calls.filter(id => id === "a").length, 1);
-  } finally {
-    release();
-    await Promise.all([first, second]);
-  }
+  // Both reconciles have passed the claim point by the time the run observes.
+  await f.until(() => f.operation.state === "observing");
+  assert.equal(f.calls.filter(id => id === "a").length, 1);
+  release();
+  await Promise.all([first, second]);
   assert.equal(f.operation.state, "succeeded");
   assert.equal(f.calls.filter(id => id === "a").length, 1);
 });

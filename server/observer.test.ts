@@ -42,26 +42,25 @@ async function fixture() {
     advance(ms: number) { time += ms; }, close: () => rm(home, { recursive: true, force: true }) };
 }
 
-test('observer session preparation preserves provider environment and ignores history/non-Claude sessions', async () => {
+test('observer session preparation preserves provider environment and ignores history/non-Claude sessions', async (t) => {
   const f = await fixture();
-  try {
-    assert.equal(f.prepared.env.OTHER, 'preserved');
-    assert.equal((f.prepared as typeof f.request).title, 'Conversation');
-    assert.deepEqual((f.prepared as typeof f.request).labels, { retained: 'yes' });
-    const launch = (await f.observer.read('a'))!.ledger!.launchId;
-    assert.equal(f.observer.startedHere('a', launch), true);
-    assert.equal(createObserver({ home: f.home, now: () => 1_000_000 }).startedHere('a', launch), false,
-      'a later plugin instance did not start this launch');
-    assert.equal(f.observer.startedHere('missing', launch), false);
-    assert(f.prepared.env.CLAUDE_CODE_PLUGIN_DIRS.startsWith('/existing' + delimiter));
-    assert.equal(await f.observer.prepareSession(f.request, false), f.request);
-    const history = { ...f.request, purpose: 'history' as const };
-    assert.equal(await f.observer.prepareSession(history, true), history);
-    assert.equal(await f.observer.readiness(f.agent, 1_060_000), null);
-    assert.match((await f.observer.readiness(f.agent, 4_600_000))!.detail, /exceeds/);
-    f.advance(61_000);
-    assert.match((await f.observer.readiness(f.agent))!.detail, /unavailable/);
-  } finally { await f.close(); }
+  t.after(() => f.close());
+  assert.equal(f.prepared.env.OTHER, 'preserved');
+  assert.equal((f.prepared as typeof f.request).title, 'Conversation');
+  assert.deepEqual((f.prepared as typeof f.request).labels, { retained: 'yes' });
+  const launch = (await f.observer.read('a'))!.ledger!.launchId;
+  assert.equal(f.observer.startedHere('a', launch), true);
+  assert.equal(createObserver({ home: f.home, now: () => 1_000_000 }).startedHere('a', launch), false,
+    'a later plugin instance did not start this launch');
+  assert.equal(f.observer.startedHere('missing', launch), false);
+  assert(f.prepared.env.CLAUDE_CODE_PLUGIN_DIRS.startsWith('/existing' + delimiter));
+  assert.equal(await f.observer.prepareSession(f.request, false), f.request);
+  const history = { ...f.request, purpose: 'history' as const };
+  assert.equal(await f.observer.prepareSession(history, true), history);
+  assert.equal(await f.observer.readiness(f.agent, 1_060_000), null);
+  assert.match((await f.observer.readiness(f.agent, 4_600_000))!.detail, /exceeds/);
+  f.advance(61_000);
+  assert.match((await f.observer.readiness(f.agent))!.detail, /unavailable/);
 });
 
 // Observer builds that open sessions may still run: releases, and main for
@@ -90,57 +89,54 @@ test('the current observer build is listed, so the build it replaces stays check
     'the build it replaces in compatibleBuilds in server/observer.ts unless the ledger contract changed.');
 });
 
-test('the compatible pre-fix observer stays readable during rollout; unknown builds stay rejected', async () => {
+test('the compatible pre-fix observer stays readable during rollout; unknown builds stay rejected', async (t) => {
   const f = await fixture();
-  try {
-    const manifestPath = join(f.parent, 'current.json');
-    for (const build of READABLE_BUILDS) {
-      await writeFile(manifestPath, JSON.stringify({ ...f.manifest, build }));
-      assert(await f.observer.read('a'));
-      f.ledger.pendingInputs = 1; await f.save();
-      await assert.rejects(f.observer.prepare(f.agent, false, 1_030_000), /still working/);
-    }
-    await writeFile(manifestPath, JSON.stringify({ ...f.manifest, build: 'unknown-build' }));
-    assert.equal(await f.observer.read('a'), null);
-  } finally { await f.close(); }
-});
-
-test('observer rejects mismatched sessions, busy native work, default TTL fallback and changed generations', async () => {
-  const f = await fixture();
-  try {
-    assert.match((await f.observer.readiness({ ...f.agent, sessionId: 'other' }))!.detail, /unavailable/);
-    f.ledger.activeTurns = ['background']; await f.save();
-    await assert.rejects(f.observer.prepare(f.agent, true, 1_030_000), /still working/);
-    f.ledger.activeTurns = []; f.ledger.transcriptPath = '/missing-transcript'; await f.save();
-    assert.equal(await f.observer.readiness(f.agent, 1_000_000 + 55 * 60_000), null);
-    assert.equal((await f.observer.read('a'))?.ledger?.cache?.source, 'default');
-    const manual = await f.observer.prepare(f.agent, false, 1_030_000);
-    f.ledger.generation = 'reloaded'; await f.save();
-    assert.equal(await f.observer.result('a', manual), null,
-      'a generation change alone waits for a matching refusal or the observation deadline');
-    await f.observer.prepareSession(f.request, true);
-    const nextManifest = JSON.parse(await readFile(join(f.parent, 'current.json'), 'utf8'));
-    await writeFile(join(f.parent, nextManifest.launchId, 'ledger.json'),
-      JSON.stringify({ ...f.ledger, launchId: nextManifest.launchId }));
-    assert.equal((await f.observer.result('a', manual))?.status, 'unknown',
-      'a different launch cannot read the old request file');
-  } finally { await f.close(); }
-});
-
-test('a ledger written just before a WSL clock step back stays readable; a far-future ledger does not', async () => {
-  const f = await fixture();
-  try {
-    // A heartbeat saved at 1_001_800, then the system clock stepped back 1.8 s.
-    f.ledger.updatedAt = 1_001_800; await f.save();
+  t.after(() => f.close());
+  const manifestPath = join(f.parent, 'current.json');
+  for (const build of READABLE_BUILDS) {
+    await writeFile(manifestPath, JSON.stringify({ ...f.manifest, build }));
     assert(await f.observer.read('a'));
-    assert.equal(await f.observer.readiness(f.agent, 1_060_000), null);
-    const manual = await f.observer.prepare(f.agent, false, 1_030_000);
-    assert.equal(manual.preparedAt, 1_000_000);
-    f.ledger.updatedAt = 1_010_000; await f.save();
-    assert(await f.observer.read('a'), 'the tolerance is inclusive');
-    f.ledger.updatedAt = 1_010_001; await f.save();
-    assert.equal(await f.observer.read('a'), null);
-  } finally { await f.close(); }
+    f.ledger.pendingInputs = 1; await f.save();
+    await assert.rejects(f.observer.prepare(f.agent, false, 1_030_000), /still working/);
+  }
+  await writeFile(manifestPath, JSON.stringify({ ...f.manifest, build: 'unknown-build' }));
+  assert.equal(await f.observer.read('a'), null);
+});
+
+test('observer rejects mismatched sessions, busy native work, default TTL fallback and changed generations', async (t) => {
+  const f = await fixture();
+  t.after(() => f.close());
+  assert.match((await f.observer.readiness({ ...f.agent, sessionId: 'other' }))!.detail, /unavailable/);
+  f.ledger.activeTurns = ['background']; await f.save();
+  await assert.rejects(f.observer.prepare(f.agent, true, 1_030_000), /still working/);
+  f.ledger.activeTurns = []; f.ledger.transcriptPath = '/missing-transcript'; await f.save();
+  assert.equal(await f.observer.readiness(f.agent, 1_000_000 + 55 * 60_000), null);
+  assert.equal((await f.observer.read('a'))?.ledger?.cache?.source, 'default');
+  const manual = await f.observer.prepare(f.agent, false, 1_030_000);
+  f.ledger.generation = 'reloaded'; await f.save();
+  assert.equal(await f.observer.result('a', manual), null,
+    'a generation change alone waits for a matching refusal or the observation deadline');
+  await f.observer.prepareSession(f.request, true);
+  const nextManifest = JSON.parse(await readFile(join(f.parent, 'current.json'), 'utf8'));
+  await writeFile(join(f.parent, nextManifest.launchId, 'ledger.json'),
+    JSON.stringify({ ...f.ledger, launchId: nextManifest.launchId }));
+  assert.equal((await f.observer.result('a', manual))?.status, 'unknown',
+    'a different launch cannot read the old request file');
+});
+
+test('a ledger written just before a WSL clock step back stays readable; a far-future ledger does not', async (t) => {
+  const f = await fixture();
+  t.after(() => f.close());
+  // A heartbeat saved at 1_001_800, then the system clock stepped back 1.8 s.
+  f.ledger.updatedAt = 1_001_800; await f.save();
+  assert(await f.observer.read('a'));
+  assert.equal(await f.observer.readiness(f.agent, 1_060_000), null);
+  const manual = await f.observer.prepare(f.agent, false, 1_030_000);
+  assert.equal(manual.preparedAt, 1_000_000);
+  f.ledger.updatedAt = 1_010_000; await f.save();
+  assert(await f.observer.read('a'), 'the tolerance is inclusive');
+  f.ledger.updatedAt = 1_010_001; await f.save();
+  assert.equal(await f.observer.read('a'), null);
 });
 
 test('the observer and the server use the same clock-step tolerance', async () => {
@@ -150,310 +146,300 @@ test('the observer and the server use the same clock-step tolerance', async () =
   assert.equal(/const QUERY_RESTARTED_REFUSAL = '([^']+)';/.exec(source)?.[1], QUERY_RESTARTED_REFUSAL);
 });
 
-test('native receipt must match operation and revision; settling preserves subsequent manual compact', async () => {
+test('native receipt must match operation and revision; settling preserves subsequent manual compact', async (t) => {
   const f = await fixture();
-  try {
-    const operation = await f.observer.prepare(f.agent, true, 1_030_000);
-    f.ledger.compact = { id: 'foreign', revision: 1, status: 'completed' }; await f.save();
-    assert.equal(await f.observer.result('a', operation), null);
-    f.ledger.compact = { id: operation.id, revision: 1, status: 'completed' }; await f.save();
-    assert.equal((await f.observer.result('a', operation))?.status, 'completed');
-    await f.observer.cancel(operation);
-    assert.equal(JSON.parse(await readFile(join(f.directory, 'request.json'), 'utf8')).status, 'settled');
-    // Input after the command advances the ledger; the operation's own record still decides.
-    f.ledger.revision++; await f.save();
-    assert.equal((await f.observer.result('a', operation))?.status, 'completed');
-    f.ledger.compact = { id: operation.id, revision: 1, status: 'running' }; await f.save();
-    assert.equal(await f.observer.result('a', operation), null, 'still running is no answer yet');
-    f.ledger.compact = { id: operation.id, revision: 1, status: 'completed' }; f.ledger.revision--; await f.save();
-    const next = await f.observer.prepare(f.agent, true, 1_030_000);
-    await f.observer.cancel(operation);
-    assert.equal(JSON.parse(await readFile(join(f.directory, 'request.json'), 'utf8')).id, next.id);
-    // Once a durable receipt exists, release settles request.json even if later
-    // activity replaced ledger.compact.
-    await writeFile(join(f.parent, 'receipts', `${encodeURIComponent(next.id)}.json`), JSON.stringify({
-      id: next.id, launchId: next.launchId, generation: 'generation-2', sessionId: next.sessionId,
-      revision: 0, status: 'failed', reason: 'Claude query restarted before compaction ran',
-      observedAt: 1_000_050, refusal: QUERY_RESTARTED_REFUSAL,
-      prepared: { launchId: next.launchId, generation: next.generation, sessionId: next.sessionId, revision: next.revision },
-    }));
-    f.ledger.compact = null; await f.save();
-    await f.observer.release('a', next, true);
-    assert.equal(JSON.parse(await readFile(join(f.directory, 'request.json'), 'utf8')).status, 'settled');
-  } finally { await f.close(); }
+  t.after(() => f.close());
+  const operation = await f.observer.prepare(f.agent, true, 1_030_000);
+  f.ledger.compact = { id: 'foreign', revision: 1, status: 'completed' }; await f.save();
+  assert.equal(await f.observer.result('a', operation), null);
+  f.ledger.compact = { id: operation.id, revision: 1, status: 'completed' }; await f.save();
+  assert.equal((await f.observer.result('a', operation))?.status, 'completed');
+  await f.observer.cancel(operation);
+  assert.equal(JSON.parse(await readFile(join(f.directory, 'request.json'), 'utf8')).status, 'settled');
+  // Input after the command advances the ledger; the operation's own record still decides.
+  f.ledger.revision++; await f.save();
+  assert.equal((await f.observer.result('a', operation))?.status, 'completed');
+  f.ledger.compact = { id: operation.id, revision: 1, status: 'running' }; await f.save();
+  assert.equal(await f.observer.result('a', operation), null, 'still running is no answer yet');
+  f.ledger.compact = { id: operation.id, revision: 1, status: 'completed' }; f.ledger.revision--; await f.save();
+  const next = await f.observer.prepare(f.agent, true, 1_030_000);
+  await f.observer.cancel(operation);
+  assert.equal(JSON.parse(await readFile(join(f.directory, 'request.json'), 'utf8')).id, next.id);
+  // Once a durable receipt exists, release settles request.json even if later
+  // activity replaced ledger.compact.
+  await writeFile(join(f.parent, 'receipts', `${encodeURIComponent(next.id)}.json`), JSON.stringify({
+    id: next.id, launchId: next.launchId, generation: 'generation-2', sessionId: next.sessionId,
+    revision: 0, status: 'failed', reason: 'Claude query restarted before compaction ran',
+    observedAt: 1_000_050, refusal: QUERY_RESTARTED_REFUSAL,
+    prepared: { launchId: next.launchId, generation: next.generation, sessionId: next.sessionId, revision: next.revision },
+  }));
+  f.ledger.compact = null; await f.save();
+  await f.observer.release('a', next, true);
+  assert.equal(JSON.parse(await readFile(join(f.directory, 'request.json'), 'utf8')).status, 'settled');
 });
 
-test('release caught in the middle of a ledger write still retires the request', async () => {
+test('release caught in the middle of a ledger write still retires the request', async (t) => {
   const f = await fixture();
-  try {
-    const ledgerPath = join(f.directory, 'ledger.json');
-    const status = async () => JSON.parse(await readFile(join(f.directory, 'request.json'), 'utf8')).status;
-    // Without a receipt, a sent request whose ledger cannot be read is cancelled,
-    // as an unobserved send is.
-    const unrecorded = await f.observer.prepare(f.agent, true, 1_030_000);
-    await writeFile(ledgerPath, '');
-    await f.observer.cancel(unrecorded);
-    assert.equal(await status(), 'cancelled');
-    // A durable receipt alone proves Claude consumed the request.
-    await f.save();
-    const recorded = await f.observer.prepare(f.agent, true, 1_030_000);
-    await writeFile(join(f.parent, 'receipts', `${encodeURIComponent(recorded.id)}.json`), JSON.stringify({
-      id: recorded.id, launchId: recorded.launchId, generation: recorded.generation, sessionId: recorded.sessionId,
-      revision: recorded.revision, status: 'completed', reason: null, observedAt: 1_000_050,
-    }));
-    await writeFile(ledgerPath, '{"version":1,"launch');
-    await f.observer.cancel(recorded);
-    assert.equal(await status(), 'settled');
-  } finally { await f.close(); }
+  t.after(() => f.close());
+  const ledgerPath = join(f.directory, 'ledger.json');
+  const status = async () => JSON.parse(await readFile(join(f.directory, 'request.json'), 'utf8')).status;
+  // Without a receipt, a sent request whose ledger cannot be read is cancelled,
+  // as an unobserved send is.
+  const unrecorded = await f.observer.prepare(f.agent, true, 1_030_000);
+  await writeFile(ledgerPath, '');
+  await f.observer.cancel(unrecorded);
+  assert.equal(await status(), 'cancelled');
+  // A durable receipt alone proves Claude consumed the request.
+  await f.save();
+  const recorded = await f.observer.prepare(f.agent, true, 1_030_000);
+  await writeFile(join(f.parent, 'receipts', `${encodeURIComponent(recorded.id)}.json`), JSON.stringify({
+    id: recorded.id, launchId: recorded.launchId, generation: recorded.generation, sessionId: recorded.sessionId,
+    revision: recorded.revision, status: 'completed', reason: null, observedAt: 1_000_050,
+  }));
+  await writeFile(ledgerPath, '{"version":1,"launch');
+  await f.observer.cancel(recorded);
+  assert.equal(await status(), 'settled');
 });
 
-test('opening a session removes closed or long-idle launches of that conversation only', async () => {
+test('opening a session removes closed or long-idle launches of that conversation only', async (t) => {
   const f = await fixture();
-  try {
-    const day = 24 * 60 * 60_000;
-    // File times before 1970 are not applied on Windows; use a present-day clock.
-    const present = Date.now();
-    f.advance(present);
-    const ago = (ms: number) => new Date(1_000_000 + present - ms);
-    const launch = async (id: string, ledger: object, ageMs: number) => {
-      const directory = join(f.parent, id);
-      await mkdir(join(directory, 'mod'), { recursive: true });
-      await writeFile(join(directory, 'ledger.json'), JSON.stringify(ledger));
-      await utimes(join(directory, 'ledger.json'), ago(ageMs), ago(ageMs));
-    };
-    await launch('closed', { ...f.ledger, closed: true }, 0);
-    await launch('idle', { ...f.ledger }, day + 1);
-    await launch('never-started', {}, day + 1);
-    await launch('recent', { ...f.ledger }, day - 60_000);
-    await mkdir(join(f.parent, 'preparing'));
-    await mkdir(join(f.parent, 'abandoned'));
-    await utimes(join(f.parent, 'abandoned'), ago(day + 1), ago(day + 1));
-    const other = await f.observer.prepareSession({ ...f.request, agentId: 'b' }, true);
-    await f.observer.prepareSession(f.request, true);
-    const current = JSON.parse(await readFile(join(f.parent, 'current.json'), 'utf8')).launchId;
-    const remaining = (await readdir(f.parent)).filter(name => name !== 'current.json').sort();
-    assert.deepEqual(remaining, [current, f.manifest.launchId, 'preparing', 'receipts', 'recent'].sort());
-    assert(other.env.CLAUDE_CODE_PLUGIN_DIRS.includes('observers'));
-    assert.equal((await readdir(join(f.home, 'plugin-data/auto-compact-for-claude/observers'))).length, 2);
-  } finally { await f.close(); }
+  t.after(() => f.close());
+  const day = 24 * 60 * 60_000;
+  // File times before 1970 are not applied on Windows; use a present-day clock.
+  const present = Date.now();
+  f.advance(present);
+  const ago = (ms: number) => new Date(1_000_000 + present - ms);
+  const launch = async (id: string, ledger: object, ageMs: number) => {
+    const directory = join(f.parent, id);
+    await mkdir(join(directory, 'mod'), { recursive: true });
+    await writeFile(join(directory, 'ledger.json'), JSON.stringify(ledger));
+    await utimes(join(directory, 'ledger.json'), ago(ageMs), ago(ageMs));
+  };
+  await launch('closed', { ...f.ledger, closed: true }, 0);
+  await launch('idle', { ...f.ledger }, day + 1);
+  await launch('never-started', {}, day + 1);
+  await launch('recent', { ...f.ledger }, day - 60_000);
+  await mkdir(join(f.parent, 'preparing'));
+  await mkdir(join(f.parent, 'abandoned'));
+  await utimes(join(f.parent, 'abandoned'), ago(day + 1), ago(day + 1));
+  const other = await f.observer.prepareSession({ ...f.request, agentId: 'b' }, true);
+  await f.observer.prepareSession(f.request, true);
+  const current = JSON.parse(await readFile(join(f.parent, 'current.json'), 'utf8')).launchId;
+  const remaining = (await readdir(f.parent)).filter(name => name !== 'current.json').sort();
+  assert.deepEqual(remaining, [current, f.manifest.launchId, 'preparing', 'receipts', 'recent'].sort());
+  assert(other.env.CLAUDE_CODE_PLUGIN_DIRS.includes('observers'));
+  assert.equal((await readdir(join(f.home, 'plugin-data/auto-compact-for-claude/observers'))).length, 2);
 });
 
-test('durable receipts survive closed-launch pruning and require every native identity field', async () => {
+test('durable receipts survive closed-launch pruning and require every native identity field', async (t) => {
   const f = await fixture();
-  try {
-    const operation = await f.observer.prepare(f.agent, false, 1_030_000, 'caller-request');
-    assert.equal(operation.id, 'caller-request');
-    const path = join(f.parent, 'receipts', 'caller-request.json');
-    const receipt = { id: operation.id, launchId: operation.launchId, generation: operation.generation,
-      sessionId: operation.sessionId, revision: operation.revision, status: 'completed', reason: null, observedAt: 1_000_001 };
-    await writeFile(path, JSON.stringify(receipt));
-    f.ledger.closed = true; await f.save();
-    await f.observer.prepareSession(f.request, true);
-    assert.equal((await f.observer.receipt('a', operation))?.status, 'completed');
-    for (const patch of [{ id: 'foreign' }, { launchId: 'foreign' }, { generation: 'foreign' },
-      { revision: operation.revision + 1 }, { sessionId: 'foreign' }]) {
-      await writeFile(path, JSON.stringify({ ...receipt, ...patch }));
-      assert.equal(await f.observer.receipt('a', operation), null);
-    }
-    await writeFile(path, '{partial');
+  t.after(() => f.close());
+  const operation = await f.observer.prepare(f.agent, false, 1_030_000, 'caller-request');
+  assert.equal(operation.id, 'caller-request');
+  const path = join(f.parent, 'receipts', 'caller-request.json');
+  const receipt = { id: operation.id, launchId: operation.launchId, generation: operation.generation,
+    sessionId: operation.sessionId, revision: operation.revision, status: 'completed', reason: null, observedAt: 1_000_001 };
+  await writeFile(path, JSON.stringify(receipt));
+  f.ledger.closed = true; await f.save();
+  await f.observer.prepareSession(f.request, true);
+  assert.equal((await f.observer.receipt('a', operation))?.status, 'completed');
+  for (const patch of [{ id: 'foreign' }, { launchId: 'foreign' }, { generation: 'foreign' },
+    { revision: operation.revision + 1 }, { sessionId: 'foreign' }]) {
+    await writeFile(path, JSON.stringify({ ...receipt, ...patch }));
     assert.equal(await f.observer.receipt('a', operation), null);
-    await writeFile(path, JSON.stringify(receipt));
-    assert.equal((await f.observer.receipt('a', operation))?.status, 'completed');
-  } finally { await f.close(); }
+  }
+  await writeFile(path, '{partial');
+  assert.equal(await f.observer.receipt('a', operation), null);
+  await writeFile(path, JSON.stringify(receipt));
+  assert.equal((await f.observer.receipt('a', operation))?.status, 'completed');
 });
 
-test('receipt cleanup protects retained work, collects old orphans and never follows directory links', async () => {
+test('receipt cleanup protects retained work, collects old orphans and never follows directory links', async (t) => {
   const f = await fixture();
-  try {
-    const receipts = join(f.parent, 'receipts');
-    const old = { id: 'orphan', launchId: f.manifest.launchId, generation: 'generation-1', sessionId: 'native-a',
-      revision: 1, status: 'completed', reason: null, observedAt: 100 };
-    await writeFile(join(receipts, 'orphan.json'), JSON.stringify(old));
-    await writeFile(join(receipts, 'pending.json'), '{}');
-    await writeFile(join(receipts, 'partial.json'), '{');
-    await writeFile(join(receipts, 'recent.json'), JSON.stringify({ ...old, id: 'recent', observedAt: 1001 }));
-    for (const file of ['pending.json', 'partial.json']) await utimes(join(receipts, file), 0, 0);
-    const retained = [{ id: 'pending', agentId: 'a' }] as StoredOperation[];
-    await f.observer.sweepReceipts(retained, 1000);
-    assert.deepEqual((await readdir(receipts)).sort(), ['pending.json', 'recent.json']);
-    // A late save from an older observer is collected using observedAt, not its fresh mtime.
-    await writeFile(join(receipts, 'orphan.json'), JSON.stringify(old));
-    await f.observer.sweepReceipts(retained, 1000);
-    assert.deepEqual((await readdir(receipts)).sort(), ['pending.json', 'recent.json']);
-    await f.observer.removeReceipt('a', 'pending');
-    await f.observer.removeReceipt('a', 'pending');
-    await f.observer.removeReceipt('missing-agent', 'missing');
-    // Windows junctions work without the optional file-symlink privilege.
-    const external = join(f.home, 'external'); await mkdir(external);
-    await writeFile(join(external, 'valuable.json'), '{}');
-    await rm(receipts, { recursive: true });
-    await symlink(external, receipts, process.platform === 'win32' ? 'junction' : 'dir');
-    await assert.rejects(f.observer.removeReceipt('a', 'valuable'), /Unsafe/);
-    await assert.rejects(f.observer.sweepReceipts([], Infinity), /Unsafe/);
-    assert.equal(await readFile(join(external, 'valuable.json'), 'utf8'), '{}');
-  } finally { await f.close(); }
+  t.after(() => f.close());
+  const receipts = join(f.parent, 'receipts');
+  const old = { id: 'orphan', launchId: f.manifest.launchId, generation: 'generation-1', sessionId: 'native-a',
+    revision: 1, status: 'completed', reason: null, observedAt: 100 };
+  await writeFile(join(receipts, 'orphan.json'), JSON.stringify(old));
+  await writeFile(join(receipts, 'pending.json'), '{}');
+  await writeFile(join(receipts, 'partial.json'), '{');
+  await writeFile(join(receipts, 'recent.json'), JSON.stringify({ ...old, id: 'recent', observedAt: 1001 }));
+  for (const file of ['pending.json', 'partial.json']) await utimes(join(receipts, file), 0, 0);
+  const retained = [{ id: 'pending', agentId: 'a' }] as StoredOperation[];
+  await f.observer.sweepReceipts(retained, 1000);
+  assert.deepEqual((await readdir(receipts)).sort(), ['pending.json', 'recent.json']);
+  // A late save from an older observer is collected using observedAt, not its fresh mtime.
+  await writeFile(join(receipts, 'orphan.json'), JSON.stringify(old));
+  await f.observer.sweepReceipts(retained, 1000);
+  assert.deepEqual((await readdir(receipts)).sort(), ['pending.json', 'recent.json']);
+  await f.observer.removeReceipt('a', 'pending');
+  await f.observer.removeReceipt('a', 'pending');
+  await f.observer.removeReceipt('missing-agent', 'missing');
+  // Windows junctions work without the optional file-symlink privilege.
+  const external = join(f.home, 'external'); await mkdir(external);
+  await writeFile(join(external, 'valuable.json'), '{}');
+  await rm(receipts, { recursive: true });
+  await symlink(external, receipts, process.platform === 'win32' ? 'junction' : 'dir');
+  await assert.rejects(f.observer.removeReceipt('a', 'valuable'), /Unsafe/);
+  await assert.rejects(f.observer.sweepReceipts([], Infinity), /Unsafe/);
+  assert.equal(await readFile(join(external, 'valuable.json'), 'utf8'), '{}');
 });
 
-test('an observer that cannot be read is a fault, not an absent observer', async () => {
+test('an observer that cannot be read is a fault, not an absent observer', async (t) => {
   const f = await fixture();
-  try {
-    assert(await f.observer.read('a'));
-    // Half-written ledger: thrown, so dispatch retries instead of treating it as gone.
-    await writeFile(join(f.directory, 'ledger.json'), '{"version":1,');
-    await assert.rejects(f.observer.read('a'), /could not be read/);
-    await assert.rejects(f.observer.prepare(f.agent, false, Date.now() + 30_000, 'op-1'), /could not be read/);
-    assert.deepEqual(await f.observer.readiness(f.agent),
-      { reason: 'observer_unreadable', detail: 'Claude observer status unavailable; retrying' });
-    // Content that parses but is not a ledger is malformed too, even JSON null.
-    await writeFile(join(f.directory, 'ledger.json'), 'null');
-    await assert.rejects(f.observer.read('a'), /could not be read/);
-    await assert.rejects(f.observer.prepare(f.agent, false, Date.now() + 30_000, 'op-1'),
-      (error: Error) => error.constructor.name !== 'Refusal' && /could not be read/.test(error.message));
-    assert.equal((await f.observer.readiness(f.agent))?.reason, 'observer_unreadable');
-    // A genuinely missing or stale observer is absence, and a refusal at dispatch.
-    await f.save();
-    f.advance(60_001);
-    assert.equal(await f.observer.read('a'), null);
-    await assert.rejects(f.observer.prepare(f.agent, false, Date.now() + 30_000, 'op-1'),
-      (error: Error) => error.constructor.name === 'Refusal');
-    await rm(join(f.parent, 'current.json'));
-    assert.equal(await f.observer.read('a'), null);
-  } finally { await f.close(); }
+  t.after(() => f.close());
+  assert(await f.observer.read('a'));
+  // Half-written ledger: thrown, so dispatch retries instead of treating it as gone.
+  await writeFile(join(f.directory, 'ledger.json'), '{"version":1,');
+  await assert.rejects(f.observer.read('a'), /could not be read/);
+  await assert.rejects(f.observer.prepare(f.agent, false, Date.now() + 30_000, 'op-1'), /could not be read/);
+  assert.deepEqual(await f.observer.readiness(f.agent),
+    { reason: 'observer_unreadable', detail: 'Claude observer status unavailable; retrying' });
+  // Content that parses but is not a ledger is malformed too, even JSON null.
+  await writeFile(join(f.directory, 'ledger.json'), 'null');
+  await assert.rejects(f.observer.read('a'), /could not be read/);
+  await assert.rejects(f.observer.prepare(f.agent, false, Date.now() + 30_000, 'op-1'),
+    (error: Error) => error.constructor.name !== 'Refusal' && /could not be read/.test(error.message));
+  assert.equal((await f.observer.readiness(f.agent))?.reason, 'observer_unreadable');
+  // A genuinely missing or stale observer is absence, and a refusal at dispatch.
+  await f.save();
+  f.advance(60_001);
+  assert.equal(await f.observer.read('a'), null);
+  await assert.rejects(f.observer.prepare(f.agent, false, Date.now() + 30_000, 'op-1'),
+    (error: Error) => error.constructor.name === 'Refusal');
+  await rm(join(f.parent, 'current.json'));
+  assert.equal(await f.observer.read('a'), null);
 });
 
-test('every observer readiness answer carries its blocked reason code', async () => {
+test('every observer readiness answer carries its blocked reason code', async (t) => {
   const f = await fixture();
-  try {
-    const code = async (agent = f.agent, dueAt?: number) => (await f.observer.readiness(agent, dueAt))?.reason;
-    assert.equal(await f.observer.readiness(f.agent, 1_060_000), null);
-    assert.equal(await code(f.agent, 4_600_000), 'idle_delay_exceeds_cache');
-    assert.equal(await code({ ...f.agent, sessionId: 'other' }), 'observer_missing');
-    f.ledger.pendingInputs = 1; await f.save();
-    assert.equal(await code(), 'claude_working');
-    f.ledger.pendingInputs = 0; f.ledger.ordinaryEndedAt = null; f.ledger.cacheRequest = null; await f.save();
-    assert.equal(await code(), 'waiting_for_reply');
-    f.ledger.ordinaryEndedAt = 1_000_000;
-    f.ledger.cacheRequest = { startedAt: 1_000_000, model: 'claude-sonnet-4-6', policy: { ttl: null, source: 'default' } };
-    f.ledger.updatedAt = 1_000_000 + 60 * 60_000; await f.save();
-    f.advance(60 * 60_000);
-    assert.equal(await code(), 'cache_window_passed');
-    await writeFile(join(f.directory, 'ledger.json'), '{"version":1,');
-    assert.equal(await code(), 'observer_unreadable');
-    f.ledger.closed = true; await f.save();
-    assert.equal(await code(), 'observer_missing');
-  } finally { await f.close(); }
+  t.after(() => f.close());
+  const code = async (agent = f.agent, dueAt?: number) => (await f.observer.readiness(agent, dueAt))?.reason;
+  assert.equal(await f.observer.readiness(f.agent, 1_060_000), null);
+  assert.equal(await code(f.agent, 4_600_000), 'idle_delay_exceeds_cache');
+  assert.equal(await code({ ...f.agent, sessionId: 'other' }), 'observer_missing');
+  f.ledger.pendingInputs = 1; await f.save();
+  assert.equal(await code(), 'claude_working');
+  f.ledger.pendingInputs = 0; f.ledger.ordinaryEndedAt = null; f.ledger.cacheRequest = null; await f.save();
+  assert.equal(await code(), 'waiting_for_reply');
+  f.ledger.ordinaryEndedAt = 1_000_000;
+  f.ledger.cacheRequest = { startedAt: 1_000_000, model: 'claude-sonnet-4-6', policy: { ttl: null, source: 'default' } };
+  f.ledger.updatedAt = 1_000_000 + 60 * 60_000; await f.save();
+  f.advance(60 * 60_000);
+  assert.equal(await code(), 'cache_window_passed');
+  await writeFile(join(f.directory, 'ledger.json'), '{"version":1,');
+  assert.equal(await code(), 'observer_unreadable');
+  f.ledger.closed = true; await f.save();
+  assert.equal(await code(), 'observer_missing');
 });
 
-test('a placeholder ledger is a starting observer until a turn completes after the launch was prepared', async () => {
+test('a placeholder ledger is a starting observer until a turn completes after the launch was prepared', async (t) => {
   const f = await fixture();
-  try {
-    // A freshly opened session: the observer has not written its first ledger yet.
-    f.advance(5_000);
-    await f.observer.prepareSession(f.request, true);
-    const preparedAt = 1_005_000;
-    const before = { ...f.agent, revision: new Date(preparedAt - 1).toISOString() };
-    f.advance(30_000);
-    assert.equal((await f.observer.readiness(before))?.reason, 'observer_starting');
-    assert.equal((await f.observer.read('a'))?.ledger, null, 'a placeholder is neither a fault nor absence');
-    // Starting is a fault at dispatch, retried until the send deadline, never a refusal.
-    await assert.rejects(f.observer.prepare(before, false, 1_100_000),
-      (error: Error) => error.constructor.name !== 'Refusal');
-    // A turn that started after preparation and is still running proves nothing yet.
-    const running = { ...f.agent, idle: false, revision: new Date(preparedAt + 1).toISOString() };
-    assert.equal((await f.observer.readiness(running))?.reason, 'observer_starting');
-    // Once that turn has finished, an attached observer would have written.
-    const finished = { ...running, idle: true };
-    assert.equal((await f.observer.readiness(finished))?.reason, 'observer_missing');
-    await assert.rejects(f.observer.prepare(finished, false, 1_100_000),
-      (error: Error) => error.constructor.name === 'Refusal');
-    // The decision is read from disk, so a restarted plugin gives the same answers.
-    const restarted = createObserver({ home: f.home, now: () => 1_035_000 });
-    assert.equal((await restarted.readiness(before))?.reason, 'observer_starting');
-    assert.equal((await restarted.readiness(finished))?.reason, 'observer_missing');
-  } finally { await f.close(); }
+  t.after(() => f.close());
+  // A freshly opened session: the observer has not written its first ledger yet.
+  f.advance(5_000);
+  await f.observer.prepareSession(f.request, true);
+  const preparedAt = 1_005_000;
+  const before = { ...f.agent, revision: new Date(preparedAt - 1).toISOString() };
+  f.advance(30_000);
+  assert.equal((await f.observer.readiness(before))?.reason, 'observer_starting');
+  assert.equal((await f.observer.read('a'))?.ledger, null, 'a placeholder is neither a fault nor absence');
+  // Starting is a fault at dispatch, retried until the send deadline, never a refusal.
+  await assert.rejects(f.observer.prepare(before, false, 1_100_000),
+    (error: Error) => error.constructor.name !== 'Refusal');
+  // A turn that started after preparation and is still running proves nothing yet.
+  const running = { ...f.agent, idle: false, revision: new Date(preparedAt + 1).toISOString() };
+  assert.equal((await f.observer.readiness(running))?.reason, 'observer_starting');
+  // Once that turn has finished, an attached observer would have written.
+  const finished = { ...running, idle: true };
+  assert.equal((await f.observer.readiness(finished))?.reason, 'observer_missing');
+  await assert.rejects(f.observer.prepare(finished, false, 1_100_000),
+    (error: Error) => error.constructor.name === 'Refusal');
+  // The decision is read from disk, so a restarted plugin gives the same answers.
+  const restarted = createObserver({ home: f.home, now: () => 1_035_000 });
+  assert.equal((await restarted.readiness(before))?.reason, 'observer_starting');
+  assert.equal((await restarted.readiness(finished))?.reason, 'observer_missing');
 });
 
-test('a placeholder from a launch prepared before preparation times were recorded uses its file time', async () => {
+test('a placeholder from a launch prepared before preparation times were recorded uses its file time', async (t) => {
   const f = await fixture();
-  try {
-    await f.observer.prepareSession(f.request, true);
-    const manifestPath = join(f.parent, 'current.json');
-    const { launchId, build } = JSON.parse(await readFile(manifestPath, 'utf8'));
-    await writeFile(manifestPath, JSON.stringify({ launchId, build }));
-    const present = Date.now();
-    await utimes(join(f.parent, launchId, 'ledger.json'), new Date(present), new Date(present));
-    const reader = createObserver({ home: f.home, now: () => present + 1_000 });
-    assert.equal((await reader.readiness({ ...f.agent, revision: new Date(present - 1_000).toISOString() }))?.reason,
-      'observer_starting');
-    assert.equal((await reader.readiness({ ...f.agent, revision: new Date(present + 500).toISOString() }))?.reason,
-      'observer_missing');
-  } finally { await f.close(); }
+  t.after(() => f.close());
+  await f.observer.prepareSession(f.request, true);
+  const manifestPath = join(f.parent, 'current.json');
+  const { launchId, build } = JSON.parse(await readFile(manifestPath, 'utf8'));
+  await writeFile(manifestPath, JSON.stringify({ launchId, build }));
+  const present = Date.now();
+  await utimes(join(f.parent, launchId, 'ledger.json'), new Date(present), new Date(present));
+  const reader = createObserver({ home: f.home, now: () => present + 1_000 });
+  assert.equal((await reader.readiness({ ...f.agent, revision: new Date(present - 1_000).toISOString() }))?.reason,
+    'observer_starting');
+  assert.equal((await reader.readiness({ ...f.agent, revision: new Date(present + 500).toISOString() }))?.reason,
+    'observer_missing');
 });
 
-test('a confirmed query-restart refusal is accepted by both receipt and result; ambiguous or foreign records stay rejected', async () => {
+test('a confirmed query-restart refusal is accepted by both receipt and result; ambiguous or foreign records stay rejected', async (t) => {
   const f = await fixture();
-  try {
-    const operation = await f.observer.prepare(f.agent, false, 1_030_000, 'restart-op');
-    const path = join(f.parent, 'receipts', 'restart-op.json');
-    const prepared = {
-      launchId: operation.launchId, generation: operation.generation,
-      sessionId: operation.sessionId, revision: operation.revision,
-    };
-    const validRefusal = {
-      id: operation.id, launchId: operation.launchId, generation: 'generation-2',
-      sessionId: operation.sessionId, revision: 0, status: 'failed',
-      reason: 'Claude query restarted before compaction ran', observedAt: 1_000_050,
-      refusal: QUERY_RESTARTED_REFUSAL, prepared,
-    };
-    await writeFile(path, JSON.stringify(validRefusal));
-    const fromReceipt = await f.observer.receipt('a', operation);
-    assert.equal(fromReceipt?.status, 'failed');
-    assert.match(fromReceipt.detail, /query restarted/i);
-    assert.equal(fromReceipt?.observedAt, 1_000_050);
+  t.after(() => f.close());
+  const operation = await f.observer.prepare(f.agent, false, 1_030_000, 'restart-op');
+  const path = join(f.parent, 'receipts', 'restart-op.json');
+  const prepared = {
+    launchId: operation.launchId, generation: operation.generation,
+    sessionId: operation.sessionId, revision: operation.revision,
+  };
+  const validRefusal = {
+    id: operation.id, launchId: operation.launchId, generation: 'generation-2',
+    sessionId: operation.sessionId, revision: 0, status: 'failed',
+    reason: 'Claude query restarted before compaction ran', observedAt: 1_000_050,
+    refusal: QUERY_RESTARTED_REFUSAL, prepared,
+  };
+  await writeFile(path, JSON.stringify(validRefusal));
+  const fromReceipt = await f.observer.receipt('a', operation);
+  assert.equal(fromReceipt?.status, 'failed');
+  assert.match(fromReceipt.detail, /query restarted/i);
+  assert.equal(fromReceipt?.observedAt, 1_000_050);
 
-    // The same rule applies to live ledger reads when the new generation writes compact.
-    f.ledger.generation = 'generation-2';
-    f.ledger.revision = 0;
-    f.ledger.compact = {
-      id: operation.id, revision: 0, status: 'failed',
-      reason: 'Claude query restarted before compaction ran',
-      refusal: QUERY_RESTARTED_REFUSAL, prepared,
-    } as typeof f.ledger.compact;
-    await f.save();
-    const fromLedger = await f.observer.result('a', operation);
-    assert.equal(fromLedger?.status, 'failed');
-    assert.match(fromLedger.detail, /query restarted/i);
+  // The same rule applies to live ledger reads when the new generation writes compact.
+  f.ledger.generation = 'generation-2';
+  f.ledger.revision = 0;
+  f.ledger.compact = {
+    id: operation.id, revision: 0, status: 'failed',
+    reason: 'Claude query restarted before compaction ran',
+    refusal: QUERY_RESTARTED_REFUSAL, prepared,
+  } as typeof f.ledger.compact;
+  await f.save();
+  const fromLedger = await f.observer.result('a', operation);
+  assert.equal(fromLedger?.status, 'failed');
+  assert.match(fromLedger.detail, /query restarted/i);
 
-    // Reject ambiguous, unrelated, generic cancellation, or foreign-generation completion records.
-    const rejected: Array<[string, Record<string, unknown>]> = [
-      ['generic cancellation without refusal code', { refusal: undefined, prepared: undefined, reason: 'Reservation cancelled' }],
-      ['unknown refusal code', { refusal: 'other_refusal' }],
-      ['missing prepared identity', { prepared: undefined }],
-      ['mismatched operation id', { id: 'other-op' }],
-      ['mismatched receipt launchId', { launchId: 'other-launch' }],
-      ['mismatched receipt sessionId', { sessionId: 'other-session' }],
-      ['same generation is not a restart', { generation: operation.generation }],
-      ['mismatched prepared launchId', { prepared: { ...prepared, launchId: 'other-launch' } }],
-      ['mismatched prepared generation', { prepared: { ...prepared, generation: 'other-generation' } }],
-      ['mismatched prepared sessionId', { prepared: { ...prepared, sessionId: 'other-session' } }],
-      ['mismatched prepared revision', { prepared: { ...prepared, revision: operation.revision + 1 } }],
-      ['foreign-generation completion', { status: 'completed', reason: null }],
-      ['foreign-generation unknown', { status: 'unknown', reason: null }],
-    ];
-    for (const [name, patch] of rejected) {
-      const candidate = { ...validRefusal, ...patch };
-      await writeFile(path, JSON.stringify(candidate));
-      assert.equal(await f.observer.receipt('a', operation), null, `receipt must reject: ${name}`);
-      if (candidate.launchId === operation.launchId && candidate.generation !== operation.generation) {
-        f.ledger.generation = String(candidate.generation);
-        f.ledger.sessionId = String(candidate.sessionId);
-        f.ledger.compact = {
-          id: candidate.id, revision: candidate.revision, status: candidate.status,
-          reason: candidate.reason, refusal: candidate.refusal, prepared: candidate.prepared,
-        } as typeof f.ledger.compact;
-        await f.save();
-        assert.equal(await f.observer.result('a', operation), null, `result must reject: ${name}`);
-      }
+  // Reject ambiguous, unrelated, generic cancellation, or foreign-generation completion records.
+  const rejected: Array<[string, Record<string, unknown>]> = [
+    ['generic cancellation without refusal code', { refusal: undefined, prepared: undefined, reason: 'Reservation cancelled' }],
+    ['unknown refusal code', { refusal: 'other_refusal' }],
+    ['missing prepared identity', { prepared: undefined }],
+    ['mismatched operation id', { id: 'other-op' }],
+    ['mismatched receipt launchId', { launchId: 'other-launch' }],
+    ['mismatched receipt sessionId', { sessionId: 'other-session' }],
+    ['same generation is not a restart', { generation: operation.generation }],
+    ['mismatched prepared launchId', { prepared: { ...prepared, launchId: 'other-launch' } }],
+    ['mismatched prepared generation', { prepared: { ...prepared, generation: 'other-generation' } }],
+    ['mismatched prepared sessionId', { prepared: { ...prepared, sessionId: 'other-session' } }],
+    ['mismatched prepared revision', { prepared: { ...prepared, revision: operation.revision + 1 } }],
+    ['foreign-generation completion', { status: 'completed', reason: null }],
+    ['foreign-generation unknown', { status: 'unknown', reason: null }],
+  ];
+  for (const [name, patch] of rejected) {
+    const candidate = { ...validRefusal, ...patch };
+    await writeFile(path, JSON.stringify(candidate));
+    assert.equal(await f.observer.receipt('a', operation), null, `receipt must reject: ${name}`);
+    if (candidate.launchId === operation.launchId && candidate.generation !== operation.generation) {
+      f.ledger.generation = String(candidate.generation);
+      f.ledger.sessionId = String(candidate.sessionId);
+      f.ledger.compact = {
+        id: candidate.id, revision: candidate.revision, status: candidate.status,
+        reason: candidate.reason, refusal: candidate.refusal, prepared: candidate.prepared,
+      } as typeof f.ledger.compact;
+      await f.save();
+      assert.equal(await f.observer.result('a', operation), null, `result must reject: ${name}`);
     }
-  } finally { await f.close(); }
+  }
 });

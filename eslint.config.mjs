@@ -24,6 +24,10 @@ const countedWait = 'A unit test waits for a condition through a signal, not by 
 const contextMock = 'A unit test mocks through its test context (t.mock), which the runner restores even when the ' +
   'test stops at its bound and its finally never runs; a mock on the shared tracker would outlive it ' +
   '(CODING_STANDARDS.md "Tests").';
+const cleanupInFinally = 'A test stopped at the runner\'s bound never reaches its finally, so it registers the cleanup ' +
+  'of what would outlive it (a timer, process, server or temporary folder) with t.after() right after acquiring it; ' +
+  'the runner still runs those hooks. A finally that must still wait says why it is safe in a disable comment ' +
+  '(CODING_STANDARDS.md "Tests").';
 const namedTiming = 'A timer or deadline argument is a named constant with an _MS suffix and a comment ' +
   'that says why it has that value (CODING_STANDARDS.md "Named timings").';
 const timer = "/^(setTimeout|setInterval)$/";
@@ -79,6 +83,12 @@ export const projectRules = [
           selector: "ImportExpression:matches([source.value=/^(node:)?timers(\\/promises)?$/], " +
             "[source.expressions.length=0][source.quasis.0.value.cooked=/^(node:)?timers(\\/promises)?$/])",
           message: realTime,
+        },
+        {
+          // A wait inside finally: it runs only when the test body ends on its
+          // own. Releasing a held step without waiting is a test step and passes.
+          selector: "TryStatement > BlockStatement.finalizer :matches(AwaitExpression, ForOfStatement[await=true])",
+          message: cleanupInFinally,
         },
       ],
     },
