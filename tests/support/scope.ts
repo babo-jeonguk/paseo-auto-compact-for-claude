@@ -18,18 +18,27 @@ export interface CleanupScope {
   // Starts a child process the test owns: its temp directory (TMPDIR, TMP and
   // TEMP) is a folder of the test's, given as `temp`, so whatever the child
   // and its descendants create there goes when the test ends, and its whole
-  // process tree ends then too. `timeout` bounds a hung child: when it passes,
-  // the tree ends. Options are spawn()'s.
+  // process tree ends then too. `timeout` bounds a hung child: when it passes
+  // before every process holding the child's output has exited, the tree ends
+  // and `timedOut` is set. Options are spawn()'s.
   spawn(command: string, args: readonly string[], options: ChildOptions): Promise<Child>;
   // Runs a child as spawn() does and collects its output, like execFile:
-  // resolves on exit code 0, and otherwise rejects with `code`, `signal`,
-  // `stdout` and `stderr` on the error. Both carry the child's `temp`.
-  run(command: string, args: readonly string[], options: ChildOptions): Promise<Ran>;
+  // resolves on exit code 0 within the time limit, and otherwise rejects with
+  // `code`, `signal`, `timedOut`, `stdout` and `stderr` on the error. Both
+  // carry the child's `temp`.
+  run(command: string, args: readonly string[], options: Omit<ChildOptions, "stdio">): Promise<Output>;
 }
 
 export type ChildOptions = Omit<SpawnOptions, "timeout" | "detached"> & { timeout: number };
-export type Child = ChildProcess & { temp: string };
-export interface Ran { stdout: string; stderr: string; temp: string }
+export type Child = ChildProcess & { temp: string; timedOut: boolean };
+// What run() collected from a child that exited 0, and the child's temp folder.
+export interface Output { stdout: string; stderr: string; temp: string }
+
+// Removal retries, so a file a Windows process held until it was ended has
+// time to be released: up to 10 tries 20 ms apart, well past how long a killed
+// process takes to close its handles.
+const REMOVE_RETRIES = 10;
+const REMOVE_RETRY_DELAY_MS = 20;
 
 const scopes = new WeakMap<ScopeContext, CleanupScope>();
 
@@ -78,16 +87,19 @@ export function cleanupScope(t: ScopeContext): CleanupScope {
         // Its own process group on POSIX, so the group can be signalled.
         detached: process.platform !== "win32",
         env: { ...env, TMPDIR: temp, TMP: temp, TEMP: temp },
-      }), { temp });
+      }), { temp, timedOut: false });
       // Every stream closes once each process holding it has exited, and a
       // child that never started has none to close.
       const closed = new Promise<void>(resolve => {
         child.once("close", () => resolve());
         child.once("error", () => { if (child.pid === undefined) resolve(); });
       });
+      // The limit holds until every process holding the child's output has
+      // exited, not only the child: a descendant left running is the hang it
+      // bounds.
       // eslint-disable-next-line no-restricted-syntax -- the time limit a real process keeps (CODING_STANDARDS.md "Tests"); spawn's own would end only the direct child
-      const limit = setTimeout(() => endTree(child), timeout);
-      child.once("exit", () => clearTimeout(limit));
+      const limit = setTimeout(() => { child.timedOut = true; endTree(child); }, timeout);
+      void closed.then(() => clearTimeout(limit));
       defer(async () => {
         clearTimeout(limit);
         endTree(child);
@@ -107,14 +119,15 @@ export function cleanupScope(t: ScopeContext): CleanupScope {
         child.once("error", error => reject(Object.assign(error, { temp: child.temp })));
         child.once("close", (exitCode: number | null, exitSignal: NodeJS.Signals | null) => resolve([exitCode, exitSignal]));
       });
-      if (code === 0) return { stdout, stderr, temp: child.temp };
-      throw Object.assign(new Error(`Command failed: ${[command, ...args].join(" ")}\n${stderr}`),
-        { code, signal, stdout, stderr, temp: child.temp });
+      if (code === 0 && !child.timedOut) return { stdout, stderr, temp: child.temp };
+      const failure = child.timedOut ? `timed out after ${options.timeout} ms` : "failed";
+      throw Object.assign(new Error(`Command ${failure}: ${[command, ...args].join(" ")}\n${stderr}`),
+        { code, signal, timedOut: child.timedOut, stdout, stderr, temp: child.temp });
     },
     async folder(prefix) {
       const folder = await mkdtemp(join(tmpdir(), prefix));
       // Retries give a Windows handle that closes late time to go.
-      const remove = () => rm(folder, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 });
+      const remove = () => rm(folder, { recursive: true, force: true, maxRetries: REMOVE_RETRIES, retryDelay: REMOVE_RETRY_DELAY_MS });
       // A folder whose test ended while it was being created goes at once.
       if (ended) { await remove(); throw new Error("The test ended while its folder was being created"); }
       defer(remove);
@@ -138,6 +151,9 @@ function endTree(child: ChildProcess) {
       if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; // nothing left in the group
     }
   } else if (child.exitCode === null && child.signalCode === null) {
-    spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], { windowsHide: true });
+    // A tree that could not be ended is reported rather than waited on.
+    const ended = spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], { windowsHide: true, encoding: "utf8" });
+    if (ended.error) throw ended.error;
+    if (ended.status !== 0) throw new Error(`taskkill could not end process tree ${child.pid} (exit ${ended.status}): ${ended.stderr}`);
   }
 }

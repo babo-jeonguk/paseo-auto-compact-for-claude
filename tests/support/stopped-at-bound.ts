@@ -15,6 +15,10 @@ import { createStore } from "../../server/store";
 import { DEFAULT_SETTINGS } from "../../shared/settings";
 import { cleanupScope } from "./scope";
 
+// Longer than the runner's bound, so the bound, not the child's own limit,
+// is what stops the test.
+const CHILD_MS = 60_000;
+
 test("holds what a unit test acquires until the runner's bound stops it", async (t) => {
   const scope = cleanupScope(t);
   const home = await scope.folder("compact-bound-observer-");
@@ -30,7 +34,7 @@ test("holds what a unit test acquires until the runner's bound stops it", async 
   scope.defer(() => scheduler.stop());
   await scheduler.ready;
   const child = await scope.spawn(process.execPath, [fileURLToPath(new URL("./child.mjs", import.meta.url)), "tree"],
-    { timeout: 60_000 });
+    { timeout: CHILD_MS });
   const pids: string[] = [];
   for await (const line of createInterface({ input: child.stdout! })) {
     const [name, value] = line.split(" ");

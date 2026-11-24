@@ -9,17 +9,33 @@ import { fileURLToPath } from 'node:url';
 import { cleanupScope } from './support/scope.ts';
 
 // A test context as the scope sees it: `end()` runs the hooks it registered
-// the way the runner does when the test ends, one after another.
-function context() {
+// the way the runner does when the test ends, one after another, once. Given
+// the real test's context `t`, it also ends when that test does, so a check
+// that fails before calling `end()` still leaves no folder or process.
+function context(t) {
   const hooks = [];
   const notes = [];
-  return {
+  let ending;
+  const c = {
     after: hook => { hooks.push(hook); },
     diagnostic: note => { notes.push(note); },
     hooks, notes,
-    async end() { for (const hook of hooks) await hook(); },
+    end() { return ending ??= (async () => { for (const hook of hooks) await hook(); })(); },
   };
+  if (t) cleanupScope(t).defer(() => c.end());
+  return c;
 }
+
+// How long a child the tests start may take: far more than starting Node and
+// printing a line takes on a slow CI runner.
+const CHILD_MS = 15_000;
+// The limit the tree test lets pass: short, since the test waits it out.
+const HUNG_CHILD_MS = 2_000;
+// The runner's bound in the end-to-end test: long enough for the stopped test
+// to acquire everything and print its PIDs first.
+const RUNNER_BOUND_MS = 4_000;
+// The end-to-end run as a whole: a fresh Node with tsx and its own runner.
+const RUNNER_RUN_MS = 60_000;
 
 const gone = path => assert.rejects(access(path), { code: 'ENOENT' }, `${path} is left behind`);
 
@@ -72,8 +88,8 @@ test('one failing release is reported as itself', async () => {
   assert.equal(t.notes.length, 1);
 });
 
-test('a folder from the scope lives in the system temp directory until the test ends, then goes with its contents', async () => {
-  const t = context();
+test('a folder from the scope lives in the system temp directory until the test ends, then goes with its contents', async (outer) => {
+  const t = context(outer);
   const folder = await cleanupScope(t).folder('compact-scope-');
   assert.equal(dirname(folder), tmpdir());
   await mkdir(join(folder, 'nested'));
@@ -83,8 +99,8 @@ test('a folder from the scope lives in the system temp directory until the test 
   await gone(folder);
 });
 
-test('a fixture whose setup throws after creating its folder leaves nothing behind', async () => {
-  const t = context();
+test('a fixture whose setup throws after creating its folder leaves nothing behind', async (outer) => {
+  const t = context(outer);
   let created;
   async function fixture(scope) {
     created = await scope.folder('compact-scope-fixture-');
@@ -95,8 +111,8 @@ test('a fixture whose setup throws after creating its folder leaves nothing behi
   await gone(created);
 });
 
-test('what was started on a folder stops before the folder goes, so its late write cannot recreate it', async () => {
-  const t = context();
+test('what was started on a folder stops before the folder goes, so its late write cannot recreate it', async (outer) => {
+  const t = context(outer);
   const scope = cleanupScope(t);
   const folder = await scope.folder('compact-scope-writer-');
   // A writer whose stop lands one last write, as a store or gateway may.
@@ -128,7 +144,7 @@ async function running(scope, pid) {
   try { process.kill(pid, 0); } catch (error) { if (error.code === 'ESRCH') return false; throw error; }
   if (process.platform === 'win32') return true;
   try {
-    const { stdout } = await scope.run('ps', ['-o', 'stat=', '-p', String(pid)], { timeout: 15_000 });
+    const { stdout } = await scope.run('ps', ['-o', 'stat=', '-p', String(pid)], { timeout: CHILD_MS });
     return !stdout.trim().startsWith('Z');
   } catch (error) {
     if (error.code === 1) return false; // ps lists no such process
@@ -138,9 +154,9 @@ async function running(scope, pid) {
 
 test('a child and its grandchild killed at the spawn timeout leave no process, and the folder they wrote to goes', async (t) => {
   const probe = cleanupScope(t);
-  const c = context();
+  const c = context(t);
   const scope = cleanupScope(c);
-  const child = await scope.spawn(process.execPath, [program, 'tree'], { timeout: 2_000 });
+  const child = await scope.spawn(process.execPath, [program, 'tree'], { timeout: HUNG_CHILD_MS });
   const closed = once(child, 'close');
   const { folder, grandchild } = await printed(child, ['folder', 'child', 'grandchild']);
   // The child's temp directory is a folder of the test's own.
@@ -155,11 +171,22 @@ test('a child and its grandchild killed at the spawn timeout leave no process, a
   await gone(child.temp);
 });
 
+test('the time limit holds until every process holding the child\'s output has ended, not only the child', async (t) => {
+  const probe = cleanupScope(t);
+  const c = context(t);
+  const scope = cleanupScope(c);
+  const failed = await scope.run(process.execPath, [program, 'orphan'], { timeout: HUNG_CHILD_MS })
+    .then(() => assert.fail('a run stopped at its limit must fail'), error => error);
+  const grandchild = Number(failed.stdout.match(/grandchild (\d+)/)?.[1]);
+  assert.equal(failed.timedOut, true, failed.stdout);
+  assert.equal(await running(probe, grandchild), false, 'the grandchild has ended');
+});
+
 test('the end of a test ends the process tree it started before removing the folder it wrote to', async (t) => {
   const probe = cleanupScope(t);
-  const c = context();
+  const c = context(t);
   const scope = cleanupScope(c);
-  const child = await scope.spawn(process.execPath, [program, 'tree'], { timeout: 60_000 });
+  const child = await scope.spawn(process.execPath, [program, 'tree'], { timeout: CHILD_MS });
   const { folder, child: pid, grandchild } = await printed(child, ['folder', 'child', 'grandchild']);
   await c.end();
   assert.equal(await running(probe, Number(pid)), false, 'the child has ended');
@@ -168,10 +195,10 @@ test('the end of a test ends the process tree it started before removing the fol
   await gone(child.temp);
 });
 
-test('a child that already exited leaves nothing to end, and its folder still goes', async () => {
-  const c = context();
+test('a child that already exited leaves nothing to end, and its folder still goes', async (t) => {
+  const c = context(t);
   const scope = cleanupScope(c);
-  const child = await scope.spawn(process.execPath, [program, 'exit', '0'], { timeout: 15_000 });
+  const child = await scope.spawn(process.execPath, [program, 'exit', '0'], { timeout: CHILD_MS });
   const [code] = await once(child, 'close');
   assert.equal(code, 0);
   await c.end();
@@ -179,13 +206,13 @@ test('a child that already exited leaves nothing to end, and its folder still go
   await gone(child.temp);
 });
 
-test('run() returns what the child printed, and rejects with its exit code as execFile does', async () => {
-  const c = context();
+test('run() returns what the child printed, and rejects with its exit code as execFile does', async (t) => {
+  const c = context(t);
   const scope = cleanupScope(c);
-  const ran = await scope.run(process.execPath, [program, 'exit', '0'], { timeout: 15_000 });
+  const ran = await scope.run(process.execPath, [program, 'exit', '0'], { timeout: CHILD_MS });
   assert.equal(ran.stdout, 'ran\n');
   assert.equal(ran.stderr, '');
-  await assert.rejects(scope.run(process.execPath, [program, 'exit', '3'], { timeout: 15_000 }), error => {
+  await assert.rejects(scope.run(process.execPath, [program, 'exit', '3'], { timeout: CHILD_MS }), error => {
     assert.equal(error.code, 3);
     assert.equal(error.signal, null);
     assert.equal(error.stdout, 'ran\n');
@@ -195,11 +222,11 @@ test('run() returns what the child printed, and rejects with its exit code as ex
   await gone(ran.temp);
 });
 
-test('a child that cannot start fails the call and leaves no folder', async () => {
-  const c = context();
+test('a child that cannot start fails the call and leaves no folder', async (t) => {
+  const c = context(t);
   const scope = cleanupScope(c);
   let temp;
-  await assert.rejects(scope.run(join(tmpdir(), 'compact-missing-program'), [], { timeout: 15_000 }), error => {
+  await assert.rejects(scope.run(join(tmpdir(), 'compact-missing-program'), [], { timeout: CHILD_MS }), error => {
     assert.equal(error.code, 'ENOENT');
     temp = error.temp;
     return true;
@@ -216,15 +243,21 @@ test('a test stopped at the runner\'s bound releases what it holds: the run exit
   const scope = cleanupScope(t);
   const file = fileURLToPath(new URL('./support/stopped-at-bound.ts', import.meta.url));
   const failed = await scope.run(process.execPath,
-    ['--import', 'tsx', '--test', '--test-isolation=none', '--test-timeout=4000', file], {
-      cwd: fileURLToPath(new URL('..', import.meta.url)), timeout: 60_000,
+    ['--import', 'tsx', '--test', '--test-isolation=none', `--test-timeout=${RUNNER_BOUND_MS}`, file], {
+      cwd: fileURLToPath(new URL('..', import.meta.url)), timeout: RUNNER_RUN_MS,
       // tsx would otherwise keep its compile cache in the temp directory.
       env: { ...process.env, TSX_DISABLE_CACHE: '1' },
     }).then(() => assert.fail('the stopped test must fail the run'), error => error);
+  // The tree the stopped test held, ended here too if its scope failed to,
+  // before any check below can fail.
+  const [, ...pids] = failed.stdout.match(/holding (\d+) (\d+)/) ?? [];
+  const left = [];
+  for (const pid of pids.map(Number)) if (await running(scope, pid)) left.push(pid);
+  for (const pid of left) process.kill(pid, 'SIGKILL');
   assert.equal(failed.signal, null, `the run exited on its own:\n${failed.stdout}`);
   assert.equal(failed.code, 1, failed.stdout);
-  assert.match(failed.stdout, /timed out after 4000ms/);
-  const [, ...pids] = failed.stdout.match(/holding (\d+) (\d+)/) ?? assert.fail(`the test never held its tree:\n${failed.stdout}`);
-  for (const pid of pids) assert.equal(await running(scope, Number(pid)), false, `process ${pid} has ended`);
+  assert.match(failed.stdout, new RegExp(`timed out after ${RUNNER_BOUND_MS}ms`));
+  assert.equal(pids.length, 2, `the test held its tree:\n${failed.stdout}`);
+  assert.deepEqual(left, [], 'the stopped test\'s process tree has ended');
   assert.deepEqual(await readdir(failed.temp), [], 'nothing is left in the run\'s temp directory');
 });

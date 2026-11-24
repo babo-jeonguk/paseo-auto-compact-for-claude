@@ -200,6 +200,8 @@ test("a reservation whose agent later becomes hidden background is skipped inste
     settings: async () => ({ ...DEFAULT_SETTINGS }),
     now: () => time,
   });
+  // It runs on real timers, so it stops however the test ends.
+  scope.defer(() => scheduler.stop());
   await scheduler.ready;
   await scheduler.observedTurn((await host.gateway.refresh("a"))!);
   assert.equal(state.jobs[0].status, "scheduled");
@@ -209,8 +211,6 @@ test("a reservation whose agent later becomes hidden background is skipped inste
   assert.equal(host.sendCount(), 0);
   assert.equal(state.jobs[0].status, "skipped");
   assert.match(state.jobs[0].detail, /no longer eligible/);
-  scheduler.stop();
-  host.stop();
 });
 
 test("completed command ownership is released; stock gateway offers no automatic dispatch", async (t) => {

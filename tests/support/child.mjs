@@ -4,6 +4,8 @@
 //   tree         makes a folder in the system temp directory, starts a
 //                grandchild that shares its output, prints both PIDs and the
 //                folder, and runs until it is killed
+//   orphan       starts a grandchild that shares its output, prints both PIDs
+//                and exits 0, leaving the grandchild holding the output open
 //   exit <code>  prints `ran` and exits with that code
 import { spawn } from 'node:child_process';
 import { mkdtemp } from 'node:fs/promises';
@@ -25,6 +27,10 @@ if (mode === 'exit') {
   spawn(process.execPath, [fileURLToPath(import.meta.url), 'leaf'], { stdio: 'inherit', windowsHide: true });
   console.log(`child ${process.pid}`);
   stay();
+} else if (mode === 'orphan') {
+  const leaf = spawn(process.execPath, [fileURLToPath(import.meta.url), 'leaf'], { stdio: 'inherit', windowsHide: true });
+  console.log(`child ${process.pid}`);
+  leaf.once('spawn', () => process.exit(0));
 } else if (mode === 'leaf') {
   console.log(`grandchild ${process.pid}`);
   stay();
