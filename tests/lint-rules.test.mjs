@@ -101,6 +101,26 @@ test('unit tests mock through their test context, not the shared tracker', () =>
   }
 });
 
+// A test stopped at the runner's bound never reaches its finally, so cleanup
+// that waits is registered with t.after(), which the runner still runs.
+test('unit tests register cleanup that waits with t.after(), not in finally', () => {
+  for (const file of ['server/a.test.ts', 'scripts/a.test.ts', 'tests/a.test.mjs', 'tests/support/a.ts']) {
+    for (const code of [
+      'try { await run(); } finally { await rm(dir, { recursive: true, force: true }); }',
+      'try { await run(); } finally { release(); await running; }',
+      'try { await run(); } finally { if (root) await rm(root); }',
+      'try { await run(); } finally { for await (const line of lines) log(line); }',
+    ]) flags(file, code, /CODING_STANDARDS\.md "Tests"/);
+    for (const code of [
+      'try { await run(); } finally { release(); }',
+      't.after(async () => { await rm(dir, { recursive: true, force: true }); });',
+      'try { await run(); } catch { await report(); }',
+    ]) passes(file, code);
+  }
+  for (const file of ['server/a.ts', 'tests/simulation/run.mjs', 'tests/e2e/run.mjs'])
+    passes(file, 'try { await run(); } finally { await rm(dir); }');
+});
+
 test('the real-time rule leaves process suites and product code alone', () => {
   for (const file of ['tests/simulation/run.mjs', 'tests/e2e/run.mjs', 'tests/simulation/a.test.mjs'])
     passes(file, 'await new Promise(resolve => setTimeout(resolve, 50));');
