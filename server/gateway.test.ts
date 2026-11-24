@@ -917,9 +917,7 @@ test("a scan whose later listing page fails stays single-flight until reads star
     holdPage: start => { if (start === 1) throw new Error("page failed"); },
   });
   const { scheduler } = directoryScheduler(dir.host);
-  // a's held read runs under the gateway's real per-read bound, so a test that
-  // stops before releasing it would keep that timer running.
-  t.after(() => { releaseA(); scheduler.stop(); dir.host.stop(); });
+  t.after(() => { scheduler.stop(); dir.host.stop(); });
   await scheduler.ready;
   await assert.rejects(scheduler.observe({ kind: "full" }), /page failed/);
   const next = scheduler.observe({ kind: "agent", agentId: "b" });
