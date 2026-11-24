@@ -283,5 +283,8 @@ export function createOperationWorker(options: {
     stopped = true;
     for (const timer of retries.values()) timers.clearTimeout(timer);
     retries.clear();
-  } };
+  },
+  // Resolves once the runs in flight now have ended, including those a stopped
+  // worker is still finishing, so a caller can see what they left behind.
+  idle: () => Promise.all([...active.values()]).then(() => {}) };
 }

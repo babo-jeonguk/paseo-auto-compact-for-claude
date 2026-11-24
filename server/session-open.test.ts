@@ -76,13 +76,22 @@ test("turn-ended hooks use native activity without reading the deprecated timeli
     turnId: "ordinary-1",
     outcome: { kind: "completed" },
   };
+  let timelineRead = false;
   Object.defineProperty(event, "timeline", {
-    get() { throw new Error("turn_ended.timeline must not be read"); },
+    get() { timelineRead = true; throw new Error("turn_ended.timeline must not be read"); },
   });
+  // The hook passes only the conversation's ID on to an observation, which
+  // reads the host; by then the event is no longer in reach.
+  let observed!: () => void;
+  const observing = new Promise<void>(resolve => { observed = resolve; });
   const paseo = {
     config: { get: async () => ({ config: { providers: {} } }) },
-    agents: { list: async () => ({ entries: [], pageInfo: { hasMore: false } }) },
+    agents: {
+      list: async () => ({ entries: [], pageInfo: { hasMore: false } }),
+      ref: () => ({ refresh: async () => { observed(); return null; } }),
+    },
   };
   assert.doesNotThrow(() => ended!(event, { paseo }));
-  await new Promise(resolve => setImmediate(resolve));
+  await observing;
+  assert.equal(timelineRead, false, "turn_ended.timeline must not be read");
 });

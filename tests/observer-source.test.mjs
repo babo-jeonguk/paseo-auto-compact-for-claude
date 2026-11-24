@@ -1,13 +1,21 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { registerObserver } from '../server/observer-source.mjs';
+import { drainer } from './support/drained.ts';
 
 function fixture(env = {}, settings = {}) {
-  let time = 1_000_000, contextTokens = 100_000, usageGate = null, afterUsage = null, clockGate = null, usageFailures = 0;
+  let time = 1_000_000, contextTokens = 100_000, usageGate = null, clockGate = null, usageFailures = 0;
   const hooks = new Map(), files = new Map();
   const timers = new Set();
+  // Context readings waiting at the gate `holdUsage` set.
+  const waiting = new Set();
+  let gateReached = null;
+  // Resolves once nothing is left to run but what the test holds: the readings
+  // the observer started have returned, unless held, and what it saved on them
+  // is written.
+  const drained = drainer();
   const configuration = { launchId: 'launch-1', ledger: '/ledger', request: '/request', receipts: '/receipts' };
-  // A held clock read blocks only the first read after a context reading.
+  // A held clock read blocks only the next clock read.
   const $ = { clock: { now: async () => { if (clockGate) { const gate = clockGate; clockGate = null; await gate(); } return time; }, every: (_ms, fn) => {
       const timer = { fn, cancel() { timers.delete(timer); } };
       timer.ms = _ms; timers.add(timer); return timer;
@@ -15,19 +23,24 @@ function fixture(env = {}, settings = {}) {
     fs: { write: async (p, v) => files.set(p, v), read: async p => files.get(p) ?? '{}' },
     session: { id: async () => 'native-1',
       // A held reading resolves to the context as it is when released.
-      usage: async () => { await usageGate;
-        if (usageFailures > 0) { usageFailures--; throw new Error('usage unavailable'); } if (afterUsage) { clockGate = afterUsage; afterUsage = null; }
-        return { context: { window: 1_000_000, ...(contextTokens === undefined ? {} : { tokens: contextTokens }) } }; } },
+      usage: () => {
+        const gate = usageGate;
+        const reading = (async () => { await gate;
+          if (usageFailures > 0) { usageFailures--; throw new Error('usage unavailable'); }
+          return { context: { window: 1_000_000, ...(contextTokens === undefined ? {} : { tokens: contextTokens }) } }; })();
+        if (gate) { waiting.add(reading); gateReached?.(); }
+        return reading;
+      } },
     env: { get: async name => env[name] },
     settings: { read: async () => settings } };
   registerObserver((name, ...rest) => { hooks.set(name, rest.at(-1)); return { catch() {} }; }, configuration);
   const event = (name, input = {}, next = async () => ({})) => hooks.get(name)($, input, next);
-  // Runs the timers due after `ms` (only those with interval `only`, if given), then lets
-  // readings they started settle, as the next event-loop turn would.
+  // Runs the timers due after `ms` (only those with interval `only`, if given),
+  // then waits until what they started has ended, unless held.
   const tick = async (ms = 500, only) => {
     time += ms;
     for (const timer of [...timers]) if (only === undefined || timer.ms === only) await timer.fn();
-    await new Promise(resolve => setImmediate(resolve));
+    await drained();
   };
   const ledger = () => JSON.parse(files.get('/ledger'));
   const request = (overrides = {}) => {
@@ -38,14 +51,17 @@ function fixture(env = {}, settings = {}) {
       preparedAt: time, expiresAt: time + 30_000, ...overrides }));
   };
   const usage = { input_tokens: 100, cache_read_input_tokens: 100, cache_creation_input_tokens: 0 };
-  const step = async (turnId = 'user-1') => {
-    const generator = hooks.get('turn.step')($, { turnId }, async function* () { return { usage }; });
+  // `requested` is called when the step's model request starts.
+  const step = async (turnId = 'user-1', requested = () => {}) => {
+    const generator = hooks.get('turn.step')($, { turnId }, async function* () { requested(); return { usage }; });
     while (!(await generator.next()).done) { /* drain the step */ }
   };
   // Paseo's /compact runs as a command around Claude's compaction and hooks.
   const compact = (inner = async () => {}) => event('command.run', { command: 'compact', args: '' },
     async () => { await inner(); return {}; });
-  return { event, step, ledger, request, files, compact, tick,
+  return { event, step, ledger, request, files, compact, tick, drained,
+    // Resolves once a reading waits at the gate `holdUsage` set.
+    readingHeld: () => new Promise(resolve => { if (waiting.size) resolve(); else gateReached = resolve; }),
     timers: () => timers.size,
     intervals: () => [...timers].map(timer => timer.ms),
     failUsage(count = 1) { usageFailures = count; },
@@ -58,14 +74,7 @@ function fixture(env = {}, settings = {}) {
       clockGate = () => { reached(); return held; };
       return { release, reached: arrival };
     },
-    holdClockAfterUsage() {
-      let release, reached;
-      const held = new Promise(resolve => { release = resolve; });
-      const arrival = new Promise(resolve => { reached = resolve; });
-      afterUsage = () => { reached(); return held; };
-      return { release, reached: arrival };
-    },
-    holdUsage() { let release; usageGate = new Promise(resolve => { release = () => { usageGate = null; resolve(); }; }); return release; },
+    holdUsage() { let release; usageGate = new Promise(resolve => { release = () => { usageGate = null; waiting.clear(); resolve(); }; }); return release; },
     async start() { await event('session.start'); },
     async ordinary(reported = usage, responseDelay = 0) {
       await event('prompt.submit', { text: 'ordinary input' });
@@ -441,12 +450,14 @@ test('with classic hooks skipped, a reading that ends after the operation was su
   ]) {
     const f = fixture(); await f.start(); await f.ordinary(); f.request();
     await f.compact();
+    await f.drained(); // the reading started as the command returned has ended
     const release = f.holdUsage();
-    const reading = f.tick();
+    await f.tick();
+    await f.readingHeld();
     await supersede(f);
     f.context(undefined);
     release();
-    await reading;
+    await f.drained();
     assert.equal(f.ledger().compact.status, 'unknown', name);
   }
 });
@@ -454,32 +465,35 @@ test('with classic hooks skipped, a reading that ends after the operation was su
 test('with classic hooks skipped, a reading in flight never rewrites a result already recorded', async () => {
   const f = fixture(); await f.start(); await f.ordinary(); f.request();
   await f.compact();
-  for (let i = 0; i < 19; i++) await f.tick();
+  for (let i = 0; i < 18; i++) await f.tick();
   assert.equal(f.ledger().compact.status, 'running');
   await f.event('turn.start', { text: 'steered input', turnId: 'user-2' });
-  // The last reading of the 10-second window is held right after it reads the context,
-  // while the steered input's model request starts and records its own result.
-  const { release, reached } = f.holdClockAfterUsage();
-  const reading = f.tick();
-  await reached;
+  // A reading of the window is held while the steered input's model request
+  // starts and records its own result, and then reports a reset.
+  const release = f.holdUsage();
+  await f.tick();
+  await f.readingHeld();
   await f.step('user-2');
   const recorded = f.ledger().compact.status;
   assert.notEqual(recorded, 'running');
+  f.context(undefined);
   release();
-  await reading;
+  await f.drained();
   assert.equal(f.ledger().compact.status, recorded, 'a terminal result is never rewritten');
 });
 
 test('with classic hooks skipped, a reading that ends after the operation was replaced records nothing for it', async () => {
   const f = fixture(); await f.start(); await f.ordinary(); f.request();
   await f.compact();
+  await f.drained(); // the reading started as the command returned has ended
   const release = f.holdUsage();
-  const reading = f.tick();
+  await f.tick();
+  await f.readingHeld();
   // Claude's own automatic compaction takes the observer's current operation.
   await f.event('classic.PreCompact', { trigger: 'auto' });
   f.context(undefined);
   release();
-  await reading;
+  await f.drained();
   assert.equal(f.files.get('/receipts/operation-1.json'), undefined, 'no receipt for the replaced operation');
   assert.deepEqual({ id: f.ledger().compact.id, status: f.ledger().compact.status }, { id: null, status: 'running' });
 });
@@ -511,14 +525,14 @@ test('with classic hooks skipped, a context reading that never settles holds nei
   let release;
   const returned = f.compact(async () => { release = f.holdUsage(); });
   await returned; // the command returns while the reading stays pending
-  for (let i = 0; i < 19; i++) void f.tick(); // each tick's reading stays pending
+  // Each tick ends although the reading it found still runs.
+  for (let i = 0; i < 19; i++) await f.tick();
   assert.equal(f.ledger().compact.status, 'running');
-  void f.tick();
-  await new Promise(resolve => setImmediate(resolve));
+  await f.tick();
   assert.equal(f.ledger().compact.status, 'failed', 'no reset seen within 10 seconds');
   f.context(undefined);
   release();
-  await new Promise(resolve => setImmediate(resolve));
+  await f.drained();
   assert.equal(f.ledger().compact.status, 'failed', 'a late reading cannot change it');
 });
 
@@ -548,8 +562,10 @@ test('with classic hooks skipped, a model request while the limit reads the cloc
   const { release, reached } = f.holdNextClock();
   const limit = f.tick(500, 500);
   await reached;
-  const stepping = f.step('user-2');
-  await new Promise(resolve => setImmediate(resolve));
+  let requested;
+  const requesting = new Promise(resolve => { requested = resolve; });
+  const stepping = f.step('user-2', requested);
+  await requesting;
   release();
   await limit; await stepping;
   assert.equal(f.ledger().compact.status, 'unknown', 'the limit never rewrites a recorded result');

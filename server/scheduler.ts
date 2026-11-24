@@ -582,6 +582,7 @@ export function createScheduler(options: {
   return {
     ready,
     reconcile: worker.reconcile,
+    idle: worker.idle,
     stop() {
       stopped = true;
       if (hostTimer !== undefined) { timers.clearTimeout(hostTimer); hostTimer = undefined; }

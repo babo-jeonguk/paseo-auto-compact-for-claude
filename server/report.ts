@@ -1,4 +1,4 @@
-import { DeadlineExceeded } from "./deadline";
+import { DeadlineExceeded, systemTimers, type Timers } from "./deadline";
 
 // The host not answering: a read that timed out, or Paseo's client closing.
 // Work that meets it is retried from durable state, so it is a condition.
@@ -14,15 +14,15 @@ export const REPORT_GRACE_MS = 30_000;
 // arrives, nothing yet tells it apart from an outage; cleanup following it
 // does. So the host being unavailable is reported only if the plugin is still
 // running a grace period later. Any other error is reported at once.
-export function createReporter(log: (message: string) => void, graceMs = REPORT_GRACE_MS) {
-  const waiting = new Set<ReturnType<typeof setTimeout>>();
+export function createReporter(log: (message: string) => void, graceMs = REPORT_GRACE_MS,
+  timers: Timers = systemTimers) {
+  const waiting = new Set<unknown>();
   let disposed = false;
   return {
     report(error: unknown) {
       if (disposed) return;
       if (!hostUnavailable(error)) return log(String(error));
-      const timer = setTimeout(() => { waiting.delete(timer); log(String(error)); }, graceMs);
-      timer.unref?.();
+      const timer = timers.setTimeout(() => { waiting.delete(timer); log(String(error)); }, graceMs);
       waiting.add(timer);
     },
     // A failing step of cleanup itself, which can settle after dispose. The
@@ -32,7 +32,7 @@ export function createReporter(log: (message: string) => void, graceMs = REPORT_
     },
     dispose() {
       disposed = true;
-      for (const timer of waiting) clearTimeout(timer);
+      for (const timer of waiting) timers.clearTimeout(timer);
       waiting.clear();
     },
   };
