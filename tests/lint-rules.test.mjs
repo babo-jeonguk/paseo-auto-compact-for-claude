@@ -48,19 +48,32 @@ test('unit tests start no real timer with a delay', () => {
       "import * as timers from 'node:timers';",
     ]) flags(file, code, /CODING_STANDARDS\.md "Tests"/);
     for (const code of [
-      'await new Promise(resolve => setImmediate(resolve));',
-      'setTimeout(resolve, 0);',
-      'setTimeout(resolve);',
       'clock.setTimeout(fire, 5_000);',
       't.mock.timers.tick(5_000);',
-      "import { setImmediate } from 'node:timers/promises';",
-      "import { setImmediate } from 'node:timers';",
       // A key built at run time is left to review: lint cannot tell what it names.
       'globalThis[`setTimeout${suffix}`](fire, 50);',
       "const setTimeout = 'setImmediate'; globalThis[setTimeout](fire, 50);",
-      "import { 'setImmediate' as immediate } from 'node:timers/promises';",
     ]) passes(file, code);
   }
+});
+
+// A turn is not the end of the work under test; only the support helper that
+// checks nothing real is pending after its turn may wait for one.
+test('unit tests do not wait for an event-loop turn outside the drained() helper', () => {
+  const turns = [
+    'await new Promise(resolve => setImmediate(resolve));',
+    'setImmediate(fire);',
+    'globalThis.setImmediate(fire);',
+    'setTimeout(resolve, 0);',
+    'setTimeout(resolve);',
+    "import { setImmediate } from 'node:timers/promises';",
+    "import { setImmediate } from 'node:timers';",
+    "import { 'setImmediate' as immediate } from 'node:timers/promises';",
+  ];
+  for (const file of ['server/a.test.ts', 'scripts/a.test.ts', 'tests/a.test.mjs'])
+    for (const code of turns) flags(file, code, /CODING_STANDARDS\.md "Tests"/);
+  for (const code of turns) passes('tests/support/a.ts', code);
+  for (const code of ['await drained();', 'await f.timers.tick(5_000);']) passes('server/a.test.ts', code);
 });
 
 // A loop that waits for a condition but gives up after a number of turns
@@ -71,7 +84,6 @@ test('unit tests do not wait for a condition by counting turns', () => {
       'for (let i = 0; i < 100 && !done(); i++) await settle();',
       'for (let i = 0; i < 100 && (await read()) !== "done"; i++) await settle();',
       'async function wait() { for (let i = 0; i < 100; i++) { if (done()) return; await settle(); } }',
-      'for (let i = 0; i < 100; i++) { if (done()) break; await new Promise(resolve => setImmediate(resolve)); }',
     ]) flags(file, code, /CODING_STANDARDS\.md "Tests"/);
     for (const code of [
       'for (let i = 0; i < 19; i++) await f.tick();',
@@ -121,14 +133,64 @@ test('unit tests register cleanup that waits with t.after(), not in finally', ()
     passes(file, 'try { await run(); } finally { await rm(dir); }');
 });
 
-test('the real-time rule leaves process suites and product code alone', () => {
-  for (const file of ['tests/simulation/run.mjs', 'tests/e2e/run.mjs', 'tests/simulation/a.test.mjs'])
+test('the unit-test real-time rule leaves process suites and product code alone', () => {
+  for (const file of ['tests/simulation/run.mjs', 'tests/e2e/run.mjs', 'tests/simulation/a.test.mjs']) {
     passes(file, 'await new Promise(resolve => setTimeout(resolve, 50));');
-  passes('server/scheduler.ts', 'setTimeout(fire, delay);');
+    passes(file, 'await new Promise(resolve => setImmediate(resolve));');
+  }
+  for (const file of ['index.server.ts', 'client/a.tsx', 'scripts/a.ts']) {
+    passes(file, 'setTimeout(fire, delay);');
+    passes(file, 'setImmediate(fire);');
+  }
+});
+
+// Server code reaches real time only through the injected timers, so a unit
+// test drives every wait it makes.
+test('server code waits on time only through injected timers', () => {
+  for (const file of ['server/a.ts', 'shared/a.ts', 'server/a.mjs']) {
+    for (const code of [
+      'setTimeout(fire, POLL_MS);',
+      'setInterval(tick, TICK_MS);',
+      'setImmediate(fire);',
+      'setTimeout(fire);',
+      'globalThis.setTimeout(fire, POLL_MS);',
+      "globalThis['setImmediate'](fire);",
+      'AbortSignal.timeout(REGISTRY_TIMEOUT_MS);',
+      "import { setTimeout } from 'node:timers/promises';",
+      "import { setImmediate } from 'node:timers';",
+      "await import('node:timers');",
+    ]) flags(file, code, /CODING_STANDARDS\.md "Decisions apart from effects"/);
+    for (const code of [
+      'timers.setTimeout(fire, POLL_MS);',
+      'clock.setTimeout(fire, Math.max(0, at - now));',
+      'timers.clearTimeout(handle);',
+      'clearTimeout(handle);',
+      'bounded(work, INSPECT_TIMEOUT_MS, timers);',
+    ]) passes(file, code);
+  }
 });
 
 test('product timer and deadline arguments are named constants', () => {
-  for (const file of ['server/a.ts', 'client/a.tsx', 'shared/a.ts', 'index.server.ts', 'scripts/a.ts', 'server/a.mjs']) {
+  // Server code calls no global timer at all, so its timers are injected ones.
+  for (const file of ['server/a.ts', 'shared/a.ts', 'server/a.mjs']) {
+    for (const code of [
+      'timers.setTimeout(fire, 50);',
+      'timers.setTimeout(fire, options.pollMs ?? 50);',
+      'clock.setTimeout(fire, 1000);',
+      'bounded(work, 5_000);',
+      'await $.clock.every(5_000, save);',
+      'clock.every(500, read);',
+    ]) flags(file, code, /CODING_STANDARDS\.md "Named timings"/);
+    for (const code of [
+      'timers.setTimeout(fire, POLL_MS);',
+      'timers.setTimeout(fire, 0);',
+      'bounded(work, Math.min(INSPECT_TIMEOUT_MS, deadline - now));',
+      'clock.every(HEARTBEAT_MS, save);',
+      'items.every(item => item.size > 1000);',
+      'items.every(hasAtLeast(1000));',
+    ]) passes(file, code);
+  }
+  for (const file of ['client/a.tsx', 'index.server.ts', 'scripts/a.ts']) {
     for (const code of [
       'setTimeout(fire, 50);',
       'setInterval(tick, 10_000);',

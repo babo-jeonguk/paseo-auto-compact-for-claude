@@ -42,6 +42,7 @@ export type Timers = {
 // The system default unrefs its timers so a pending wake-up never keeps the process alive.
 export const systemTimers: Timers = {
   setTimeout(callback, milliseconds) {
+    // eslint-disable-next-line no-restricted-syntax -- the one real implementation of Timers
     const timer = setTimeout(callback, milliseconds);
     timer.unref?.();
     return timer;

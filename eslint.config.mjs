@@ -12,8 +12,12 @@ const typed = ["**/*.ts", "**/*.tsx"];
 // drive real processes and keep real time. Test support modules are held to
 // the unit-test rule too.
 const unitTests = ["server/*.test.ts", "scripts/*.test.ts", "tests/*.test.mjs", "tests/support/**"];
+const testSupport = ["tests/support/**"];
 const tests = ["**/*.test.ts", "**/*.test.mjs", "tests/**"];
 const product = ["index.server.ts", "index.client.tsx", "client/**", "server/**", "shared/**", "scripts/**"];
+// Code the unit tests run with fakes. The plugin's entry point, the client and
+// the scripts run on real time.
+const server = ["server/**", "shared/**"];
 
 const realTime = 'Unit tests start no real timer with a delay. Advance the injected clock or the test\'s mock timers ' +
   'and wait on observable state such as a fake being called; the test runner bounds every test, so a wait needs ' +
@@ -28,9 +32,27 @@ const cleanupInFinally = 'A test stopped at the runner\'s bound never reaches it
   'of what would outlive it (a timer, process, server or temporary folder) with t.after() right after acquiring it; ' +
   'the runner still runs those hooks. A finally that must still wait says why it is safe in a disable comment ' +
   '(CODING_STANDARDS.md "Tests").';
+const turnWait = 'A unit test does not wait for an event-loop turn: work outside its fakes can still act after one. ' +
+  'Wait on the promise of the call, on a fake\'s change, or with drained() from tests/support/drained.ts, which ' +
+  'resolves once nothing is left to run and fails if real work is still pending (CODING_STANDARDS.md "Tests").';
+const serverRealTime = 'Server code waits on time only through the injected timers (Timers), whose one real ' +
+  'implementation is systemTimers in server/deadline.ts, so a unit test drives every wait and can tell when ' +
+  'processing has ended (CODING_STANDARDS.md "Decisions apart from effects").';
 const namedTiming = 'A timer or deadline argument is a named constant with an _MS suffix and a comment ' +
   'that says why it has that value (CODING_STANDARDS.md "Named timings").';
 const timer = "/^(setTimeout|setInterval)$/";
+// A call of one of `names` by name or through the global object with a written
+// key. One reached through another name or a key built at run time is left to
+// review: a selector cannot tell what it names.
+const globalCall = (names) => `CallExpression:matches([callee.name=${names}], ` +
+  `[callee.object.name=/^global(This)?$/]:matches([callee.computed=false][callee.property.name=${names}], ` +
+  `[callee.property.value=${names}], ` +
+  `[callee.property.expressions.length=0][callee.property.quasis.0.value.cooked=${names}]))`;
+const timersModule = "/^(node:)?timers(\\/promises)?$/";
+// The same modules loaded at run time, named by a string or a template without
+// interpolation.
+const timersImport = `ImportExpression:matches([source.value=${timersModule}], ` +
+  `[source.expressions.length=0][source.quasis.0.value.cooked=${timersModule}])`;
 // The delay argument when a number is written into it, alone or inside an
 // expression; 0 (the next turn, or a lower bound) is not a duration. A function
 // in that position is a callback; `every` is a timer only on a clock.
@@ -38,26 +60,16 @@ const number = "Literal[raw=/^\\.?[0-9]/]:not([value=0])";
 const literal = (call, position) =>
   `${call} > :nth-child(${position}):not(:function):matches(${number}, :has(${number}))`;
 
-export const projectRules = [
-  {
-    files: unitTests,
-    rules: {
-      "no-restricted-syntax": ["error",
+// Rules for every unit test and its support modules.
+const unitTestRules = [
         {
-          // Any delay but 0 (the next turn), whatever the callback does, called
-          // by name or through the global object with a written key. A timer
-          // reached through another name or a key built at run time is left
-          // to review: a selector cannot tell what it names.
-          selector: `CallExpression:matches([callee.name=${timer}], ` +
-            `[callee.object.name=/^global(This)?$/]:matches([callee.computed=false][callee.property.name=${timer}], ` +
-            `[callee.property.value=${timer}], ` +
-            `[callee.property.expressions.length=0][callee.property.quasis.0.value.cooked=${timer}]))` +
-            "[arguments.length>1]:not([arguments.1.value=0])",
+          // Any delay but 0 (the next turn), whatever the callback does.
+          selector: `${globalCall(timer)}[arguments.length>1]:not([arguments.1.value=0])`,
           message: realTime,
         },
         {
           // Everything these modules offer but setImmediate waits in real time.
-          selector: "ImportDeclaration[source.value=/^(node:)?timers(\\/promises)?$/] > " +
+          selector: `ImportDeclaration[source.value=${timersModule}] > ` +
             ":matches(ImportSpecifier:not([imported.name='setImmediate'], [imported.value='setImmediate']), " +
             "ImportNamespaceSpecifier, ImportDefaultSpecifier)",
           message: realTime,
@@ -78,10 +90,7 @@ export const projectRules = [
           message: contextMock,
         },
         {
-          // The same modules loaded at run time, named by a string or a
-          // template without interpolation.
-          selector: "ImportExpression:matches([source.value=/^(node:)?timers(\\/promises)?$/], " +
-            "[source.expressions.length=0][source.quasis.0.value.cooked=/^(node:)?timers(\\/promises)?$/])",
+          selector: timersImport,
           message: realTime,
         },
         {
@@ -90,23 +99,58 @@ export const projectRules = [
           selector: "TryStatement > BlockStatement.finalizer :matches(AwaitExpression, ForOfStatement[await=true])",
           message: cleanupInFinally,
         },
-      ],
-    },
+];
+// A wait for one event-loop turn: an immediate, a timer with no delay, or the
+// promise forms of either. Only tests/support/drained.ts, which checks that
+// nothing real is pending after its turn, may take one.
+const turnWaitRules = [
+  {
+    selector: `${globalCall("/^setImmediate$/")}, ` +
+      `${globalCall("/^setTimeout$/")}:matches([arguments.length<2], [arguments.1.value=0]), ` +
+      `ImportDeclaration[source.value=${timersModule}] > ImportSpecifier:matches([imported.name='setImmediate'], ` +
+      "[imported.value='setImmediate'])",
+    message: turnWait,
+  },
+];
+const namedTimingRules = [{
+  selector: [
+    literal(`CallExpression:matches([callee.name=${timer}], [callee.property.name=${timer}], [callee.name='bounded'])`, 2),
+    literal("CallExpression[callee.property.name='every']:matches([callee.object.name='clock'], " +
+      "[callee.object.property.name='clock'])", 1),
+    literal("CallExpression[callee.object.name='AbortSignal'][callee.property.name='timeout']", 1),
+  ].join(", "),
+  message: namedTiming,
+}];
+// Real time reached in server code: a global timer, a timeout signal, or the
+// timer modules.
+const serverRealTimeRules = [{
+  selector: `${globalCall("/^(setTimeout|setInterval|setImmediate)$/")}, ` +
+    "CallExpression[callee.object.name='AbortSignal'][callee.property.name='timeout'], " +
+    `ImportDeclaration[source.value=${timersModule}], ${timersImport}`,
+  message: serverRealTime,
+}];
+
+// A later entry's no-restricted-syntax replaces an earlier one's for the same
+// file, so each entry lists every selector that applies to its files.
+export const projectRules = [
+  {
+    files: unitTests,
+    ignores: testSupport,
+    rules: { "no-restricted-syntax": ["error", ...unitTestRules, ...turnWaitRules] },
+  },
+  {
+    files: testSupport,
+    rules: { "no-restricted-syntax": ["error", ...unitTestRules] },
   },
   {
     files: product,
+    ignores: [...tests, ...server],
+    rules: { "no-restricted-syntax": ["error", ...namedTimingRules] },
+  },
+  {
+    files: server,
     ignores: tests,
-    rules: {
-      "no-restricted-syntax": ["error", {
-        selector: [
-          literal(`CallExpression:matches([callee.name=${timer}], [callee.property.name=${timer}], [callee.name='bounded'])`, 2),
-          literal("CallExpression[callee.property.name='every']:matches([callee.object.name='clock'], " +
-            "[callee.object.property.name='clock'])", 1),
-          literal("CallExpression[callee.object.name='AbortSignal'][callee.property.name='timeout']", 1),
-        ].join(", "),
-        message: namedTiming,
-      }],
-    },
+    rules: { "no-restricted-syntax": ["error", ...namedTimingRules, ...serverRealTimeRules] },
   },
 ];
 
