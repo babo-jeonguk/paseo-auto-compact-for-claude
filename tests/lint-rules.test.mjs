@@ -205,13 +205,18 @@ test('unit tests start child processes through their cleanup scope', () => {
   ];
   for (const file of ['server/a.test.ts', 'scripts/a.test.ts', 'tests/a.test.mjs'])
     for (const code of started) flags(file, code, /CODING_STANDARDS\.md "Tests"/);
-  flags('server/a.test.ts', "import { type ChildProcess, spawn } from 'node:child_process';", /CODING_STANDARDS\.md "Tests"/);
+  for (const code of [
+    "import { type ChildProcess, spawn } from 'node:child_process';",
+    "export { type ChildProcess, spawn } from 'node:child_process';",
+  ]) flags('server/a.test.ts', code, /CODING_STANDARDS\.md "Tests"/);
   for (const code of started) passes('tests/support/a.ts', code);
   for (const file of ['tests/simulation/run.mjs', 'tests/e2e/run.mjs', 'scripts/a.mjs', 'server/a.ts'])
     passes(file, "import { spawn } from 'node:child_process';");
   for (const code of [
     "import type { ChildProcess } from 'node:child_process';",
     "import { type ChildProcess, type SpawnOptions } from 'node:child_process';",
+    "export type { ChildProcess } from 'node:child_process';",
+    "export { type ChildProcess } from 'node:child_process';",
     "await scope.run('git', ['init'], { timeout: GIT_TIMEOUT_MS });",
   ]) passes('server/a.test.ts', code);
 });

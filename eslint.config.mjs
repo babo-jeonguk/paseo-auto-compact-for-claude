@@ -61,9 +61,11 @@ const timersModule = "/^(node:)?timers(\\/promises)?$/";
 // The key of the member expression at `path` ("" for the node itself, or
 // "callee." and "object." for one below it), written as a name, a string or a
 // template without interpolation.
-const writtenKey = (name, path = "") => `:matches([${path}computed=false][${path}property.name='${name}'], ` +
-  `[${path}property.value='${name}'], ` +
-  `[${path}property.expressions.length=0][${path}property.quasis.0.value.cooked='${name}'])`;
+// `key` is an esquery value: a quoted name or a regular expression.
+const writtenKeyMatching = (key, path = "") => `:matches([${path}computed=false][${path}property.name=${key}], ` +
+  `[${path}property.value=${key}], ` +
+  `[${path}property.expressions.length=0][${path}property.quasis.0.value.cooked=${key}])`;
+const writtenKey = (name, path = "") => writtenKeyMatching(`'${name}'`, path);
 // The timer modules loaded at run time, named by a string or a template
 // without interpolation: import(), require(), or process.getBuiltinModule()
 // (also through the global object).
@@ -138,8 +140,7 @@ const unitTestRules = [
 const scopeRules = [
   {
     selector: ":matches(ImportSpecifier[imported.name=/^mkdtemp(Sync)?$/], " +
-      "MemberExpression:matches([computed=false][property.name=/^mkdtemp(Sync)?$/], [property.value=/^mkdtemp(Sync)?$/], " +
-      "[property.expressions.length=0][property.quasis.0.value.cooked=/^mkdtemp(Sync)?$/]), " +
+      `MemberExpression${writtenKeyMatching("/^mkdtemp(Sync)?$/")}, ` +
       "ObjectPattern > Property[key.name=/^mkdtemp(Sync)?$/])",
     message: temporaryFolder,
   },
@@ -152,7 +153,8 @@ const scopeRules = [
     // Types alone start nothing.
     selector: `ImportDeclaration[source.value=${childProcessModule}]:not([importKind='type'])` +
       ":has(> :matches(ImportDefaultSpecifier, ImportNamespaceSpecifier, ImportSpecifier:not([importKind='type']))), " +
-      `:matches(ExportNamedDeclaration, ExportAllDeclaration)[source.value=${childProcessModule}], ` +
+      `ExportNamedDeclaration[source.value=${childProcessModule}]:not([exportKind='type']):has(> ExportSpecifier:not([exportKind='type'])), ` +
+      `ExportAllDeclaration[source.value=${childProcessModule}]:not([exportKind='type']), ` +
       moduleLoad(childProcessModule),
     message: childProcess,
   },
