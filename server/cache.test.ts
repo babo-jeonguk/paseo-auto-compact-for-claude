@@ -31,35 +31,33 @@ test('transcript parsing excludes other sessions, sidechains, old context and ma
   assert.equal(transcriptTtl('partial row\n' + row(0, 10) + '{incomplete', 'session', request.model, now)?.ttlMinutes, 60);
 });
 
-test('missing TTL uses a disclosed one-hour default; settings and actual transcript override it without blocking 50/55m', async () => {
+test('missing TTL uses a disclosed one-hour default; settings and actual transcript override it without blocking 50/55m', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'compact-ttl-'));
-  try {
-    const path = join(dir, 'session.jsonl'), read = createCacheReader();
-    const fallback = await read(request, path, 'session', now, now);
-    assert.equal(fallback?.source, 'default'); assert.equal(fallback?.ttlMinutes, 60);
-    for (const delay of [50, 55]) assert(fallback.deadline > now + delay * 60_000 + 30_000);
-    await writeFile(path, row(0, 10));
-    const observed = await read(request, path, 'session', now, now);
-    assert.equal(observed?.source, 'transcript'); assert.equal(observed?.ttlMinutes, 60);
-    // Re-read changed metadata even after a previous one-hour observation.
-    // Same-size rewrites can share an mtime tick on Windows.
-    await writeFile(path, row(12, 0));
-    await utimes(path, new Date(now + 1_000), new Date(now + 1_000));
-    assert.equal((await read(request, path, 'session', now, now))?.ttlMinutes, 5);
-    assert.equal((await read({ ...request, policy: { ttl: '5m', source: 'settings' } }, null, 'session', now, now))?.source, 'settings');
-  } finally { await rm(dir, { recursive: true, force: true }); }
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, 'session.jsonl'), read = createCacheReader();
+  const fallback = await read(request, path, 'session', now, now);
+  assert.equal(fallback?.source, 'default'); assert.equal(fallback?.ttlMinutes, 60);
+  for (const delay of [50, 55]) assert(fallback.deadline > now + delay * 60_000 + 30_000);
+  await writeFile(path, row(0, 10));
+  const observed = await read(request, path, 'session', now, now);
+  assert.equal(observed?.source, 'transcript'); assert.equal(observed?.ttlMinutes, 60);
+  // Re-read changed metadata even after a previous one-hour observation.
+  // Same-size rewrites can share an mtime tick on Windows.
+  await writeFile(path, row(12, 0));
+  await utimes(path, new Date(now + 1_000), new Date(now + 1_000));
+  assert.equal((await read(request, path, 'session', now, now))?.ttlMinutes, 5);
+  assert.equal((await read({ ...request, policy: { ttl: '5m', source: 'settings' } }, null, 'session', now, now))?.source, 'settings');
 });
 
-test('read-only replies refresh a recent same-model observation; explicit changed policy overrides an old write', async () => {
+test('read-only replies refresh a recent same-model observation; explicit changed policy overrides an old write', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'compact-ttl-read-'));
-  try {
-    const path = join(dir, 'session.jsonl'), read = createCacheReader();
-    await writeFile(path, row(0, 10) + row(0, 0, { timestamp: new Date(now + 60_000).toISOString() }));
-    const later = { ...request, startedAt: now + 59_000 };
-    const inherited = await read(later, path, 'session', now + 60_000, now + 60_000);
-    assert.equal(inherited?.source, 'transcript');
-    assert.equal(inherited?.deadline, later.startedAt + 3_600_000);
-    const changed = await read({ ...later, policy: { ttl: '5m', source: 'environment' } }, path, 'session', now + 60_000, now + 60_000);
-    assert.equal(changed?.source, 'environment'); assert.equal(changed?.ttlMinutes, 5);
-  } finally { await rm(dir, { recursive: true, force: true }); }
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, 'session.jsonl'), read = createCacheReader();
+  await writeFile(path, row(0, 10) + row(0, 0, { timestamp: new Date(now + 60_000).toISOString() }));
+  const later = { ...request, startedAt: now + 59_000 };
+  const inherited = await read(later, path, 'session', now + 60_000, now + 60_000);
+  assert.equal(inherited?.source, 'transcript');
+  assert.equal(inherited?.deadline, later.startedAt + 3_600_000);
+  const changed = await read({ ...later, policy: { ttl: '5m', source: 'environment' } }, path, 'session', now + 60_000, now + 60_000);
+  assert.equal(changed?.source, 'environment'); assert.equal(changed?.ttlMinutes, 5);
 });

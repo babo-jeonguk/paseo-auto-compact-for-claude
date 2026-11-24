@@ -34,44 +34,41 @@ const V102StateSchema = z.object({
   ),
 });
 
-test("file store retains off policies and processed revisions across instances", async () => {
+test("file store retains off policies and processed revisions across instances", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "compact-store-"));
-  try {
-    const path = join(root, "state.json");
-    const first = createStore(path);
-    assert.equal((await first.read()).jobs.length, 0);
-    await writeFile(path, JSON.stringify({
-      version: 1,
-      disabled: ["a"],
-      jobs: [
-        {
-          agentId: "a",
-          revision: "revision",
-          endedAt: 100,
-          attemptedAt: 200,
-          status: "completed",
-          detail: "Completed",
-        },
-        {
-          agentId: "b",
-          revision: "skipped-revision",
-          endedAt: 300,
-          status: "skipped",
-          detail: "This reservation skipped; session policy unchanged",
-          skip: { id: "skip-id", dueAt: 1000, sessionId: "native-b" },
-        },
-      ],
-    }));
-    assert.deepEqual(await createStore(path).read(), await first.read());
-    assert.match((await createStore(path).read()).jobs[0].operationId!, /^legacy-[0-9a-f]{64}$/);
-    assert.deepEqual((await createStore(path).read()).jobs[1].skip,
-      { id: "skip-id", dueAt: 1000, sessionId: "native-b" });
-    await writeFile(path, "{broken");
-    await assert.rejects(first.read(), /unreadable/);
-    assert.equal(await readFile(path, "utf8"), "{broken");
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, "state.json");
+  const first = createStore(path);
+  assert.equal((await first.read()).jobs.length, 0);
+  await writeFile(path, JSON.stringify({
+    version: 1,
+    disabled: ["a"],
+    jobs: [
+      {
+        agentId: "a",
+        revision: "revision",
+        endedAt: 100,
+        attemptedAt: 200,
+        status: "completed",
+        detail: "Completed",
+      },
+      {
+        agentId: "b",
+        revision: "skipped-revision",
+        endedAt: 300,
+        status: "skipped",
+        detail: "This reservation skipped; session policy unchanged",
+        skip: { id: "skip-id", dueAt: 1000, sessionId: "native-b" },
+      },
+    ],
+  }));
+  assert.deepEqual(await createStore(path).read(), await first.read());
+  assert.match((await createStore(path).read()).jobs[0].operationId!, /^legacy-[0-9a-f]{64}$/);
+  assert.deepEqual((await createStore(path).read()).jobs[1].skip,
+    { id: "skip-id", dueAt: 1000, sessionId: "native-b" });
+  await writeFile(path, "{broken");
+  await assert.rejects(first.read(), /unreadable/);
+  assert.equal(await readFile(path, "utf8"), "{broken");
 });
 
 test("provider inheritance follows exact Claude root, rejects substring names and cycles", () => {
@@ -87,82 +84,79 @@ test("provider inheritance follows exact Claude root, rejects substring names an
   assert.equal(claudeProvider(providers, "a"), false);
 });
 
-test("migration expires old pending work while preserving settings-independent off choices and history", async () => {
+test("migration expires old pending work while preserving settings-independent off choices and history", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "compact-store-migrate-"));
-  try {
-    const path = join(root, "state.json");
-    const store = createStore(path);
-    await writeFile(path, JSON.stringify({ version: 1, disabled: ["a"], jobs: [
-      { agentId: "a", revision: "old", endedAt: Date.now(), status: "scheduled", detail: "Old reservation" },
-      { agentId: "b", revision: "done", endedAt: 100, status: "completed", detail: "Completed" },
-      { agentId: "c", revision: "new", endedAt: Date.now(), status: "scheduled", detail: "Native reservation",
-        activityKey: "launch:generation:1", sessionId: "native" },
-    ] }));
-    const restored = await store.read();
-    assert.deepEqual(restored.disabled, ["a"]);
-    assert.equal(restored.jobs[0].status, "expired");
-    assert.equal(restored.jobs[1].status, "completed");
-    assert.equal(restored.jobs[2].status, "scheduled");
-  } finally { await rm(root, { recursive: true, force: true }); }
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, "state.json");
+  const store = createStore(path);
+  await writeFile(path, JSON.stringify({ version: 1, disabled: ["a"], jobs: [
+    { agentId: "a", revision: "old", endedAt: Date.now(), status: "scheduled", detail: "Old reservation" },
+    { agentId: "b", revision: "done", endedAt: 100, status: "completed", detail: "Completed" },
+    { agentId: "c", revision: "new", endedAt: Date.now(), status: "scheduled", detail: "Native reservation",
+      activityKey: "launch:generation:1", sessionId: "native" },
+  ] }));
+  const restored = await store.read();
+  assert.deepEqual(restored.disabled, ["a"]);
+  assert.equal(restored.jobs[0].status, "expired");
+  assert.equal(restored.jobs[1].status, "completed");
+  assert.equal(restored.jobs[2].status, "scheduled");
 });
 
-test("the state v1.0.2 really wrote migrates to legacy history and keeps every guard", async () => {
+test("the state v1.0.2 really wrote migrates to legacy history and keeps every guard", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "compact-v1.0.2-"));
-  try {
-    const path = join(root, "state.json");
-    const legacy = JSON.parse(await readFile(released, "utf8"));
-    await writeFile(path, JSON.stringify(legacy));
-    const store = createStore(path), migrated = await store.read();
-    assert.deepEqual(await store.read(), migrated, "migration IDs must be deterministic");
-    const byAgent = (id: string) => migrated.operations.find(op => op.agentId === id);
-    assert.deepEqual(migrated.operations.map(op => op.agentId).sort(), ["automatic", "failed", "interrupted", "manual"]);
-    // v1.0.2 did not record who asked; nothing pretends to know.
-    assert(migrated.operations.every(op => op.kind === "legacy" && op.result?.code === "legacy_outcome"));
-    assert.equal(byAgent("interrupted")?.state, "unknown");
-    assert.equal(byAgent("failed")?.state, "failed");
-    assert.equal(byAgent("manual")?.state, "succeeded");
-    assert.deepEqual(migrated.disabled, ["off"]);
-    const job = (id: string) => migrated.jobs.find(entry => entry.agentId === id)!;
-    assert.equal(job("reserved").status, "scheduled");
-    assert.deepEqual(job("skipped").skip, legacy.jobs.find((entry: { agentId: string }) => entry.agentId === "skipped").skip);
-    await store.write(syncJobs(migrated));
-    const written = JSON.parse(await readFile(path, "utf8"));
-    assert.equal(written.version, 1, "additive fields keep the version v1.0.2 reads");
-    assert.deepEqual(await createStore(path).read(), migrated);
-    await assert.rejects(store.write({ ...migrated, operations: [migrated.operations[0], migrated.operations[0]] }));
-    assert.deepEqual(await createStore(path).read(), migrated, "invalid write must not replace saved state");
-    await writeFile(path, JSON.stringify({ ...written, version: 2 }));
-    await assert.rejects(store.read(), /unreadable/);
-  } finally { await rm(root, { recursive: true, force: true }); }
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, "state.json");
+  const legacy = JSON.parse(await readFile(released, "utf8"));
+  await writeFile(path, JSON.stringify(legacy));
+  const store = createStore(path), migrated = await store.read();
+  assert.deepEqual(await store.read(), migrated, "migration IDs must be deterministic");
+  const byAgent = (id: string) => migrated.operations.find(op => op.agentId === id);
+  assert.deepEqual(migrated.operations.map(op => op.agentId).sort(), ["automatic", "failed", "interrupted", "manual"]);
+  // v1.0.2 did not record who asked; nothing pretends to know.
+  assert(migrated.operations.every(op => op.kind === "legacy" && op.result?.code === "legacy_outcome"));
+  assert.equal(byAgent("interrupted")?.state, "unknown");
+  assert.equal(byAgent("failed")?.state, "failed");
+  assert.equal(byAgent("manual")?.state, "succeeded");
+  assert.deepEqual(migrated.disabled, ["off"]);
+  const job = (id: string) => migrated.jobs.find(entry => entry.agentId === id)!;
+  assert.equal(job("reserved").status, "scheduled");
+  assert.deepEqual(job("skipped").skip, legacy.jobs.find((entry: { agentId: string }) => entry.agentId === "skipped").skip);
+  await store.write(syncJobs(migrated));
+  const written = JSON.parse(await readFile(path, "utf8"));
+  assert.equal(written.version, 1, "additive fields keep the version v1.0.2 reads");
+  assert.deepEqual(await createStore(path).read(), migrated);
+  await assert.rejects(store.write({ ...migrated, operations: [migrated.operations[0], migrated.operations[0]] }));
+  assert.deepEqual(await createStore(path).read(), migrated, "invalid write must not replace saved state");
+  await writeFile(path, JSON.stringify({ ...written, version: 2 }));
+  await assert.rejects(store.read(), /unreadable/);
 });
 
-test("a rollback to v1.0.2 reads our state, keeps attempted activities guarded and rolls forward again", async () => {
+test("a rollback to v1.0.2 reads our state, keeps attempted activities guarded and rolls forward again", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "compact-rollback-"));
-  try {
-    const path = join(root, "state.json");
-    const target = { sessionId: "native-a", activityKey: "launch:generation:1" };
-    const operation = (id: string, state: "succeeded" | "expired" | "requested") => ({ id, agentId: id, revision: "rev", target,
-      kind: "manual" as const, state, createdAt: 50, updatedAt: 60, inputFingerprint: "f",
-      result: state === "requested" ? null : { code: state, message: state } });
-    const state = syncJobs({ version: 1, disabled: ["off"], operations: ["succeeded", "expired", "requested"]
-      .map(entry => operation(entry, entry as "succeeded")), jobs: ["succeeded", "expired", "requested"].map(id => ({
-      agentId: id, revision: "rev", endedAt: 10, status: "scheduled" as const, detail: "", operationId: id,
-      sessionId: "native-a", activityKey: "launch:generation:1" })) });
-    await createStore(path).write(state);
-    // What v1.0.2 sees: its schema accepts the file and drops what it does not know.
-    const seen = V102StateSchema.parse(JSON.parse(await readFile(path, "utf8")));
-    const job = (id: string) => seen.jobs.find(entry => entry.agentId === id)!;
-    assert.deepEqual([job("succeeded").status, job("succeeded").attemptedAt], ["completed", 50], "v1.0.2 will not repeat it");
-    assert.deepEqual([job("expired").status, job("expired").attemptedAt], ["expired", undefined], "v1.0.2 may retry it manually");
-    assert.equal(job("requested").status, "running", "v1.0.2 recovers it as unknown, never resends");
-    assert.equal("operations" in seen, false);
-    // v1.0.2 writes the file back without operations; this release migrates it again.
-    await writeFile(path, JSON.stringify(seen));
-    const forward = await createStore(path).read();
-    assert.deepEqual(forward.disabled, ["off"]);
-    assert.deepEqual(forward.operations.map(op => [op.agentId, op.kind, op.state]),
-      [["succeeded", "legacy", "succeeded"], ["requested", "legacy", "unknown"]]);
-  } finally { await rm(root, { recursive: true, force: true }); }
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, "state.json");
+  const target = { sessionId: "native-a", activityKey: "launch:generation:1" };
+  const operation = (id: string, state: "succeeded" | "expired" | "requested") => ({ id, agentId: id, revision: "rev", target,
+    kind: "manual" as const, state, createdAt: 50, updatedAt: 60, inputFingerprint: "f",
+    result: state === "requested" ? null : { code: state, message: state } });
+  const state = syncJobs({ version: 1, disabled: ["off"], operations: ["succeeded", "expired", "requested"]
+    .map(entry => operation(entry, entry as "succeeded")), jobs: ["succeeded", "expired", "requested"].map(id => ({
+    agentId: id, revision: "rev", endedAt: 10, status: "scheduled" as const, detail: "", operationId: id,
+    sessionId: "native-a", activityKey: "launch:generation:1" })) });
+  await createStore(path).write(state);
+  // What v1.0.2 sees: its schema accepts the file and drops what it does not know.
+  const seen = V102StateSchema.parse(JSON.parse(await readFile(path, "utf8")));
+  const job = (id: string) => seen.jobs.find(entry => entry.agentId === id)!;
+  assert.deepEqual([job("succeeded").status, job("succeeded").attemptedAt], ["completed", 50], "v1.0.2 will not repeat it");
+  assert.deepEqual([job("expired").status, job("expired").attemptedAt], ["expired", undefined], "v1.0.2 may retry it manually");
+  assert.equal(job("requested").status, "running", "v1.0.2 recovers it as unknown, never resends");
+  assert.equal("operations" in seen, false);
+  // v1.0.2 writes the file back without operations; this release migrates it again.
+  await writeFile(path, JSON.stringify(seen));
+  const forward = await createStore(path).read();
+  assert.deepEqual(forward.disabled, ["off"]);
+  assert.deepEqual(forward.operations.map(op => [op.agentId, op.kind, op.state]),
+    [["succeeded", "legacy", "succeeded"], ["requested", "legacy", "unknown"]]);
 });
 
 // A store that counts what reaches the file, standing in for the file store.
@@ -270,21 +264,18 @@ test("a write that lands while the first read is in flight is not replaced by th
   assert.deepEqual((await store.read()).disabled, ["newer"]);
 });
 
-test("the cached file store keeps today's unreadable-state failure and missing-file default", async () => {
+test("the cached file store keeps today's unreadable-state failure and missing-file default", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "compact-cached-store-"));
-  try {
-    const path = join(root, "state.json");
-    const missing = createCachedStore(createStore(path));
-    assert.deepEqual(await missing.read(), { version: 1, disabled: [], jobs: [], operations: [] });
-    await writeFile(join(root, "corrupt.json"), "{not json");
-    const corrupt = createCachedStore(createStore(join(root, "corrupt.json")));
-    await assert.rejects(corrupt.read(), /unreadable; automation stopped/);
-    await assert.rejects(corrupt.read(), /unreadable; automation stopped/);
-    await writeFile(join(root, "corrupt.json"), JSON.stringify({ version: 1, disabled: ["x"], jobs: [], operations: [] }));
-    assert.deepEqual((await corrupt.read()).disabled, ["x"]);
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, "state.json");
+  const missing = createCachedStore(createStore(path));
+  assert.deepEqual(await missing.read(), { version: 1, disabled: [], jobs: [], operations: [] });
+  await writeFile(join(root, "corrupt.json"), "{not json");
+  const corrupt = createCachedStore(createStore(join(root, "corrupt.json")));
+  await assert.rejects(corrupt.read(), /unreadable; automation stopped/);
+  await assert.rejects(corrupt.read(), /unreadable; automation stopped/);
+  await writeFile(join(root, "corrupt.json"), JSON.stringify({ version: 1, disabled: ["x"], jobs: [], operations: [] }));
+  assert.deepEqual((await corrupt.read()).disabled, ["x"]);
 });
 
 test("a read error clears a snapshot that a concurrent read cached, so the next read asks the file", async () => {
@@ -312,21 +303,20 @@ test("a read error clears a snapshot that a concurrent read cached, so the next 
   await assert.rejects(third, /unreadable/);
 });
 
-test("a blocked reservation reads back with its reason code; records without one, or from a rollback, still load", async () => {
+test("a blocked reservation reads back with its reason code; records without one, or from a rollback, still load", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "compact-blocked-"));
-  try {
-    const path = join(root, "state.json");
-    const job = (agentId: string, blockedReason?: string) => ({ agentId, revision: "rev", endedAt: 10,
-      status: "blocked" as const, detail: "Claude observer unavailable", ...(blockedReason ? { blockedReason } : {}) });
-    // Written before codes existed, and by a later release that added a code.
-    await writeFile(path, JSON.stringify({ version: 1, disabled: [], operations: [],
-      jobs: [job("old"), job("newer", "added_later")] }));
-    const loaded = await createStore(path).read();
-    assert.deepEqual(loaded.jobs.map(entry => entry.blockedReason), [undefined, "added_later"]);
-    loaded.jobs.push(job("current", "observer_missing"));
-    await createStore(path).write(loaded);
-    assert.equal((await createStore(path).read()).jobs[2].blockedReason, "observer_missing");
-    // A rollback drops the code and keeps the reservation.
-    assert.equal(V102StateSchema.parse(JSON.parse(await readFile(path, "utf8"))).jobs.length, 3);
-  } finally { await rm(root, { recursive: true, force: true }); }
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, "state.json");
+  const job = (agentId: string, blockedReason?: string) => ({ agentId, revision: "rev", endedAt: 10,
+    status: "blocked" as const, detail: "Claude observer unavailable", ...(blockedReason ? { blockedReason } : {}) });
+  // Written before codes existed, and by a later release that added a code.
+  await writeFile(path, JSON.stringify({ version: 1, disabled: [], operations: [],
+    jobs: [job("old"), job("newer", "added_later")] }));
+  const loaded = await createStore(path).read();
+  assert.deepEqual(loaded.jobs.map(entry => entry.blockedReason), [undefined, "added_later"]);
+  loaded.jobs.push(job("current", "observer_missing"));
+  await createStore(path).write(loaded);
+  assert.equal((await createStore(path).read()).jobs[2].blockedReason, "observer_missing");
+  // A rollback drops the code and keeps the reservation.
+  assert.equal(V102StateSchema.parse(JSON.parse(await readFile(path, "utf8"))).jobs.length, 3);
 });
