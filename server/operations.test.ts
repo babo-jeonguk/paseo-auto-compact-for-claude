@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createOperationWorker, recoverOperations } from "./operations";
 import { TICK_INTERVAL_MS } from "./scheduler";
+import { dueAt } from "./policy";
 import { changes } from "../tests/support/changes";
 import { fakeTimers } from "../tests/support/timers";
 import { cleanupScope } from "../tests/support/scope";
@@ -269,7 +270,7 @@ async function send(f: Fixture, execution: ExecutionContext | undefined, native 
 // guard again right before sending.
 const automatic = (f: Fixture) => {
   f.operation.kind = "automatic";
-  f.operation.reservationEndedAt = f.time - DEFAULT_SETTINGS.idleMinutes * 60_000;
+  f.operation.reservationEndedAt = f.time - dueAt(0, DEFAULT_SETTINGS);
   f.agent.tokens = DEFAULT_SETTINGS.threshold;
   f.gateway.automatic = async (agent, guard, execution) => {
     if (guard && !await guard.allowed()) throw new Refusal("Reservation cancelled or session changed before send");
@@ -387,9 +388,10 @@ for (const [at, stopAt] of Object.entries(stopPoints)) {
     scope.defer(() => worker.stop());
     const run = worker.reconcile();
     await held.reached;
+    // Taken before stop(), so what stop() itself did counts too.
+    const state = JSON.stringify(f.snapshot), events = f.events.length, errors = f.errors.length;
     worker.stop();
     assert.equal(f.timers.pending, 0, `${at}: stopping ends every wait and clears its timer`);
-    const state = JSON.stringify(f.snapshot), events = f.events.length, errors = f.errors.length;
     // The run ends while its step is still held; one still waiting fails here,
     // at the runner's bound.
     await run;

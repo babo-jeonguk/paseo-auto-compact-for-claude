@@ -55,6 +55,17 @@ test("a wait with no deadline of its own arms no timer and ends only when its at
   await assert.rejects(stopped, Stopped);
 });
 
+test("a stopped wait clears its timer whatever handle the timers returned", async () => {
+  // Timers is opaque about handles, so one may be undefined.
+  const cleared: unknown[] = [];
+  const timers = { setTimeout: () => undefined, clearTimeout: (handle: unknown) => { cleared.push(handle); } };
+  const attempt = new AbortController();
+  const waiting = bounded(new Promise<never>(() => {}), 5_000, timers, attempt.signal);
+  attempt.abort();
+  await assert.rejects(waiting, Stopped);
+  assert.deepEqual(cleared, [undefined], "the armed deadline is cleared");
+});
+
 test("a bounded wait clears only its own timer, even on timers that reuse a retired handle", async () => {
   // Numbered handles, the lowest free one reused, as some timer implementations do.
   const due = new Map<number, () => void>();
