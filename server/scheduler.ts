@@ -110,8 +110,8 @@ export function createScheduler(options: {
     if (stopped) throw new Error("Plugin stopped");
     await options.store.write(syncJobs(state));
   } };
-  const settings = () => bounded(options.settings(), INSPECT_TIMEOUT_MS);
-  const refresh = (id: string) => bounded(gateway.refresh(id), INSPECT_TIMEOUT_MS);
+  const settings = () => bounded(options.settings(), INSPECT_TIMEOUT_MS, timers);
+  const refresh = (id: string) => bounded(gateway.refresh(id), INSPECT_TIMEOUT_MS, timers);
   const now = options.now ?? Date.now;
   const onError = options.onError ?? (() => {});
   let tail: Promise<unknown> = Promise.resolve();
@@ -178,7 +178,7 @@ export function createScheduler(options: {
     const failures: unknown[] = [];
     const track = (observation: Promise<Observation | null>) => {
       started.push(observation);
-      const wait = bounded(observation, INSPECT_TIMEOUT_MS);
+      const wait = bounded(observation, INSPECT_TIMEOUT_MS, timers);
       wait.catch((reason) => { failures.push(reason); });
       waits.push(wait);
     };
@@ -190,7 +190,7 @@ export function createScheduler(options: {
         await listing.catch(() => {});
         await Promise.allSettled(started);
       })();
-      await bounded(listing, INSPECT_TIMEOUT_MS);
+      await bounded(listing, INSPECT_TIMEOUT_MS, timers);
     } else {
       const ids = new Set(plan.agentIds);
       if (plan.attention) {
@@ -362,7 +362,7 @@ export function createScheduler(options: {
         const blocked = await bounded(gateway.readiness(
           agent,
           job && config ? due(job, config) : undefined
-        ), INSPECT_TIMEOUT_MS);
+        ), INSPECT_TIMEOUT_MS, timers);
         if (blocked) block(blocked);
       }
     }
@@ -483,7 +483,7 @@ export function createScheduler(options: {
           return { candidate, outcome: { kind: "blocked", reason: "resume_required", detail: SESSION_RESUME_REQUIRED } };
         }
         const blocked = gateway.readiness
-          ? await bounded(gateway.readiness(agent, dueAt(candidate.endedAt, phaseConfig)), INSPECT_TIMEOUT_MS)
+          ? await bounded(gateway.readiness(agent, dueAt(candidate.endedAt, phaseConfig)), INSPECT_TIMEOUT_MS, timers)
           : null;
         // Like an unreadable observation above: not a change, so keep the reservation.
         if (blocked && TRANSIENT.includes(blocked.reason)) return null;
@@ -633,7 +633,7 @@ export function createScheduler(options: {
           const observations: Promise<Observation>[] = [];
           await gateway.list((observation) => observations.push(observation));
           return Promise.all(observations);
-        })(), INSPECT_TIMEOUT_MS),
+        })(), INSPECT_TIMEOUT_MS, timers),
       ]);
       return Promise.all(
         agents
