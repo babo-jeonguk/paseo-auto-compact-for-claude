@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { OBSERVATION_MS } from "./deadline";
+import { DeadlineExceeded, INSPECT_TIMEOUT_MS, OBSERVATION_MS, Stopped } from "./deadline";
 import { Refusal, type OperationEvidence, type StoredOperation } from "./model";
 import { createGateway, EVIDENCE_POLL_MS } from "./gateway";
 import { createObserver, QUERY_RESTARTED_REFUSAL } from "./observer";
@@ -52,8 +52,9 @@ function fixture(
   liveItems = items,
   options: Parameters<typeof createGateway>[0] = {}
 ) {
-  const clock = testClock(options.pollMs ?? 1);
-  const host = createGateway({ timeoutMs: 40, pollMs: 1, now: clock.now, timers: clock.timers, ...options });
+  const pollMs = options.pollMs ?? 1;
+  const clock = testClock(pollMs);
+  const host = createGateway({ timeoutMs: 40, now: clock.now, timers: clock.timers, ...options, pollMs });
   let sends = 0;
   let native = "native-a";
   const agent = {
@@ -367,11 +368,14 @@ test("completion evidence is checked every 50 ms after sending", () => {
   assert.equal(EVIDENCE_POLL_MS, 50);
 });
 
-test('a send that starts just before its deadline is still observed in full', async () => {
+test('a send that starts just before its deadline is still observed in full', async (t) => {
   // A live budget longer than the send deadline, as in production (120 s vs. what is left).
   let time = 1_000_000;
   const host = fixture([{ type: "compaction", status: "completed", trigger: "manual" }],
     undefined, false, undefined, { timeoutMs: 1_000, now: () => time });
+  // The clock moves only with the send, so a missing boundary would poll on;
+  // stopping ends the attempt even if the test stops early.
+  t.after(() => host.stop());
   const send = host.ref.send;
   // The send takes past its deadline, so the boundary arrives after it.
   host.ref.send = async (text, options) => { time += 80; return send(text, options); };
@@ -561,6 +565,65 @@ test("stopping the gateway ends a waiting attempt at once and leaves none of its
   assert.equal(result.status, "unknown");
   assert.equal(after.sendCount(), 1);
   assert.equal(after.clock.timers.pending, 0, "the history read's deadline is cleared");
+});
+
+test("a native request whose preparation outlives the wait on it is retired once it is prepared", async (t) => {
+  for (const ending of ["deadline", "stop"] as const) {
+    const native = observer(null)!;
+    const prepare = native.prepare;
+    let reach!: () => void;
+    const reached = new Promise<void>(resolve => { reach = resolve; });
+    let land!: () => void;
+    const landed = new Promise<void>(resolve => { land = resolve; });
+    native.prepare = async (...args: Parameters<typeof prepare>) => { reach(); await landed; return prepare(...args); };
+    let retire!: (value: string) => void;
+    const retired = new Promise<string>(resolve => { retire = resolve; });
+    native.cancel = async (operation: { id: string }, sent?: boolean) => { retire(`${operation.id}:${sent}`); };
+    const host = fixture([], undefined, false, [], { observer: native });
+    t.after(() => host.stop());
+    const attempt = host.gateway.automatic!((await host.gateway.refresh("a"))!, undefined, {
+      id: `late-${ending}`, sendBy: host.clock.now() + 30_000, checkpoint: async () => {}, current: () => true,
+    });
+    const ended = attempt.then(() => null, (error: unknown) => error);
+    await reached;
+    if (ending === "stop") host.stop();
+    else {
+      // The read gives up at its deadline, then cleanup at its own.
+      await host.clock.armed(INSPECT_TIMEOUT_MS);
+      await host.clock.tick(INSPECT_TIMEOUT_MS);
+      await host.clock.armed(1_000);
+      await host.clock.tick(1_000);
+    }
+    assert.ok(await ended instanceof (ending === "stop" ? Stopped : DeadlineExceeded), `${ending}: the attempt fails`);
+    // The preparation lands only after the attempt has ended.
+    land();
+    assert.equal(await retired, `late-${ending}:false`, `${ending}: the request it left is retired, as unsent`);
+    assert.equal(host.sendCount(), 0, ending);
+    assert.equal(host.clock.timers.pending, 0, `${ending}: nothing is left armed`);
+  }
+});
+
+test("stopping the gateway also ends the wait on an attempt's cleanup", async (t) => {
+  for (const at of ["cleanup", "observation"] as const) {
+    const items = at === "cleanup" ? [{ type: "compaction", status: "completed", trigger: "manual" }] : [];
+    const host = fixture(items, undefined, false, undefined, { timeoutMs: 120_000 });
+    t.after(() => host.stop());
+    // Releasing the subscription never ends.
+    let releasing = false;
+    const subscribe = host.ref.timeline.subscribe;
+    host.ref.timeline.subscribe = listener => {
+      const result = subscribe(listener);
+      result.release = () => { releasing = true; return new Promise<never>(() => {}); };
+      return result;
+    };
+    const attempt = host.gateway.compact("a");
+    // Stopped while waiting on the release, or while observing, before cleanup starts.
+    await host.clock.until(() => at === "cleanup" ? releasing : host.sendCount() === 1);
+    host.stop();
+    assert.equal((await attempt).status, at === "cleanup" ? "completed" : "unknown", at);
+    assert.equal(releasing, true, `${at}: the release is still asked for`);
+    assert.equal(host.clock.timers.pending, 0, `${at}: nothing is left armed`);
+  }
 });
 
 test("stable identity and durable send marker precede provider dispatch", async () => {
@@ -1260,6 +1323,8 @@ test("stopping the plugin after dispatch preserves request.json so a query-resta
   const obs = await realObserverFixture(() => time);
   t.after(() => obs.close());
   const host = fixture([], undefined, false, [], { observer: obs.native, now: () => time, timeoutMs: 120_000, pollMs: 1 });
+  // The clock stands still; stopping ends the attempt even if the send is never reached.
+  t.after(() => host.stop());
   const send = host.ref.send;
   let saved: OperationEvidence | undefined;
   host.ref.send = async (text, options) => {

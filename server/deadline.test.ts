@@ -38,3 +38,25 @@ test("a bounded wait ends when its attempt stops, and leaves no timer armed", as
     "a wait started after its attempt stopped ends at once");
   assert.equal(timers.pending, 0);
 });
+
+test("a bounded wait clears only its own timer, even on timers that reuse a retired handle", async () => {
+  // Numbered handles, the lowest free one reused, as some timer implementations do.
+  const due = new Map<number, () => void>();
+  const timers = {
+    setTimeout(callback: () => void) { let id = 1; while (due.has(id)) id++; due.set(id, callback); return id; },
+    clearTimeout(handle: unknown) { due.delete(handle as number); },
+  };
+  const fire = (id: number) => { const callback = due.get(id)!; due.delete(id); callback(); };
+  let fail!: (error: Error) => void;
+  const work = new Promise<never>((_resolve, reject) => { fail = reject; });
+  const first = bounded(work, 5_000, timers);
+  fire(1);
+  await assert.rejects(first, DeadlineExceeded);
+  // The next wait takes the retired handle; then the first wait's work settles late.
+  const second = bounded(new Promise<never>(() => {}), 5_000, timers);
+  fail(new Error("late"));
+  await work.catch(() => {});
+  assert.equal(due.size, 1, "the second wait's deadline is still armed");
+  fire(1);
+  await assert.rejects(second, DeadlineExceeded);
+});
