@@ -55,6 +55,19 @@ export function createGateway(options: {
   const timers = options.timers ?? systemTimers;
   const pending = new Map<string, { turnId: string | null }>();
   const busy = new Set<string>();
+  // One writer of a conversation's native request at a time: a turn ends with
+  // its last write, not with the wait on it.
+  const writers = new Map<string, { done: Promise<void>; end: () => void }>();
+  const takeTurn = (agentId: string) => {
+    const earlier = writers.get(agentId)?.done ?? Promise.resolve();
+    let end!: () => void;
+    const own = new Promise<void>(resolve => { end = resolve; });
+    const turn = { done: earlier.then(() => own), end };
+    writers.set(agentId, turn);
+    // Drop the entry once this chain has ended, unless a newer turn replaced it.
+    void turn.done.then(() => { if (writers.get(agentId) === turn) writers.delete(agentId); });
+    return { wait: earlier, end };
+  };
   // Stopping the gateway aborts this signal, which ends every wait on it at
   // once, cleanup waits included, and clears their timers.
   const stopping = new AbortController();
@@ -136,7 +149,14 @@ export function createGateway(options: {
       readiness: (expected: Observation, dueAt?: number) => observer.readiness(expected, dueAt),
       async release(operation: StoredOperation) {
         const native = operation.evidence?.native;
-        if (native) await observer.release(operation.agentId, native, operation.evidence?.dispatchStartedAt !== undefined);
+        if (!native) return;
+        const turn = takeTurn(operation.agentId);
+        await turn.wait;
+        try {
+          await observer.release(operation.agentId, native, operation.evidence?.dispatchStartedAt !== undefined);
+        } finally {
+          turn.end();
+        }
       },
     } : {}),
     compact: (id, expected, execution) => compact(id, expected, false, undefined, execution),
@@ -174,6 +194,7 @@ export function createGateway(options: {
     const id = execution?.id ?? randomUUID();
     let operation: Awaited<ReturnType<Observer['prepare']>> | undefined;
     let preparing: ReturnType<Observer['prepare']> | undefined;
+    let turn: ReturnType<typeof takeTurn> | undefined;
     let sent = false, armed = false, ownershipLost = false;
     let boundary = false;
     // Lost live views so far. After one, the live command turn and boundary
@@ -200,6 +221,10 @@ export function createGateway(options: {
       saved = serialized; lastCheckpoint = now();
     }
     try {
+      if (observer) {
+        turn = takeTurn(agentId);
+        await read(turn.wait);
+      }
       const before = readable(await read(gateway.refresh(agentId)));
       if (!before?.sessionId || !before.idle || !before.eligible ||
           (expected && !unchanged({ revision: expected.revision, target: targetOf(expected) }, before)))
@@ -309,6 +334,7 @@ export function createGateway(options: {
       const cleanupMs = options.cleanupTimeoutMs ?? CLEANUP_TIMEOUT_MS;
       // A preparation that outlives the wait on it is still retired once it
       // lands; the cleanup wait bounds waiting, it does not cancel the work.
+      // The turn ends with those writes, however late.
       // When the plugin stops after dispatch, leave the prepared request intact
       // so a restarting query can still attribute its refusal; the next instance's
       // reconciliation retires it once the operation settles.
@@ -316,6 +342,11 @@ export function createGateway(options: {
       const retire = prepared && !(sent && stopped)
         ? prepared.then(value => observer!.cancel(value, sent), () => undefined)
         : undefined;
+      const writes = retire ?? prepared;
+      if (turn) {
+        if (writes) void writes.then(turn.end, turn.end);
+        else turn.end();
+      }
       await Promise.all([
         retire ? bounded(retire, cleanupMs, timers, stopping.signal).catch(() => {}) : undefined,
         subscription ? bounded(Promise.resolve(subscription.release()), cleanupMs, timers, stopping.signal).catch(() => {}) : undefined,
