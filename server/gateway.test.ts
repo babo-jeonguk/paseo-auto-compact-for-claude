@@ -603,6 +603,76 @@ test("a native request whose preparation outlives the wait on it is retired once
   }
 });
 
+// An observer whose first preparation of a request lands only when the test
+// lets it, recording each write to the request as it happens.
+function stalledPreparation() {
+  const native = observer(null)!;
+  const prepare = native.prepare;
+  const writes: string[] = [];
+  let preparations = 0;
+  let reach!: () => void;
+  const reached = new Promise<void>(resolve => { reach = resolve; });
+  let land!: () => void;
+  const landed = new Promise<void>(resolve => { land = resolve; });
+  native.prepare = async (...args: Parameters<typeof prepare>) => {
+    const preparation = ++preparations;
+    if (preparation === 1) { reach(); await landed; }
+    writes.push(`prepare ${preparation}`);
+    return { ...await prepare(...args), preparedAt: preparation };
+  };
+  native.cancel = async (operation: { id: string; preparedAt?: number }) => { writes.push(`retire ${operation.preparedAt}`); };
+  native.release = async () => { writes.push("release"); };
+  return { native, writes, reached, land };
+}
+
+// An attempt that gives up on its stalled preparation at the read deadline,
+// and then on its cleanup.
+async function abandonedPreparation(host: ReturnType<typeof fixture>, reached: Promise<void>, id: string) {
+  const attempt = host.gateway.automatic!((await host.gateway.refresh("a"))!, undefined, {
+    id, sendBy: host.clock.now() + 30_000, checkpoint: async () => {}, current: () => true,
+  }).then(() => null, (error: unknown) => error);
+  await reached;
+  await host.clock.armed(INSPECT_TIMEOUT_MS);
+  await host.clock.tick(INSPECT_TIMEOUT_MS);
+  await host.clock.armed(1_000);
+  await host.clock.tick(1_000);
+  assert.ok(await attempt instanceof DeadlineExceeded, "the attempt gives up on its preparation");
+}
+
+test("a retry prepares a conversation's native request only after an earlier attempt's late writes to it end", async (t) => {
+  const { native, writes, reached, land } = stalledPreparation();
+  const host = fixture([], undefined, false, [], { observer: native });
+  t.after(() => host.stop());
+  await abandonedPreparation(host, reached, "retried");
+  const agent = (await host.gateway.refresh("a"))!;
+  const execution = () => ({ id: "retried", sendBy: host.clock.now() + 30_000, checkpoint: async () => {}, current: () => true });
+  // While that preparation is still being written, a retry waits for it as a
+  // read before sending, and gives up at the read deadline.
+  const waiting = host.gateway.automatic!(agent, undefined, execution()).then(() => null, (error: unknown) => error);
+  await host.clock.armed(INSPECT_TIMEOUT_MS);
+  await host.clock.tick(INSPECT_TIMEOUT_MS);
+  assert.ok(await waiting instanceof DeadlineExceeded, "the retry fails before sending, for the worker to retry");
+  // The next retry prepares once the earlier preparation has landed and been retired.
+  const next = host.gateway.automatic!(agent, undefined, execution());
+  land();
+  assert.equal((await next).status, "unknown");
+  assert.deepEqual(writes, ["prepare 1", "retire 1", "prepare 2", "retire 2"]);
+  assert.equal(host.sendCount(), 1);
+});
+
+test("releasing a finished operation's native request waits for an attempt's late writes to it", async (t) => {
+  const { native, writes, reached, land } = stalledPreparation();
+  const host = fixture([], undefined, false, [], { observer: native });
+  t.after(() => host.stop());
+  await abandonedPreparation(host, reached, "finished");
+  const finished = { id: "finished", agentId: "a", evidence: {
+    native: { id: "finished", launchId: "launch", generation: "generation", sessionId: "native-a", revision: 1 } } };
+  const released = host.gateway.release!(finished as unknown as StoredOperation);
+  land();
+  await released;
+  assert.deepEqual(writes, ["prepare 1", "retire 1", "release"]);
+});
+
 test("stopping the gateway also ends the wait on an attempt's cleanup", async (t) => {
   for (const at of ["cleanup", "observation"] as const) {
     const items = at === "cleanup" ? [{ type: "compaction", status: "completed", trigger: "manual" }] : [];
