@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { bounded, DeadlineExceeded, Stopped } from "./deadline";
+import { bounded, createLifetime, DeadlineExceeded, Stopped } from "./deadline";
 import { fakeTimers, reusedHandleTimers, undefinedHandleTimers } from "../tests/support/timers";
 
 test("a bounded wait runs on the caller's timers and clears its timer once the work settles", async () => {
@@ -80,4 +80,31 @@ test("a bounded wait clears only its own timer, even on timers that reuse a reti
   assert.equal(timers.pending, 1, "the second wait's deadline is still armed");
   timers.fire(1);
   await assert.rejects(second, DeadlineExceeded);
+});
+
+test("ending a lifetime ends every wait on it at once, and a wait after it arms nothing", async () => {
+  const timers = fakeTimers();
+  const lifetime = createLifetime(timers);
+  const unbounded = lifetime.wait(new Promise<never>(() => {}));
+  const bounded = lifetime.wait(new Promise<never>(() => {}), 5_000);
+  assert.equal(timers.pending, 1, "only the wait with a deadline arms a timer");
+  assert.equal(lifetime.live(), true);
+  lifetime.end();
+  assert.equal(lifetime.live(), false);
+  assert.equal(timers.pending, 0);
+  await assert.rejects(unbounded, Stopped);
+  await assert.rejects(bounded, Stopped);
+  await assert.rejects(lifetime.wait(Promise.resolve("late"), 5_000), Stopped);
+  assert.equal(timers.pending, 0);
+});
+
+test("a lifetime begins work only while it lasts", async () => {
+  const timers = fakeTimers();
+  const lifetime = createLifetime(timers);
+  const begun: string[] = [];
+  assert.equal(await lifetime.begin(async () => { begun.push("live"); return "read"; }), "read");
+  lifetime.end();
+  await assert.rejects(lifetime.begin(async () => { begun.push("ended"); return "read"; }), Stopped);
+  assert.deepEqual(begun, ["live"]);
+  assert.equal(timers.pending, 0);
 });

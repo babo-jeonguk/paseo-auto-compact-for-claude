@@ -91,6 +91,27 @@ export function bounded<T>(work: Promise<T>, milliseconds: number, timers: Timer
     else stop?.addEventListener("abort", stopped, { once: true });
   });
 }
+// A component's one lifetime, which `end()` ends. Every await of the
+// component goes through `wait`: bounded by its own deadline where it has one
+// and by the lifetime where it has none, so ending the lifetime ends them all
+// at once and clears their timers. `begin` starts I/O only while the lifetime
+// lasts and returns it as it is, for the caller to wait on. Each side effect goes
+// through an owner that does nothing once `live()` is false, so no step of the
+// component checks for itself.
+export function createLifetime(timers: Timers) {
+  const controller = new AbortController();
+  const live = () => !controller.signal.aborted;
+  const wait = <T>(work: Promise<T>, milliseconds = Infinity) =>
+    bounded(work, milliseconds, timers, controller.signal);
+  return {
+    signal: controller.signal,
+    live,
+    wait,
+    begin: <T>(work: () => Promise<T>): Promise<T> => live() ? work() : Promise.reject(new Stopped()),
+    end: () => controller.abort(),
+  };
+}
+
 // A pause of `milliseconds`, which `stop` ends early.
 export const pause = (milliseconds: number, timers: Timers, stop?: AbortSignal) =>
   bounded(new Promise<never>(() => {}), milliseconds, timers, stop).catch((error: unknown) => {

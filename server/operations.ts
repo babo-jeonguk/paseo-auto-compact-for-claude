@@ -4,7 +4,7 @@ import { finishedState, operationRowStatus, operationPending, type CompactOperat
 import { Refusal, readable, unchanged, type CompactOutcome, type Gateway, type State, type StateStore,
   type StoredOperation } from "./model";
 import type { Settings } from "../shared/settings";
-import { bounded, deadlineOf, INSPECT_TIMEOUT_MS, OBSERVATION_MS, readWithin, Stopped, systemTimers,
+import { createLifetime, deadlineOf, INSPECT_TIMEOUT_MS, OBSERVATION_MS, readWithin, Stopped, systemTimers,
   type Timers } from "./deadline";
 import { automaticBlock } from "./policy";
 
@@ -89,19 +89,13 @@ export function createOperationWorker(options: {
   const { store, gateway, settings, now } = options;
   const timers = options.timers ?? systemTimers;
   const owner = randomUUID();
-  // The worker's one lifetime, which stop() ends. Every await of a run takes its
-  // signal — reads, state transactions, the dispatch call — as the gateway's
-  // waits take the gateway's, so stopping ends them at once and clears their
-  // timers. Every side effect (a state write, a report, a native request's
-  // release, a retry's wake-up, and a send, which the gateway asks `current()`
-  // about) goes through an owner that does nothing once the lifetime has ended,
-  // so no step of a run checks for itself.
-  const lifetime = new AbortController();
-  const live = () => !lifetime.signal.aborted;
-  // An await of a run: bounded by its own deadline where it has one, and by the
-  // lifetime where it has none.
-  const wait = <T>(work: Promise<T>, milliseconds = Infinity) =>
-    bounded(work, milliseconds, timers, lifetime.signal);
+  // The worker's one lifetime, which stop() ends. Every await of a run waits on
+  // it — reads, state transactions, the dispatch call — as the gateway's waits
+  // take the gateway's signal. Every side effect (a state write, a report, a
+  // native request's release, a retry's wake-up, and a send, which the gateway
+  // asks `current()` about) goes through an owner below.
+  const lifetime = createLifetime(timers);
+  const { live, wait } = lifetime;
   // State writes: a stopped worker's transaction changes nothing and fails,
   // checked when it runs, since the queue can hold it past stop(); the caller's
   // wait on it also ends at once.
@@ -308,7 +302,7 @@ export function createOperationWorker(options: {
     }
   }
   return { reconcile, stop() {
-    lifetime.abort();
+    lifetime.end();
     for (const timer of retries.values()) timers.clearTimeout(timer);
     retries.clear();
   },
