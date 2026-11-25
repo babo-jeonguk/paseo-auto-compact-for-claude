@@ -3,7 +3,7 @@
  * patch. Each line gets one issue; later versions of the line are comments on it. Pure; the CLI acts.
  *
  * The baseline is the newest Paseo CLI the native simulation runs, not the SDK pin: the package stays
- * compiled against SDK 0.12 as its minimum contract, so the pin never moves when a line is supported.
+ * compiled against SDK 0.16.2 as its minimum contract, so the pin never moves when a line is supported.
  */
 
 export interface DistTags {

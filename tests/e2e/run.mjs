@@ -20,16 +20,13 @@ import { cliPackagePath, installedPlugin, parseOptions, pluginStderr, PLUGIN, re
 
 const here = dirname(fileURLToPath(import.meta.url));
 const simulation = resolve(here, '../simulation');
-const arg = parseOptions('run.mjs', [['--paseo', '0.13.0'], ['--from', 'v1.2.2'], ['--to', 'main'],
+const arg = parseOptions('run.mjs', [['--paseo', '0.16.2'], ['--from', 'v1.2.2'], ['--to', 'main'],
   ['--source', DEFAULT_SOURCE], ['--expect-platform', process.platform],
   ['--claude', process.env.SIMULATION_CLAUDE_BINARY ?? ''], ['--tools', simulation],
   ['--report-dir', join(resolve(here, '../..'), 'test-results', 'e2e')], ['--min', '0']]);
 const [FROM, TO, SOURCE, PASEO] = [arg('--from'), arg('--to'), arg('--source'), arg('--paseo')];
 // These wait for real one-minute deadlines; --min 1 leaves them to the native matrix.
 const LONG = ['real automatic timer', 'overdue reservation'];
-// Paseo 0.14 reopens a plugin session that a reloaded plugin no longer owns just before its next
-// prompt. Until an ordinary message has done so, the plugin compacts nothing there (docs/runtime.md).
-const REOPENS_STALE_SESSIONS = Number(PASEO.split('.')[1]) >= 14;
 const selected = arg('--min') === '1' ? scenarios.filter(s => !LONG.some(name => s.name.includes(name))) : scenarios;
 
 const reportDir = join(resolve(arg('--report-dir')), `${process.platform}-paseo-${PASEO}`);
@@ -68,8 +65,8 @@ async function moveTo(ref, key) {
 }
 const pluginLog = () => pluginStderr([1, 2, 3, 4].map(n => join(reportDir, `daemon-${n}.log`)));
 // The fixture stops a daemon by signalling its whole process group, so the plugin can exit before
-// Paseo delivers agent.closed during that shutdown. That is the harness, not the plugin.
-const shutdownNoise = line => /^Lifecycle hook agent\.closed failed: Plugin process exited/.test(line);
+// Paseo delivers agent.close.after during that shutdown. That is the harness, not the plugin.
+const shutdownNoise = line => /^Lifecycle hook agent\.close\.after failed: Plugin process exited/.test(line);
 
 // ---- 1. install the release a user has ------------------------------------------------------------
 const legacy = {};
@@ -84,7 +81,11 @@ check(`install ${FROM} from GitHub with paseo plugin install`, async () => {
 });
 
 // ---- 2. data the older release writes ------------------------------------------------------------
-check(`${FROM} records a reservation, a conversation OFF and a completed Compact now`, async () => {
+check(`${FROM} records settings, a reservation, a conversation OFF and a completed Compact now`, async () => {
+  // Settings a user changed, which the update must keep. Excluding a provider no scenario uses
+  // leaves the Claude conversations below unaffected.
+  legacy.defaults = await fixture.settings();
+  legacy.settings = await fixture.settings({ disabledProviders: ['codex'] });
   for (const key of ['reserved', 'off', 'compacted']) {
     legacy[key] = await fixture.agent();
     await fixture.turn(legacy[key], `LEGACY_${key.toUpperCase()}: reply without tools.`);
@@ -112,20 +113,18 @@ check(`${FROM} records a reservation, a conversation OFF and a completed Compact
 });
 
 // ---- 3. update to the version under test -----------------------------------------------------------
-check(`update to ${TO} keeps state v1, policy, reservation and compaction history`, async () => {
+check(`update to ${TO} keeps state v1, settings, policy, reservation and compaction history`, async () => {
   await moveTo(TO, 'to');
   const state = await waitFor(async () => { const s = await readState(); return Array.isArray(s.operations) ? s : null; }, 'operation history');
   assert.equal(state.version, 1, 'additive fields keep the version the release reads');
+  assert.deepEqual(await fixture.settings(), legacy.settings, 'settings survive');
   assert.equal((await fixture.row(legacy.off)).enabled, false, 'conversation OFF survives');
-  if (REOPENS_STALE_SESSIONS) {
-    // The update reloaded the plugin, so the reservation of a conversation opened before it is held.
-    const held = await waitFor(async () => { const row = await fixture.row(legacy.reserved);
-      return row.status === 'blocked' ? row : null; }, 'reservation held until the session resumes');
-    assert.match(held.detail, /resume/i, held.detail);
-  } else {
-    const reserved = await fixture.row(legacy.reserved);
-    assert.equal(reserved.status, 'scheduled'); assert.equal(reserved.dueAt, legacy.row.dueAt, 'reservation time survives');
-  }
+  // Paseo reopens a plugin session that a reloaded plugin no longer owns just before its next prompt.
+  // Until an ordinary message has done so, the plugin compacts nothing there (docs/runtime.md), so the
+  // reservation of a conversation opened before the update is held.
+  const held = await waitFor(async () => { const row = await fixture.row(legacy.reserved);
+    return row.status === 'blocked' ? row : null; }, 'reservation held until the session resumes');
+  assert.match(held.detail, /resume/i, held.detail);
   const compacted = await fixture.row(legacy.compacted);
   assert.equal(compacted.status, 'completed');
   assert.equal(compacted.latestOperation?.state, 'succeeded');
@@ -143,14 +142,12 @@ check(`update to ${TO} keeps state v1, policy, reservation and compaction histor
     target: compacted.target, operationId: randomUUID() });
   assert.equal(again.code, 'existing', `the earlier attempt guards the same activity: ${again.detail}`);
   assert.equal(model.count, legacy.requests, 'update and migration send nothing');
-  if (REOPENS_STALE_SESSIONS) {
-    // An ordinary message reopens the session; its activity earns a new reservation.
-    await fixture.turn(legacy.reserved, 'RESUME: reply without tools.');
-    const resumed = await waitFor(async () => { const row = await fixture.row(legacy.reserved);
-      return row.status === 'scheduled' && row.dueAt > legacy.row.dueAt ? row : null; }, 'reservation after the session resumed');
-    assert.notEqual(resumed.revision, legacy.row.revision);
-    legacy.requests = model.count;
-  }
+  // An ordinary message reopens the session; its activity earns a new reservation.
+  await fixture.turn(legacy.reserved, 'RESUME: reply without tools.');
+  const resumed = await waitFor(async () => { const row = await fixture.row(legacy.reserved);
+    return row.status === 'scheduled' && row.dueAt > legacy.row.dueAt ? row : null; }, 'reservation after the session resumed');
+  assert.notEqual(resumed.revision, legacy.row.revision);
+  legacy.requests = model.count;
   // An activity this release compacts, for the rollback to check.
   legacy.fresh = await fixture.agent();
   await fixture.turn(legacy.fresh, 'FRESH: reply without tools.');
@@ -166,6 +163,7 @@ check(`update to ${TO} keeps state v1, policy, reservation and compaction histor
   // Leave later scenarios a quiet host: their one-minute timers would otherwise also reach these.
   for (const id of Object.values(legacy).filter(v => typeof v === 'string'))
     await fixture.rpc('toggle', { agentId: id, enabled: false });
+  await fixture.settings(legacy.defaults);
 });
 
 // ---- 4. main features on the updated install --------------------------------------------------------

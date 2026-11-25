@@ -7,29 +7,30 @@ import { tmpdir } from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { startFixture, waitFor } from './fixture.mjs';
 import { startModel } from './model.mjs';
+import { paseoPackages } from './paseo-versions.mjs';
 const here=dirname(fileURLToPath(import.meta.url)), plugin=resolve(here,'../..');
 const value=(name, fallback)=>{const at=process.argv.indexOf(name); return at<0 ? fallback : process.argv[at+1];};
 const playwright=value('--playwright'), executablePath=value('--browser');
 assert(playwright && executablePath, 'Specify --playwright /path/to/playwright-core/index.mjs and --browser /path/to/chromium');
 const { chromium }=await import(pathToFileURL(resolve(playwright)));
 const req=createRequire(join(plugin,'tests/simulation/package.json'));
-const version=value('--paseo','0.12.0');
-assert(['0.12.0','0.13.0','0.14.0','0.16.0-beta.1','0.16.0'].includes(version), 'Unsupported Paseo version');
-const alias=version==='0.16.0-beta.1'?'0-16-beta':version==='0.16.0'?'0-16-stable':version.split('.').slice(0,2).join('-');
+const version=value('--paseo','0.16.2');
+const alias=paseoPackages.get(version);
+assert(alias, `Unsupported Paseo version: ${version}`);
 const reportDir=join(resolve(value('--report-dir',join(plugin,'test-results'))),`browser-${version}`);
 await mkdir(reportDir,{recursive:true});
 const root=await mkdtemp(join(tmpdir(),'paseo-ui-validation-'));
 const model=await startModel(); let fixture,browser;
 const report={version, platform:process.platform, arch:process.arch, node:process.version, checks:[], sources:{}, startedAt:new Date().toISOString()};
 try {
- for (const path of ['index.client.tsx','client/conversation.tsx','client/compact-submission.ts','client/conversations.tsx','client/format.ts','client/cadence.ts','client/clock.ts','client/surface.ts','client/session-state.ts','client/settings.tsx','client/toggle.tsx','index.server.ts',
+ for (const path of ['index.client.tsx','client/conversation.tsx','client/compact-submission.ts','client/conversations.tsx','client/format.ts','client/cadence.ts','client/clock.ts','client/surface.ts','client/session-state.ts','client/state-events.ts','client/settings-list.ts','client/settings.tsx','client/toggle.tsx','index.server.ts',
    'server/cache.ts','server/observer.ts','server/observer-source.mjs','server/observer-assets.generated.ts',
-   'server/gateway.ts','server/scheduler.ts','server/model.ts','server/store.ts','server/operations.ts',
+   'server/gateway.ts','server/scheduler.ts','server/model.ts','server/store.ts','server/state-changes.ts','server/operations.ts',
    'server/retention.ts','server/deadline.ts','shared/rpc.ts','shared/providers.ts','shared/settings.ts',
-   'paseo-plugin.json','package.json','tests/simulation/fixture.mjs','tests/simulation/model.mjs','tests/simulation/browser.mjs']) {
+   'paseo-plugin.json','package.json','tests/simulation/fixture.mjs','tests/simulation/model.mjs','tests/simulation/paseo-versions.mjs','tests/simulation/browser.mjs']) {
    report.sources[path]=createHash('sha256').update(await readFile(join(plugin,path))).digest('hex');
  }
- fixture=await startFixture({root,plugin,cliPackage:req.resolve(`@getpaseo/cli-${alias}/package.json`),appVersion:version,binary:join(req.resolve(`@anthropic-ai/claude-code-${process.platform}-${process.arch}/package.json`),process.platform === 'win32' ? '../claude.exe' : '../claude'),model,reportDir,webUi:true});
+ fixture=await startFixture({root,plugin,cliPackage:req.resolve(`${alias}/package.json`),appVersion:version,binary:join(req.resolve(`@anthropic-ai/claude-code-${process.platform}-${process.arch}/package.json`),process.platform === 'win32' ? '../claude.exe' : '../claude'),model,reportDir,webUi:true});
  const id=await fixture.agent(); await fixture.turn(id,'UI_READY: reply without tools.');
  await waitFor(async()=> (await fixture.row(id)).status==='scheduled', 'UI reservation');
  browser=await chromium.launch({headless:true,executablePath:resolve(executablePath),args:['--no-sandbox']});

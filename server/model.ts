@@ -21,8 +21,8 @@ export interface Observation {
   // The observer exists but could not be read just now (see observer.read).
   observerUnreadable?: boolean;
   // The host reopens this session before its next prompt, because a plugin
-  // instance before this one started its observer (Paseo 0.14). Until an
-  // ordinary message has done that, nothing is compacted there.
+  // instance before this one started its observer. Until an ordinary message
+  // has done that, nothing is compacted there.
   resumeRequired?: boolean;
 }
 // Schemas are the one definition of stored records; the store validates with

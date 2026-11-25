@@ -1,4 +1,4 @@
-// Test-only: accelerate the stock 0.14 cleanup sweep and its own clock only.
+// Test-only: accelerate the stock idle-runtime cleanup sweep and its own clock only.
 // The marker is created after an ordinary turn; no plugin clocks are changed.
 import { readFile } from 'node:fs/promises';
 export async function load(url, context, nextLoad) {

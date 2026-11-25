@@ -15,8 +15,7 @@ import { drainer } from "../tests/support/drained";
 import { cleanupScope, type CleanupScope } from "../tests/support/scope";
 import type {
   PluginHandlerContext,
-  PluginLifecycleEvents,
-  PluginSessionOpenRequest,
+  PluginHookEvents,
 } from "@getpaseo/plugin/server";
 
 // A gateway test's clock and timers. Time moves only with `tick`, which moves
@@ -122,7 +121,7 @@ function fixture(
         turnId: "compact-1",
         outcome,
         timeline: items,
-      } as PluginLifecycleEvents["agent.turn_ended"]);
+      } as PluginHookEvents["agent.turn.after"]);
     },
   };
   host.attach({
@@ -413,12 +412,11 @@ test('an unreadable observer is reported on the observation and is a fault befor
   assert.equal(host.sendCount(), 0);
 });
 
-test('a host that reopens stale plugin sessions never sends against an observer from the prior plugin instance', async (t) => {
+test('a session whose observer this plugin instance did not start never receives a send until it resumes', async (t) => {
   const scope = cleanupScope(t);
   const native = observer(null)!;
   native.startedHere = () => false;
   const host = fixture(scope, [], undefined, false, [], { observer: native });
-  Object.assign(host.ref, { reload: async () => null });
   assert.equal((await host.gateway.refresh('a'))!.resumeRequired, true);
   await assert.rejects(host.gateway.compact('a', (await host.gateway.refresh('a'))!),
     (error: unknown) => error instanceof Refusal && /resume.*message/i.test(error.message));
@@ -428,17 +426,6 @@ test('a host that reopens stale plugin sessions never sends against an observer 
   assert.equal(host.sendCount(), 0);
 });
 
-test('a host without session reopening never requires a resume', async (t) => {
-  const scope = cleanupScope(t);
-  const native = observer({ status: 'completed', detail: 'Native PostCompact' })!;
-  native.startedHere = () => false;
-  const host = fixture(scope, [{ type: "compaction", status: "completed", trigger: "manual" }], undefined, false, undefined,
-    { observer: native });
-  const agent = (await host.gateway.refresh('a'))!;
-  assert.equal(agent.resumeRequired, undefined);
-  assert.equal((await host.gateway.automatic!(agent)).status, 'completed');
-});
-
 test('observer ownership is rechecked at the dispatch boundary, in memory, and ends the attempt at once', async (t) => {
   const scope = cleanupScope(t);
   const native = observer(null)!;
@@ -446,7 +433,6 @@ test('observer ownership is rechecked at the dispatch boundary, in memory, and e
   let markerPersisted = false;
   native.startedHere = () => { ownershipChecks++; return !markerPersisted; };
   const host = fixture(scope, [], undefined, false, [], { observer: native });
-  Object.assign(host.ref, { reload: async () => null });
   const saved: OperationEvidence[] = [];
   const result = await host.gateway.compact('a', (await host.gateway.refresh('a'))!, {
     id: 'ownership-race', sendBy: host.clock.now() + 30_000,
@@ -469,8 +455,7 @@ test('an absent or unreadable observer is not misreported as a session awaiting 
     native.startedHere = () => false;
     native.prepare = async () => { throw new Refusal('Claude observer unavailable'); };
     const host = fixture(scope, [], undefined, false, [], { observer: native });
-    Object.assign(host.ref, { reload: async () => null });
-    const agent = (await host.gateway.refresh('a'))!;
+      const agent = (await host.gateway.refresh('a'))!;
     assert.equal(agent.resumeRequired, undefined);
     await assert.rejects(host.gateway.compact('a', agent),
       (error: unknown) => !/resume.*message/i.test(String(error)));
@@ -824,7 +809,7 @@ test('native activity identity survives compaction without restoring its schedul
 
 // A host directory of many agents, paged like Paseo's agent list, with an
 // observer that records which agents' native ledgers were read. A `slow`
-// agent's ledger read does not end; a `broken` agent's host reference throws.
+// agent's ledger read does not end; reading a `broken` agent's observer throws.
 // `holdRead` and `holdPage` may delay or fail one ledger read or listing page.
 function directory(scope: CleanupScope, pageSize = 2, { slow = [] as string[], broken = [] as string[],
   holdRead = (_id: string): Promise<void> | void => {},
@@ -852,6 +837,11 @@ function directory(scope: CleanupScope, pageSize = 2, { slow = [] as string[], b
   let listCalls = 0;
   const native = observer(null)!;
   const read = native.read;
+  // A defect, not an unreadable file: the observation itself fails.
+  native.startedHere = (id: string) => {
+    if (broken.includes(id)) throw new Error(`observer failed for ${id}`);
+    return true;
+  };
   native.read = async (id: string) => {
     reads.push(id);
     if (slow.includes(id)) await new Promise(() => {});
@@ -877,7 +867,6 @@ function directory(scope: CleanupScope, pageSize = 2, { slow = [] as string[], b
       },
       ref: (id: string) => {
         calls.push(`host ${id}`);
-        if (broken.includes(id)) throw new Error(`host failed for ${id}`);
         return { refresh: async () => {
           const agent = agents.find(entry => entry.id === id);
           return agent ? { agent } : null;
@@ -923,7 +912,7 @@ test("each listed agent's observation settles on its own, so a slow or failing o
   const fulfilled = results.flatMap(result => result.status === "fulfilled" ? [result.value.agentId] : []);
   assert.deepEqual(fulfilled, ["a", ...INELIGIBLE], "every other observation is returned");
   const failures = results.flatMap(result => result.status === "rejected" ? [String(result.reason)] : []);
-  assert.deepEqual(failures, ["Error: host failed for c"], "c's failure is returned with them");
+  assert.deepEqual(failures, ["Error: observer failed for c"], "c's failure is returned with them");
   host.stop();
 });
 
@@ -1309,11 +1298,10 @@ test("an attempt that ends unknown after a lost live view stays open for reconci
 async function realObserverFixture(scope: CleanupScope, now = () => Date.now()) {
   const home = await scope.folder("compact-gateway-restart-");
   const native = createObserver({ home, now });
-  // Include Paseo 0.14+ session-open fields so this compiles across SDK 0.12–0.16+.
   await native.prepareSession({
     agentId: "a", workspaceId: "w", provider: "claude", purpose: "interactive", reason: "create",
     cwd: home, title: "Conversation", labels: {}, metadata: {}, background: false, tools: [], mcpServers: {}, env: {},
-  } as PluginSessionOpenRequest, true);
+  }, true);
   const parent = join(home, "plugin-data/auto-compact-for-claude/observers",
     (await readdir(join(home, "plugin-data/auto-compact-for-claude/observers")))[0]);
   const manifest = JSON.parse(await readFile(join(parent, "current.json"), "utf8"));

@@ -38,7 +38,7 @@ Separate conditions the plugin expects and retries from durable state (the host 
 
 ## Host compatibility by capability
 
-The plugin supports Paseo 0.12 and later, and SDK 0.12 stays the compile-time contract. Detect a newer host feature by checking for it (`typeof … === "function"`), not by comparing version strings, and keep the older path working. Never reject a Paseo or Claude Code version outright; let a real mismatch surface as a real failure.
+The plugin requires Paseo 0.16.2, and SDK 0.16.2 is the compile-time contract. Write a capability check only for a feature newer than 0.16.2, whether the daemon or the app supplies it, since a phone or desktop app can be older than the daemon. An app older than 0.16.2 does not load the plugin at all, so nothing in 0.16.2 needs a check. Check for the feature itself (`typeof … === "function"`), not by comparing version strings, and keep the path without it working. Beyond the manifest's minimum, never reject a Paseo or Claude Code version outright; let a real mismatch surface as a real failure.
 
 ## General path first
 

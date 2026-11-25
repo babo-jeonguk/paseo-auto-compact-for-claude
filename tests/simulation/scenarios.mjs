@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { access, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { waitFor } from './fixture.mjs';
+import { connectionProxy } from './proxy.mjs';
 
 const scheduled = (f, id, source) => waitFor(async () => {
   const row = await f.row(id);
@@ -13,8 +14,7 @@ const boundaries = rows => rows.filter(row => row.item.type === 'compaction' && 
 // Claude and Paseo recorded themselves, read apart from the plugin: Claude's
 // receipt for that request, and a completed manual compaction boundary in the
 // /compact message's own turn. Both mean success; anything less never does.
-// Hosts differ in whether overlapping input stops a compaction, so the
-// returned evidence says which way this one went.
+// The returned evidence says which way it went, for the caller to check.
 async function settledAgainstEvidence(f, id, operationId) {
   const operation = await waitFor(async () => {
     const current = (await f.rpc('operation', { operationId })).operation;
@@ -51,9 +51,9 @@ async function heldCompaction(f, model, id) {
 // follow-up: its own reply, one model request each, and when the compaction
 // completed, a follow-up request that started only after Claude recorded that
 // completion. Both times come from the same machine clock. What the host did
-// with the input is its own behavior, returned for the report: whether the
-// compaction request was answered or cut off, read once the model has seen
-// that request close.
+// with the input is returned for the caller to check: whether the compaction
+// request was answered or cut off, read once the model has seen that request
+// close.
 async function overlapSettled(f, model, id, held, label) {
   await waitFor(() => held.next.requestId, `${label}: its own request`);
   held.next.release();
@@ -149,22 +149,16 @@ export const scenarios = [
       model.backgroundShellNext();
       await f.turn(id, 'BACKGROUND_SHELL_COMPACT: start the synthetic background shell, then reply without further tools.');
       const agent = await f.refresh(id);
-      const nativeBackground = typeof f.client.listAgentBackgroundWork === 'function';
-      let shellId = null;
-      if (nativeBackground) {
-        const work = await waitFor(async () => {
-          const rows = await f.client.listAgentBackgroundWork(id);
-          return rows.length ? rows : null;
-        }, 'background shell still running', 30_000);
-        shellId = work[0].id;
-      }
+      const work = await waitFor(async () => {
+        const rows = await f.client.listAgentBackgroundWork(id);
+        return rows.length ? rows : null;
+      }, 'background shell still running', 30_000);
+      const shellId = work[0].id;
       const row = await scheduled(f, id);
       const sessionId = agent.persistence.sessionId;
       const completedBefore = boundaries(await f.timeline(id)).length;
       const requestsBefore = model.count;
-      // Paseo 0.16 reports hidden background work; older hosts do not expose it.
-      if (typeof agent.backgroundWork?.count === 'number')
-        assert(agent.backgroundWork.count >= 1, 'the shell must still be running at Compact now');
+      assert(agent.backgroundWork.count >= 1, 'the shell must still be running at Compact now');
       const accepted = await f.rpc('now', { agentId: id, revision: row.revision, target: row.target });
       assert.equal(accepted.status, 'running'); assert(accepted.operationId);
       await waitFor(async () => {
@@ -179,11 +173,10 @@ export const scenarios = [
       assert(boundaryAt >= 0, 'a native compaction boundary must be on the timeline');
       const notification = await waitFor(() => model.requests.slice(requestsBefore).find(request =>
         request.texts?.some(text => /task-notification|SYSTEM NOTIFICATION/i.test(text) &&
-          /completed/i.test(text) && (!shellId || text.includes(shellId)))),
+          /completed/i.test(text) && text.includes(shellId))),
         'background completion notification request', 90_000);
-      if (shellId)
-        assert(notification.texts.some(text => text.includes(shellId)),
-          'the completion notification must name the background shell');
+      assert(notification.texts.some(text => text.includes(shellId)),
+        'the completion notification must name the background shell');
       await waitFor(async () => {
         const rows = await f.timeline(id);
         return rows.length > boundaryAt && rows.slice(boundaryAt + 1)
@@ -197,9 +190,8 @@ export const scenarios = [
       assert.equal(state.pendingInputs, 0, 'a delivered completion notification must not remain queued');
       const fresh = await scheduled(f, id);
       assert.notEqual(fresh.revision, row.revision, 'the notification turn is new activity');
-      if (nativeBackground)
-        await waitFor(async () => (await f.client.listAgentBackgroundWork(id)).length === 0,
-          'background shell end', 90_000);
+      await waitFor(async () => (await f.client.listAgentBackgroundWork(id)).length === 0,
+        'background shell end', 90_000);
       const commands = (await f.timeline(id)).filter(entry =>
         entry.item.type === 'user_message' && entry.item.text === '/compact');
       assert.equal(commands.length, 1, 'compaction must not be resent');
@@ -534,16 +526,107 @@ export const scenarios = [
     },
   },
   {
-    name: 'input steered into a compaction gets its own reply, and the outcome agrees with what Claude and Paseo recorded',
+    name: 'an open state subscription hears a compaction start and finish, and a read after each event shows it',
+    async run({ fixture: f, model }) {
+      await f.settings({ idleMinutes: 50 });
+      const id = await f.agent();
+      const other = await f.agent();
+      await f.turn(id, 'SUBSCRIPTION_READY: reply without tools.');
+      const row = await scheduled(f, id);
+      const subscription = await f.subscribe({ agentId: id });
+      const everything = await f.subscribe();
+      // A screen reads only when it hears an event: wait for each new event, read once after it,
+      // and stop at the first read that shows what the screen should.
+      const afterEvents = async (wanted, label) => {
+        let heard = subscription.events.length;
+        return waitFor(async () => {
+          if (subscription.events.length === heard) return null;
+          heard = subscription.events.length;
+          const current = await f.row(id);
+          return wanted(current) ? current : null;
+        }, label);
+      };
+      try {
+        // Each subscription starts by asking its screen to read everything.
+        await waitFor(() => subscription.events.length, 'the first event');
+        assert.equal(subscription.events[0].agentId, null);
+        const compact = model.holdNext();
+        const started = afterEvents(current => current.status === 'running', 'a read after an event shows the compaction running');
+        const accepted = await f.rpc('now', { agentId: id, revision: row.revision, target: row.target });
+        assert.equal(accepted.status, 'running'); assert(accepted.operationId);
+        await waitFor(() => compact.requestId, 'in-flight compaction');
+        await started;
+        const finished = afterEvents(current => current.latestOperation?.id === accepted.operationId &&
+          current.latestOperation?.state === 'succeeded', 'a read after an event shows the finished compaction');
+        compact.release();
+        assert.notEqual((await finished).status, 'running');
+        // A change to another conversation reaches a subscription to everything, not this one.
+        const heardOther = () => everything.events.some(event => event.agentId === other);
+        assert((await f.rpc('toggle', { agentId: other, enabled: false })).changed);
+        await waitFor(heardOther, 'the other conversation\'s event on a subscription to everything');
+        assert(subscription.events.every(event => event.agentId === null || event.agentId === id),
+          'a subscription narrowed to this conversation hears no other');
+        return { events: subscription.events.length };
+      } finally {
+        await subscription.close();
+        await everything.close();
+        await f.rpc('toggle', { agentId: id, enabled: false });
+      }
+    },
+  },
+  {
+    name: 'a subscriber whose connection drops during a compaction reads the finished state once it reconnects',
+    async run({ fixture: f, model }) {
+      await f.settings({ idleMinutes: 50 });
+      const id = await f.agent();
+      await f.turn(id, 'RECONNECT_READY: reply without tools.');
+      const row = await scheduled(f, id);
+      const proxy = await connectionProxy(f.target);
+      let app;
+      try {
+        // A client that reconnects on its own after its connection drops, as an app does.
+        app = await f.connect({ via: proxy.url });
+        const subscription = await f.subscribe({ agentId: id }, app);
+        await waitFor(() => subscription.events.length, 'the subscription is live');
+        const compact = model.holdNext();
+        const accepted = await f.rpc('now', { agentId: id, revision: row.revision, target: row.target });
+        await waitFor(() => compact.requestId, 'in-flight compaction');
+        proxy.offline();
+        compact.release();
+        await waitFor(async () => (await f.rpc('operation', { operationId: accepted.operationId })).operation
+          ?.state === 'succeeded', 'the compaction finishes while the subscriber is offline', 60_000);
+        const missed = subscription.events.length;
+        proxy.online();
+        // Nothing missed is replayed. The client subscribes again by itself, and
+        // the plugin starts that subscription by asking it to read everything.
+        await waitFor(() => subscription.events.slice(missed).some(event => event.agentId === null),
+          'a read-everything event after the reconnect', 60_000);
+        const current = (await app.invokePluginRpc('auto-compact-for-claude', 'auto-compact.session', { agentId: id })).row;
+        assert.equal(current.latestOperation?.id, accepted.operationId);
+        assert.equal(current.latestOperation?.state, 'succeeded');
+        assert.notEqual(current.status, 'running');
+        await subscription.close();
+        return { disconnects: proxy.disconnects, afterReconnect: subscription.events.slice(missed) };
+      } finally {
+        await app?.close().catch(() => {});
+        await proxy.close();
+        await f.rpc('toggle', { agentId: id, enabled: false });
+      }
+    },
+  },
+  {
+    name: 'input steered into a compaction is answered after it, and the compaction completes',
     async run({ fixture: f, model }) {
       await f.settings({ idleMinutes: 50 });
       const id = await f.agent();
       await f.turn(id, 'STEER_READY: reply without tools.');
       const held = await heldCompaction(f, model, id);
-      // Paseo 0.16.2 and later deliver a steer after the compaction; earlier hosts stop it.
+      // Paseo delivers a steer after the compaction instead of stopping it.
       try { await f.send(id, 'STEERED_DURING_COMPACT: reply without tools.', { activeTurnBehavior: 'steer' }); }
       finally { held.compact.release(); }
       const evidence = await overlapSettled(f, model, id, held, 'the steered message');
+      assert.equal(evidence.outcome, 'succeeded', JSON.stringify(evidence));
+      assert.equal(evidence.compactionRequest, 'answered', JSON.stringify(evidence));
       const fresh = await scheduled(f, id);
       assert.notEqual(fresh.revision, held.row.revision);
       await f.rpc('toggle', { agentId: id, enabled: false });
@@ -551,7 +634,7 @@ export const scenarios = [
     },
   },
   {
-    name: 'a message from another agent during a compaction gets its own reply, and the outcome agrees with what Claude and Paseo recorded',
+    name: 'a message from another agent during a compaction is answered after it, and the compaction completes',
     async run({ fixture: f, model }) {
       await f.settings({ idleMinutes: 50 });
       const id = await f.agent(), source = await f.agent();
@@ -565,6 +648,9 @@ export const scenarios = [
         await new Promise(resolve => setTimeout(resolve, AGENT_MESSAGE_BATCH_WAIT_MS));
       } finally { held.compact.release(); }
       const evidence = await overlapSettled(f, model, id, held, 'the agent message');
+      // Paseo holds a message from another agent until the compaction's turn ends.
+      assert.equal(evidence.outcome, 'succeeded', JSON.stringify(evidence));
+      assert.equal(evidence.compactionRequest, 'answered', JSON.stringify(evidence));
       await f.rpc('toggle', { agentId: id, enabled: false });
       return evidence;
     },

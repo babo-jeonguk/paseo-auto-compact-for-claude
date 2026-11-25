@@ -49,7 +49,10 @@ function decode(value: unknown): State {
   return StateSchema.parse({ ...legacy, operations });
 }
 
-export function createCachedStore(inner: StateStore): StateStore {
+export function createCachedStore(
+  inner: StateStore,
+  onSaved?: (before: State | null, after: State) => void
+): StateStore {
   let cached: State | null = null;
   // Advances on every write and failed read, so an older read cannot refill the cache.
   let epoch = 0;
@@ -73,8 +76,14 @@ export function createCachedStore(inner: StateStore): StateStore {
     },
     async write(state) {
       await inner.write(state);
+      const before = cached;
       epoch++;
       cached = structuredClone(state);
+      // Every save passes through here, so this is where the state changes are
+      // noticed. It runs after the cache holds the new snapshot, so a listener
+      // that reads back through this store sees what was saved; both snapshots
+      // are cache clones, which later caller mutation cannot change.
+      onSaved?.(before, cached);
     },
   };
 }

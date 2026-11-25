@@ -16,7 +16,7 @@ import { paseoPackages } from './paseo-versions.mjs';
 const here = dirname(fileURLToPath(import.meta.url));
 const plugin = resolve(here, '../..');
 if (process.argv.includes('--help')) {
-  console.log('npm run test:simulation:0.12 -- [--expect-platform linux|win32] [--claude /native/claude] [--tools /npm/prefix] [--report-dir /results]');
+  console.log('npm run test:simulation:0.16.2 -- [--expect-platform linux|win32] [--claude /native/claude] [--tools /npm/prefix] [--report-dir /results]');
   process.exit(0);
 }
 const value = (name, fallback) => {
@@ -25,7 +25,7 @@ const value = (name, fallback) => {
   if (!process.argv[at + 1] || process.argv[at + 1].startsWith('--')) throw new Error(`Missing value: ${name}`);
   return process.argv[at + 1];
 };
-const paseoRequested = value('--paseo', '0.12.0');
+const paseoRequested = value('--paseo', '0.16.2');
 assert(paseoPackages.has(paseoRequested), `Unsupported Paseo simulation version: ${paseoRequested}`);
 const reportRoot = resolve(value('--report-dir', join(plugin, 'test-results', `${process.platform}-${process.arch}`)));
 const reportDir = join(reportRoot, `paseo-${paseoRequested}`);
@@ -97,11 +97,11 @@ try {
   report.claude = (await promisify(execFile)(binary, ['--version'], { timeout: 30_000, windowsHide: true })).stdout.trim();
   console.log(`Native ${process.platform}/${process.arch}; Node ${process.version}; Paseo ${report.paseo}; Claude ${report.claude}`);
   for (const path of ['index.server.ts', 'server/cache.ts', 'server/observer.ts', 'server/observer-source.mjs',
-    'server/observer-assets.generated.ts', 'server/lifecycle.ts', 'server/gateway.ts', 'server/scheduler.ts', 'shared/settings.ts',
-    'server/model.ts', 'server/store.ts', 'server/operations.ts', 'server/retention.ts', 'server/deadline.ts', 'shared/rpc.ts', 'shared/providers.ts', 'paseo-plugin.json', 'package.json'])
+    'server/observer-assets.generated.ts', 'server/gateway.ts', 'server/scheduler.ts', 'shared/settings.ts',
+    'server/model.ts', 'server/store.ts', 'server/state-changes.ts', 'server/operations.ts', 'server/retention.ts', 'server/deadline.ts', 'shared/rpc.ts', 'shared/providers.ts', 'paseo-plugin.json', 'package.json'])
     report.sourceFiles[path] = sha(await readFile(join(plugin, path)));
   report.simulationFiles = {};
-  for (const path of ['matrix.mjs', 'run.mjs', 'execution.mjs', 'fixture.mjs', 'model.mjs', 'scenarios.mjs', 'paseo-versions.mjs', 'package.json', 'package-lock.json'])
+  for (const path of ['matrix.mjs', 'run.mjs', 'execution.mjs', 'fixture.mjs', 'model.mjs', 'proxy.mjs', 'scenarios.mjs', 'paseo-versions.mjs', 'package.json', 'package-lock.json'])
     report.simulationFiles[path] = sha(await readFile(join(here, path)));
   model = await startModel();
   fixture = await startFixture({ root, plugin, cliPackage, appVersion: report.appVersion,

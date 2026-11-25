@@ -14,28 +14,28 @@ npm run test:update
 
 In Windows PowerShell, `npm.cmd run test:update` also works when execution policy blocks `npm.ps1`. Run with **Windows Node** to test Windows; WSL Node tests Linux. The runner records `process.platform`, architecture, OS release, Node/Claude/Paseo versions and product source hashes.
 
-The update command runs observer consistency, type checks and the fast regression suite. After committing, run `npm run test:release` for those checks and the full native matrix on an isolated snapshot with Paseo **0.12.0**, **0.13.0**, **0.14.0**, **0.15.0**, **0.16.2** and **0.17.1**. Install the pinned native tools once with `npm ci --prefix tests/simulation --ignore-scripts`. This needs network access and can take several minutes; later runs reuse them. Nothing is installed globally and no Claude login is required.
+The update command runs observer consistency, type checks and the fast regression suite. After committing, run `npm run test:release` for those checks and the full native matrix on an isolated snapshot with Paseo **0.16.2** and **0.17.1**. Install the pinned native tools once with `npm ci --prefix tests/simulation --ignore-scripts`. This needs network access and can take several minutes; later runs reuse them. Nothing is installed globally and no Claude login is required.
 
 ## What is real and what is simulated
 
-Each simulation starts stock **Paseo 0.12.0, 0.13.0, 0.14.0, 0.15.0, 0.16.2 or 0.17.1**, native **Claude Code 2.1.306**, and this checkout's actual plugin. The client handshake uses the selected toolchain's real version. Only model responses come from a synthetic loopback HTTP server. Native transcript creation, Mod loading, public RPC, settings persistence, process restart and automatic timers run normally. The fixture reports a 500k context to a 1M model so the real 400k threshold can be exercised without sending a huge prompt.
+Each simulation starts stock **Paseo 0.16.2 or 0.17.1**, native **Claude Code 2.1.306**, and this checkout's actual plugin. The client handshake uses the selected toolchain's real version. Only model responses come from a synthetic loopback HTTP server. Native transcript creation, Mod loading, public RPC, settings persistence, process restart and automatic timers run normally. The fixture reports a 500k context to a 1M model so the real 400k threshold can be exercised without sending a huge prompt.
 
 Each run uses temporary HOME/USERPROFILE, Claude settings, Paseo configuration, agents and ports. The native process receives a synthetic API key and a local model URL. Existing Paseo and Claude sessions/settings are not used. Successful runs stop their process trees and delete the temporary home. Failed runs retain the temporary path in `report.json` for diagnosis.
 
 The automatic timer test first verifies real **55- and 50-minute reservation values**, then uses a one-minute idle setting and waits for the real server timer. A second one-minute wait checks that a reservation which elapsed while the plugin was stopped expires on recovery. There is no test-only product RPC and no edit to the plugin's stored reservation times.
 
-## Paseo 0.15 restart and browser reconnect checks
+## Restart and browser reconnect checks
 
-The default development SDK stays at 0.12.0, and the SDK and native CI matrices test the versions listed under [CI](#ci). The focused restart/reconnect suite uses the 0.15.0 alias installed by the native tools above by default (`--paseo 0.16.0`, `0.16.2`, `0.17.0-beta.1` or `0.17.1` selects that version), or a separate CLI directory:
+The development SDK is the 0.16.2 minimum, and the SDK and native CI matrices test the versions listed under [CI](#ci). The focused restart/reconnect suite uses the 0.16.2 alias installed by the native tools above by default (`--paseo 0.17.0-beta.1` or `0.17.1` selects that version), or a separate CLI directory:
 
 ```sh
-npm install --prefix /tmp/auto-compact-paseo-015 --ignore-scripts --no-audit --no-fund @getpaseo/cli@0.15.0
+npm install --prefix /tmp/auto-compact-paseo-0162 --ignore-scripts --no-audit --no-fund @getpaseo/cli@0.16.2
 node --no-maglev tests/simulation/restart-reconnect.mjs \
-  --tools /tmp/auto-compact-paseo-015 \
+  --tools /tmp/auto-compact-paseo-0162 \
   --browser /absolute/path/to/chromium
 ```
 
-The suite checks completed-request deduplication after restart, interrupted compaction after graceful and forced shutdown, automatic recovery of a running ordinary turn after forced shutdown, actual `addHook` registration by an installed probe plugin, and rendered countdown/progress recovery after a browser connection outage. It uses a local forwarding proxy to disconnect only the browser while the daemon state changes, then reconnects the same document without reloading it. Model responses alone are synthetic.
+The suite checks completed-request deduplication after restart, interrupted compaction after graceful and forced shutdown, automatic recovery of a running ordinary turn after forced shutdown, actual `addHook` registration by an installed probe plugin, and rendered countdown/progress recovery after a browser connection outage. It uses a local forwarding proxy (`tests/simulation/proxy.mjs`) to disconnect only the browser while the daemon state changes, then reconnects the same document without reloading it. Model responses alone are synthetic.
 
 Use `--suite interrupted|recovery|hooks|browser|restart` to narrow a run and `--report-dir /path/to/results` to preserve separate attempts. Reports include product/test source hashes, request counts, conversation/operation evidence, and browser screenshots. Temporary homes are retained for inspection. The forced-shutdown checks currently require Linux; a Windows invocation must not be reported as equivalent graceful/forced coverage. Desktop Electron and mobile reconnection are separate tests.
 
@@ -60,7 +60,8 @@ On a heavily loaded machine, `--minimal-builtins` omits the released server's li
 | Operation identity | Same-ID retries during execution and after completion do not resend; conflicting input is rejected; history remains queryable after new activity |
 | Retention | Stop the plugin, age a completed native operation and seed recent/pending controls; reload deletes eligible history and orphan receipts, preserves controls, and does not resend unchanged activity |
 | Input overlap | An explicit interrupt stops the compaction, which is never reported completed; the user's own response remains on the timeline |
-| Steered and agent input | A steered message, and a message from another agent held past Paseo's two-second batch window, each get their own reply. Claude must have recorded an outcome for the `/compact`, Paseo must show exactly one command row, and the plugin's outcome must be completed exactly when Claude's record and the command's own boundary both show completion. Each overlap makes two model requests, the compaction and the follow-up, and after a completed compaction the follow-up request starts no earlier than Claude recorded the completion. Whether the host stopped the compaction or let it finish is Paseo's behavior, not the plugin's: the report's `detail` records it, and the PR checks it in the CI reports (locally, 0.16.2, 0.17.0-beta.1 and 0.17.1 finished the compaction; 0.12.0 and 0.16.0 stopped it) |
+| Screen updates | A subscription narrowed to one conversation first receives an event for everything, then an event when Compact now starts and another when it finishes, after which a status read shows the running and then the completed operation; it hears no other conversation. A second client reconnecting by itself through a forwarding proxy has its connection cut during a compaction; after the compaction finishes and the connection returns, its subscription starts again with an event for everything and its status read shows the completed operation |
+| Steered and agent input | A steered message, and a message from another agent held past Paseo's two-second batch window, each get their own reply. Claude must have recorded an outcome for the `/compact`, Paseo must show exactly one command row, and the plugin's outcome must be completed exactly when Claude's record and the command's own boundary both show completion. Each overlap makes two model requests, the compaction and the follow-up. The compaction request is answered, the operation completes, and the follow-up request starts no earlier than Claude recorded the completion |
 | Thinking level | After a change from low to high and an ordinary reply, Compact now completes on a receipt from the observer it was prepared for; the report records whether the change kept that observer |
 | Query restart | Compact now and an automatic reservation right after a pending thinking-level change both report `failed_after_dispatch` promptly, with one `/compact` command, zero compaction model requests and no completed boundary |
 | Changing TTL | New 5m/mixed responses are re-detected; later 1h data restores scheduling |
@@ -83,7 +84,7 @@ This does not measure Anthropic's real cache lifetime, billing savings or summar
 
 `npm run test:e2e:desktop` installs the ref under test from GitHub into the released Paseo desktop app, whose daemon runs the plugin on the app's Electron 44.2.0 runtime (Node 24.20.0); see [tests/e2e/README.md](https://github.com/babo-jeonguk/paseo-auto-compact-for-claude/blob/main/tests/e2e/README.md#desktop-app). Closing the window stops the desktop daemon by default; the plugin recovers when it starts again.
 
-`npm run test:e2e:android` runs the released Paseo **Android** app in a fresh Android 14 emulator, connected by direct connection to an isolated daemon with this branch installed from GitHub; see [tests/e2e/README.md](https://github.com/babo-jeonguk/paseo-auto-compact-for-claude/blob/main/tests/e2e/README.md#android-app). Paseo sends the plugin's client bundle to the app, so its pill, sheet, confirmation and polling run natively on Hermes, including the operation-ID fallback browsers never take. With the 0.12.0 and 0.13.0 APKs it passed **8/8 each** at `1a6ceb4`, as it had at `0d0ab31`: Skip and Undo, a confirmed Compact now whose operation ID the device generated (one model request), the last result in the sheet, and the same result after force-stopping and reopening the app, with no plugin stderr. Building it found two app behaviors the harness now handles: a selected conversation takes about ten seconds to show its pill on the emulator, and Paseo 0.12 briefly restores the last conversation after a restart before moving to a new chat. On a heavily loaded host the emulator's own watchdog stopped it twice ("detected a hanging thread"); those runs did not reach the plugin. At `1a6ceb4`, one 0.12.0 run at load average 12–16 timed out waiting for the pill, which its final screenshot shows rendered; the rerun at lower load passed.
+`npm run test:e2e:android` runs the released Paseo **Android** app in a fresh Android 14 emulator, connected by direct connection to an isolated daemon with this branch installed from GitHub; see [tests/e2e/README.md](https://github.com/babo-jeonguk/paseo-auto-compact-for-claude/blob/main/tests/e2e/README.md#android-app). Paseo sends the plugin's client bundle to the app, so its pill, sheet, confirmation and polling run natively on Hermes, including the operation-ID fallback browsers never take. It checks Skip and Undo, a confirmed Compact now whose operation ID the device generated (one model request), the last result in the sheet, and the same result after force-stopping and reopening the app, with no plugin stderr. It has not yet run with an APK of Paseo 0.16.2 or later. On the emulator a selected conversation takes about ten seconds to show its pill, which the harness waits for. On a heavily loaded host the emulator's own watchdog can stop it ("detected a hanging thread") before it reaches the plugin, and a wait for the pill can time out although the pill rendered; rerun at lower load.
 
 ## Optional browser validation
 
@@ -92,17 +93,17 @@ This does not measure Anthropic's real cache lifetime, billing savings or summar
 Provide an existing Playwright Core module and Chromium executable explicitly; this runner does not install browser dependencies:
 
 ```sh
-node --no-maglev tests/simulation/browser.mjs --paseo 0.12.0 \
+node --no-maglev tests/simulation/browser.mjs --paseo 0.16.2 \
   --playwright /absolute/path/to/playwright-core/index.mjs \
   --browser /absolute/path/to/chromium \
   --report-dir /absolute/path/to/results
 ```
 
-Repeat with `--paseo 0.13.0`, `--paseo 0.14.0` or `--paseo 0.16.0`. Each run writes a browser report and completed-state screenshot under `browser-<version>/`. An unavailable Windows runtime or browser is an untested environment, not a passing result; WSL execution reports Linux.
+Repeat with `--paseo 0.17.1`. Each run writes a browser report and completed-state screenshot under `browser-<version>/`. An unavailable Windows runtime or browser is an untested environment, not a passing result; WSL execution reports Linux.
 
-## Paseo 0.14 lifecycle regression
+## Session reopening and idle cleanup
 
-The focused 0.14 harness covers the two upstream lifecycle changes separately from the default matrix:
+The focused lifecycle harness covers Paseo's deferred session reopening and idle-runtime cleanup separately from the default matrix. It runs Paseo 0.16.2 by default; `--paseo 0.17.1` selects that version:
 
 ```sh
 node --no-maglev tests/simulation/lifecycle.mjs reload
@@ -110,7 +111,7 @@ node --no-maglev tests/simulation/lifecycle.mjs automatic
 node --no-maglev tests/simulation/lifecycle.mjs cleanup
 ```
 
-`reload` verifies that Compact now sends nothing after a plugin reload until an ordinary message reopens the observer, and then succeeds once. `automatic` applies the same assertion to a real one-minute reservation and normal scheduler tick. `cleanup` runs Paseo 0.14's installed idle collector with only its clock and sweep interval accelerated, then verifies closure, reservation invalidation and ordinary-message resume. It does not establish the real one-hour wait, successful compaction before cleanup, input/background-work vetoes, or a cleanup/dispatch race. These diagnostics use native Claude and the loopback model, need localhost binding, and are not part of the cross-platform CI matrix.
+`reload` verifies that Compact now sends nothing after a plugin reload until an ordinary message reopens the observer, and then succeeds once. `automatic` applies the same assertion to a real one-minute reservation and normal scheduler tick. `cleanup` runs Paseo's installed idle collector with only its clock and sweep interval accelerated, then verifies closure, reservation invalidation and ordinary-message resume. It does not establish the real one-hour wait, successful compaction before cleanup, input/background-work vetoes, or a cleanup/dispatch race. These diagnostics use native Claude and the loopback model, need localhost binding, and are not part of the cross-platform CI matrix.
 
 ## Reports and failure handling
 
@@ -128,23 +129,22 @@ Run only the native simulation:
 
 ```sh
 npm run test:simulation
-npm run test:simulation:0.12 -- --expect-platform linux
-npm run test:simulation:0.13 -- --expect-platform win32
-npm run test:simulation:0.14 -- --expect-platform linux
+npm run test:simulation:0.16.2 -- --expect-platform linux
+npm run test:simulation:0.17 -- --expect-platform win32
 ```
 
-The first command runs every version in the matrix: 0.12.0, 0.13.0, 0.14.0, 0.15.0, 0.16.2 and 0.17.1. 0.15.0-beta.1, 0.16.0-beta.1, 0.16.0 and 0.17.0-beta.1 stay pinned and run through their own scripts. The version-specific commands accept `--claude /absolute/native/claude`, `--tools /npm/prefix`, or `--report-dir /results`. A custom tools prefix may contain the matching ordinary `@getpaseo/cli` package or the versioned aliases used by this repository. Overrides still use an isolated home and the local model server. `npm run test:simulation:0.12 -- --help` lists the options.
+The first command runs every version in the matrix: 0.16.2 and 0.17.1. 0.17.0-beta.1 stays pinned and runs through its own script. The version-specific commands accept `--claude /absolute/native/claude`, `--tools /npm/prefix`, or `--report-dir /results`. A custom tools prefix may contain the matching ordinary `@getpaseo/cli` package or the versioned aliases used by this repository. Overrides still use an isolated home and the local model server. `npm run test:simulation:0.16.2 -- --help` lists the options.
 
-To change a tested Claude/Paseo version, edit its exact alias in `tests/simulation/package.json` and its entry in `tests/simulation/paseo-versions.mjs`, regenerate the lockfile with `npm install --prefix tests/simulation --ignore-scripts`, and run the full suite on both OSes. Commit both package and lockfile. Keep 0.12 in the matrix while it remains the declared minimum. Do not infer native compatibility from the unit suite alone.
+To change a tested Claude/Paseo version, edit its exact alias in `tests/simulation/package.json` and its entry in `tests/simulation/paseo-versions.mjs`, regenerate the lockfile with `npm install --prefix tests/simulation --ignore-scripts`, and run the full suite on both OSes. Commit both package and lockfile. Keep the declared minimum, 0.16.2, in the matrix. Do not infer native compatibility from the unit suite alone.
 
 ## CI
 
-[Check workflow](https://github.com/babo-jeonguk/paseo-auto-compact-for-claude/blob/main/.github/workflows/check.yml) has native simulation jobs for Paseo 0.12.0, 0.13.0, 0.14.0, 0.15.0, 0.16.2 and 0.17.1 on **ubuntu-latest** and **windows-latest**, in addition to fast SDK checks for the same versions on Linux, macOS and Windows. Pull requests, main-branch pushes and manual workflow dispatch run them and upload their reports/logs even when a test fails. No API secret is needed. [View workflow runs](https://github.com/babo-jeonguk/paseo-auto-compact-for-claude/actions/workflows/check.yml). Native macOS execution is not covered by the fast macOS checks.
+[Check workflow](https://github.com/babo-jeonguk/paseo-auto-compact-for-claude/blob/main/.github/workflows/check.yml) has native simulation jobs for Paseo 0.16.2 and 0.17.1 on **ubuntu-latest** and **windows-latest**, in addition to fast SDK checks for the same versions on Linux, macOS and Windows. Pull requests, main-branch pushes and manual workflow dispatch run them and upload their reports/logs even when a test fails. No API secret is needed. [View workflow runs](https://github.com/babo-jeonguk/paseo-auto-compact-for-claude/actions/workflows/check.yml). Native macOS execution is not covered by the fast macOS checks.
 
 ## Fast feedback and isolated runs
 
 `npm run test:focused -- server/cache.test.ts` runs just the named test file. `npm run test:update` runs only the fast checks; it no longer starts native daemons. `npm run test:release` explicitly runs the fast checks and the full native matrix from one committed snapshot.
 
-For one native version, run `npm run test:snapshot -- --suite simulation --paseo 0.13.0`. Reports include the full commit SHA in `snapshot.json` and native `report.json`, under `test-results/snapshots/<sha>-<timestamp>/`. Source edits and later pushes do not change that run. Root and simulation dependencies must be installed for the chosen lockfiles. See [development workflow](development.md#packaging-and-releases) for prerequisites and cleanup.
+For one native version, run `npm run test:snapshot -- --suite simulation --paseo 0.16.2`. Reports include the full commit SHA in `snapshot.json` and native `report.json`, under `test-results/snapshots/<sha>-<timestamp>/`. Source edits and later pushes do not change that run. Root and simulation dependencies must be installed for the chosen lockfiles. See [development workflow](development.md#packaging-and-releases) for prerequisites and cleanup.
 
 CI separates native versions into independent Linux/Windows jobs and artifacts. An open PR no longer also starts a feature-branch push workflow; a new PR commit cancels its superseded PR run. Manual dispatch can select a feature branch if it needs validation before a PR exists. Actual automatic-timer and downtime waits remain in each native lane. No retry turns an assertion failure into a pass.

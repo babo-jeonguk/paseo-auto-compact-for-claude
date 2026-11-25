@@ -1,13 +1,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { countdownTickDelay, directoryRefreshDelay, nextRenderAt, operationPollDelay, pollFailures,
-  sessionPollDelay, surfaceActive, DIRECTORY_REFRESH_MS, OPERATION_LOOKUP_MS, OPERATION_POLL_MS,
+import { countdownTickDelay, directoryRefreshDelay, listPollDelay, nextRenderAt, operationPollDelay, pollFailures,
+  sessionPollDelay, surfaceActive, DIRECTORY_REFRESH_MS, OPERATION_LOOKUP_MS,
   SESSION_BACKOFF_MS, SESSION_POLL_MS, STATUS_FRESH_MS } from "../client/cadence.ts";
 
 test("cadences are the agreed values", () => {
   assert.equal(SESSION_POLL_MS, 10_000);
   assert.equal(SESSION_BACKOFF_MS, 30_000);
-  assert.equal(OPERATION_POLL_MS, 2_000);
   assert.equal(OPERATION_LOOKUP_MS, 30_000);
   assert.equal(DIRECTORY_REFRESH_MS, 5 * 60_000);
 });
@@ -31,18 +30,32 @@ test("three consecutive failures back off; a success, focus or reconnect restore
   }
 });
 
-test("a pending operation keeps the prompt lookup until it ends", () => {
-  assert.equal(operationPollDelay({ active: true, found: true, pending: true, elapsed: 0 }), 2_000);
+test("a pending operation is looked up at the status safety interval until it ends", () => {
+  const lookup = changes => operationPollDelay({ active: true, failures: 0, found: true, pending: true, elapsed: 0, ...changes });
+  // Changes arrive through the subscription; this only covers a surface without one.
+  assert.equal(lookup({}), 10_000);
   // An accepted operation may legitimately take minutes; only a missing record is bounded.
-  assert.equal(operationPollDelay({ active: true, found: true, pending: true, elapsed: 10 * 60_000 }), 2_000);
-  assert.equal(operationPollDelay({ active: true, found: true, pending: false, elapsed: 0 }), false);
-  assert.equal(operationPollDelay({ active: false, found: true, pending: true, elapsed: 0 }), false);
+  assert.equal(lookup({ elapsed: 10 * 60_000 }), 10_000);
+  assert.equal(lookup({ failures: 3 }), 30_000, "it backs off with the status poll");
+  assert.equal(lookup({ pending: false }), false);
+  assert.equal(lookup({ active: false }), false);
 });
 
 test("an operation that is never found stops being looked up after 30 seconds", () => {
-  assert.equal(operationPollDelay({ active: true, found: false, pending: true, elapsed: 0 }), 2_000);
-  assert.equal(operationPollDelay({ active: true, found: false, pending: true, elapsed: 29_999 }), 2_000);
-  assert.equal(operationPollDelay({ active: true, found: false, pending: true, elapsed: 30_000 }), false);
+  const lookup = elapsed => operationPollDelay({ active: true, failures: 0, found: false, pending: true, elapsed });
+  assert.equal(lookup(0), 10_000);
+  assert.equal(lookup(29_999), 10_000);
+  assert.equal(lookup(30_000), false);
+});
+
+test("the conversation list reads again at the safety interval only while its subscription is not live or its last read failed", () => {
+  // A live subscription refreshes the list on every change; without one it has nothing else.
+  assert.equal(listPollDelay({ live: true, active: true, failed: false }), false);
+  assert.equal(listPollDelay({ live: false, active: true, failed: false }), SESSION_POLL_MS);
+  assert.equal(listPollDelay({ live: false, active: false, failed: false }), false);
+  // A read that failed after the change that asked for it would otherwise stay failed until the next change.
+  assert.equal(listPollDelay({ live: true, active: true, failed: true }), SESSION_POLL_MS);
+  assert.equal(listPollDelay({ live: true, active: false, failed: true }), false);
 });
 
 test("a countdown above one minute next changes at its minute boundary", () => {

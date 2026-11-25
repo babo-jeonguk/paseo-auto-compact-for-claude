@@ -13,8 +13,7 @@ async function fixture(scope: CleanupScope) {
   const home = await scope.folder('compact-observer-');
   let time = 1_000_000;
   const observer = createObserver({ home, now: () => time });
-  // The additive 0.14 fields are harmless to 0.12/0.13 and verify that the
-  // observer preserves the complete session-open request across SDK versions.
+  // A complete session-open request, which the observer must preserve.
   const request = { agentId: 'a', workspaceId: 'w', provider: 'claude',
     purpose: 'interactive', reason: 'create', cwd: home, title: 'Conversation',
     labels: { retained: 'yes' }, metadata: {}, background: false, tools: [], mcpServers: {},

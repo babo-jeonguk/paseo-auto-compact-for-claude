@@ -1,8 +1,9 @@
 export const SESSION_POLL_MS = 10_000; // safety poll while the surface is active
 export const SESSION_BACKOFF_MS = 30_000; // after SESSION_BACKOFF_FAILURES consecutive failures
 export const SESSION_BACKOFF_FAILURES = 3;
-export const OPERATION_POLL_MS = 2_000; // operation lookup while the popover is open
-export const OPERATION_LOOKUP_MS = 30_000; // bound for an operation that is never found
+// Bound for an operation that is never found. Changes arrive through the
+// subscription; a surface without one reads at the status safety cadence.
+export const OPERATION_LOOKUP_MS = 30_000;
 export const DIRECTORY_REFRESH_MS = 5 * 60_000; // directory safety refresh
 export const POLL_JITTER_MS = 5_000;
 // Status tolerates one missed poll plus network jitter: a read stays fresh this long,
@@ -61,13 +62,23 @@ export function sessionPollDelay(input: { active: boolean; failures: number }): 
   return input.failures >= SESSION_BACKOFF_FAILURES ? SESSION_BACKOFF_MS : SESSION_POLL_MS;
 }
 
+// A failed read would otherwise stay failed until the next change; a live
+// subscription refreshes the list on every change, and without one the list has
+// nothing else.
+export function listPollDelay(input: { live: boolean; active: boolean; failed: boolean }): number | false {
+  if (!input.active) return false;
+  return !input.live || input.failed ? SESSION_POLL_MS : false;
+}
+
+// Changes arrive through the subscription; this lookup only covers a surface
+// without one, at the status safety cadence, until a missing record is given up.
 export function operationPollDelay(input: {
-  active: boolean; found: boolean; pending: boolean; elapsed: number;
+  active: boolean; failures: number; found: boolean; pending: boolean; elapsed: number;
 }): number | false {
   if (!input.active) return false;
   if (input.found && !input.pending) return false;
   if (!input.found && input.elapsed >= OPERATION_LOOKUP_MS) return false;
-  return OPERATION_POLL_MS;
+  return sessionPollDelay({ active: input.active, failures: input.failures });
 }
 
 export function countdownTickDelay(remaining: number | null): number | null {

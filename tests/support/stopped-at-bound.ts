@@ -8,7 +8,6 @@ import { test } from "node:test";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
-import type { PluginSessionOpenRequest } from "@getpaseo/plugin/server";
 import { createObserver } from "../../server/observer";
 import { createScheduler } from "../../server/scheduler";
 import { createStore } from "../../server/store";
@@ -26,7 +25,7 @@ test("holds what a unit test acquires until the runner's bound stops it", async 
   await createObserver({ home }).prepareSession({
     agentId: "a", workspaceId: "w", provider: "claude", purpose: "interactive", reason: "create",
     cwd: home, title: "Conversation", labels: {}, metadata: {}, background: false, tools: [], mcpServers: {}, env: {},
-  } as PluginSessionOpenRequest, true);
+  }, true);
   const store = createStore(join(await scope.folder("compact-bound-store-"), "state.json"));
   const scheduler = createScheduler({
     store, settings: async () => ({ ...DEFAULT_SETTINGS, enabled: false }),

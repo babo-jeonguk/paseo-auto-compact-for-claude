@@ -13,11 +13,11 @@ test('simulation cannot report another operating system as tested or count unrun
   // The runner's own folder lands in the child's temp directory, which the scope removes.
   await assert.rejects(scope.run(process.execPath, [file, '--expect-platform', expected,
     '--report-dir', reportDir], { timeout: 15_000 }), error => error.code === 1);
-  const report = JSON.parse(await readFile(join(reportDir, 'paseo-0.12.0', 'report.json'), 'utf8'));
+  const report = JSON.parse(await readFile(join(reportDir, 'paseo-0.16.2', 'report.json'), 'utf8'));
   assert.equal(report.platform, process.platform);
   assert.equal(report.result, 'failed');
   assert.match(report.error, /Native OS mismatch/);
   assert(report.checks.every(check => check.result === 'not-run'));
   assert.deepEqual(report.requests, []);
-  assert.match(await readFile(join(reportDir, 'paseo-0.12.0', 'junit.xml'), 'utf8'), /<failure>/);
+  assert.match(await readFile(join(reportDir, 'paseo-0.16.2', 'junit.xml'), 'utf8'), /<failure>/);
 });

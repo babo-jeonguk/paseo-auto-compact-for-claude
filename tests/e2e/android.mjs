@@ -22,7 +22,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const simulation = resolve(here, '../simulation');
 const PACKAGE = 'sh.paseo';
 const run = promisify(execFile);
-const arg = parseOptions('android.mjs', [['--paseo', '0.13.0'], ['--to', 'main'], ['--apk', ''],
+const arg = parseOptions('android.mjs', [['--paseo', '0.16.2'], ['--to', 'main'], ['--apk', ''],
   ['--source', DEFAULT_SOURCE],
   ['--sdk', process.env.ANDROID_HOME ?? join(homedir(), 'Android', 'Sdk')],
   ['--system-image', 'system-images;android-34;google_apis;x86_64'], ['--avd-home', join(tmpdir(), 'auto-compact-e2e-avd')],
@@ -114,9 +114,9 @@ const shot = async name => writeFile(join(reportDir, `${name}.png`),
     { env: androidEnv, encoding: 'buffer', maxBuffer: 64 * 1024 * 1024, timeout: 60_000 })).stdout);
 const launch = () => shell('monkey', '-p', PACKAGE, '-c', 'android.intent.category.LAUNCHER', '1');
 // Reach the conversation from whatever the app shows: it may reopen it, show a new chat, or leave
-// the drawer over an already selected conversation. Paseo 0.12 briefly restores the last
-// conversation after a restart and then moves to a new chat, so require the view to hold.
-// The drawer lists "New workspace" with "Schedules"; 0.12's home screen has "New workspace" alone.
+// the drawer over an already selected conversation. After a restart the app can show the last
+// conversation briefly and then move to a new chat, so require the view to hold.
+// The drawer lists "New workspace" with "Schedules"; a home screen can show "New workspace" alone.
 // Never press Back: on the home screen it leaves the app. A selected conversation can take ten
 // seconds to show its pill on the emulator, so wait before acting again.
 const openConversation = () => { let since = 0, tries = 0, selectedAt = 0; return waitFor(async () => {
