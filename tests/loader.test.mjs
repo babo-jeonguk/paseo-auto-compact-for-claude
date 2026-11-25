@@ -21,9 +21,9 @@ test('a unit test that checks nothing is pending passes on a cold loader cache',
   // would keep its cache, so nothing compiled earlier is reused. The child
   // inherits neither this process's cache setting nor its preloads, so only
   // its own command can turn the cache off.
-  const env = { ...process.env };
-  delete env.TSX_DISABLE_CACHE;
-  delete env.NODE_OPTIONS;
+  // Windows reads variable names in any case, so they are matched that way.
+  const env = Object.fromEntries(Object.entries(process.env)
+    .filter(([name]) => !['TSX_DISABLE_CACHE', 'NODE_OPTIONS'].includes(name.toUpperCase())));
   const { temp } = await cleanupScope(t).run(process.execPath, [...flags, 'tests/support/drained-after-load.ts'],
     { cwd: root, env, timeout: CHILD_MS });
   assert.deepEqual((await readdir(temp)).filter(name => name.startsWith('tsx')), []);

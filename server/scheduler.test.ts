@@ -2680,7 +2680,8 @@ test("with timers that return no handle, the scheduler clears every timer it arm
   await f.drained();
   s.stop();
   assert.ok(armed > 0, "the pass armed its bounds and the single-flight timer");
-  assert.equal(opaque.cleared.length, armed, "each one is cleared by the handle it returned");
+  assert.deepEqual(opaque.cleared, Array.from({ length: armed }, () => undefined),
+    "each one is cleared by the handle it returned");
 });
 
 test("a stopped scheduler starts no read, write, host call or timer for a call made after it stopped", async () => {
