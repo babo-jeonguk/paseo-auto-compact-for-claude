@@ -5,7 +5,7 @@ import { knownBlockedReason, operationPending, operationRowStatus, SESSION_RESUM
   type CompactTarget, type Row } from "../shared/rpc";
 import { targetOf, unchanged, type Gateway, type Job, type Observation, type State, type StateStore,
   type StoredOperation } from "./model";
-import { createOperationWorker, recoverOperations, inputFingerprint, mayHaveSent,
+import { createOperationWorker, leftoverRetirement, recoverOperations, inputFingerprint, mayHaveSent,
   publicOperation, sameActivity, syncJobs } from "./operations";
 import { automaticBlock, dueAt, DELIVERY_WINDOW_MS } from "./policy";
 import { HISTORY_RETENTION_MS, HISTORY_SWEEP_INTERVAL_MS, pruneOperationHistory, type OperationReceipts } from "./retention";
@@ -308,6 +308,9 @@ export function createScheduler(options: {
     }
     await store.write(state);
     await cleanup();
+    // History cleanup may have pruned operations and saved a newer state; a
+    // leftover request is decided against what is retained after it.
+    return store.read();
   }
   async function cleanup() {
     if (!receipts) return;
@@ -333,7 +336,19 @@ export function createScheduler(options: {
       return result;
     }),
   });
-  const ready = serialize(recover);
+  // Retire requests an earlier instance left prepared, decided against the
+  // operations the startup transaction just saved. It runs outside the state
+  // queue and does not hold `ready`: a request file held at the file system
+  // must not hold every later state change, and a stop ends the wait. It may
+  // run alongside the worker's first pass, which is safe because the observer
+  // leaves this instance's own preparations alone and serializes every write of
+  // a request file. Each failure is reported on its own.
+  const ready = serialize(recover).then(state => {
+    if (!gateway.recover) return;
+    void wait(begin(() => gateway.recover!(
+      request => leftoverRetirement(request, state.operations.find(operation => operation.id === request.id)),
+      onError))).catch(onError);
+  });
 
   async function view(
     agent: Observation,

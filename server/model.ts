@@ -44,7 +44,10 @@ export const JobSchema = z.object({
 });
 export type Job = z.infer<typeof JobSchema>;
 export const NativeOperationSchema = z.object({ id: z.string(), launchId: z.string(), generation: z.string(),
-  sessionId: z.string().nullable(), revision: z.number().int() });
+  sessionId: z.string().nullable(), revision: z.number().int(),
+  // Which preparation of the native request was sent against; absent from
+  // evidence earlier releases recorded.
+  preparation: z.string().optional() });
 export type NativeOperation = z.infer<typeof NativeOperationSchema>;
 export const OperationEvidenceSchema = z.object({
   native: NativeOperationSchema.optional(),
@@ -73,6 +76,14 @@ export class Refusal extends Error {}
 export function readable<T extends Observation | null>(agent: T): T {
   if (agent?.observerUnreadable) throw new Error("Claude observer could not be read");
   return agent;
+}
+
+// A record and a request or evidence belong to the same preparation unless both
+// name a preparation and the two differ. A record or evidence naming none, from
+// an earlier release or a rollback, is matched by the operation ID alone.
+export function samePreparation(recordPreparation: string | undefined, attribution: string | undefined) {
+  return recordPreparation === undefined || attribution === undefined ||
+    recordPreparation === attribution;
 }
 
 export const targetOf = (agent: Pick<Observation, "sessionId" | "activityKey">): CompactTarget =>
@@ -108,6 +119,10 @@ export interface StateStore {
   read(): Promise<State>;
   write(state: State): Promise<void>;
 }
+// A native request an earlier plugin instance left prepared, and what to do
+// with it: null keeps it, otherwise it is retired as sent or unsent.
+export type LeftoverRequest = { id: string; preparation?: string };
+export type LeftoverDecision = (request: LeftoverRequest) => { sent: boolean } | null;
 export interface DispatchGuard {
   expiresAt: number;
   allowed(): Promise<boolean>;
@@ -138,4 +153,6 @@ export interface Gateway {
   inspect?: (operation: StoredOperation) => Promise<CompactOutcome | null>;
   /** Retire a finished operation's native request; best effort. */
   release?: (operation: StoredOperation) => Promise<void>;
+  /** Retire native requests an earlier plugin instance left prepared, as `decide` says. */
+  recover?: (decide: LeftoverDecision, report: (error: unknown) => void) => Promise<void>;
 }

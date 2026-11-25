@@ -1522,3 +1522,18 @@ test("recovery accepts a confirmed query-restart refusal within the deadline and
   assert.equal((await host.gateway.inspect!(operation))?.status, "completed");
   host.stop();
 });
+
+test("the gateway records which preparation of the native request it sends against", async (t) => {
+  const scope = cleanupScope(t);
+  const native = observer(null)!;
+  const prepare = native.prepare;
+  native.prepare = async (...args: Parameters<typeof prepare>) => ({ ...await prepare(...args), preparation: "preparation-1" });
+  const host = fixture(scope, [], undefined, false, [], { observer: native });
+  const saved: OperationEvidence[] = [];
+  await host.gateway.compact("a", (await host.gateway.refresh("a"))!, {
+    id: "operation-1", sendBy: host.clock.now() + 30_000,
+    checkpoint: async evidence => { saved.push(evidence); }, current: () => true,
+  });
+  assert.equal(saved[0]?.native?.preparation, "preparation-1");
+  assert(saved.every(evidence => evidence.native?.preparation === "preparation-1"));
+});

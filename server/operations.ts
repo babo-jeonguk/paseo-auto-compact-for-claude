@@ -1,8 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import { finishedState, operationRowStatus, operationPending, type CompactOperation, type CompactTarget,
   type ResultCode } from "../shared/rpc";
-import { Refusal, readable, unchanged, type CompactOutcome, type Gateway, type State, type StateStore,
-  type StoredOperation } from "./model";
+import { Refusal, readable, samePreparation, unchanged, type CompactOutcome, type Gateway, type LeftoverRequest,
+  type State, type StateStore, type StoredOperation } from "./model";
 import type { Settings } from "../shared/settings";
 import { createLifetime, deadlineOf, INSPECT_TIMEOUT_MS, OBSERVATION_MS, readWithin, Stopped, systemTimers,
   type Timers } from "./deadline";
@@ -36,6 +36,23 @@ export function sameActivity(operation: Pick<CompactOperation, "agentId" | "revi
 // proves that nothing was sent. Legacy history never recorded the marker.
 export const mayHaveSent = (operation: StoredOperation) => operation.kind === "legacy" ||
   !(operation.state === "expired" || (operation.state === "failed" && operation.evidence?.dispatchStartedAt === undefined));
+
+export function leftoverRetirement(request: LeftoverRequest, operation: StoredOperation | undefined): { sent: boolean } | null {
+  // An operation no longer retained ended at least the retention period ago.
+  if (!operation) return { sent: false };
+  if (operationPending(operation)) {
+    // Pending without the dispatch marker: the earlier instance never sent it,
+    // and a retry prepares a fresh request.
+    if (operation.evidence?.dispatchStartedAt === undefined) return { sent: false };
+    // Possibly sent and still observed with the same preparation: the observer
+    // needs the request to attribute its outcome. A side naming no preparation,
+    // from an earlier release, is matched by the operation.
+    const native = operation.evidence.native?.preparation;
+    return samePreparation(request.preparation, native) ? null : { sent: true };
+  }
+  // Finished: retired as the worker's release would, sent once the marker exists.
+  return { sent: operation.evidence?.dispatchStartedAt !== undefined };
+}
 
 // Jobs keep the fields v1.0.2 reads, so a rollback neither replays an attempted
 // reservation nor blocks a retry of one that sent nothing. The scheduler applies
@@ -104,11 +121,11 @@ export function createOperationWorker(options: {
   // Reports: what a stopped worker's run meets is its stopping, not a fault.
   const onError = (error: unknown) => { if (live()) options.onError(error); };
   // Retiring a finished operation's native request. A stopped worker starts no
-  // retirement, since one it started would not be ordered with the next
-  // instance's writes; the request stays prepared, as after a crash at this
-  // point. A release that fails or outlasts its wait is not reported either:
-  // the operation has already ended, and a request it leaves prepared is
-  // checked like any other at the next /compact (docs/runtime.md).
+  // retirement, because its durable writes have closed (the plugin's stop closes
+  // them first); a request left prepared is retired by the next instance's
+  // startup recovery, and until then the observer checks at most one /compact
+  // against it. A release that fails or outlasts its wait is not reported
+  // either: the operation has already ended (docs/runtime.md).
   const release = async (operation: StoredOperation) => {
     if (live() && operation.evidence?.native && gateway.release)
       await wait(gateway.release(operation), INSPECT_TIMEOUT_MS).catch(() => {});

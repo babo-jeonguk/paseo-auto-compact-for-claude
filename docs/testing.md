@@ -68,6 +68,7 @@ On a heavily loaded machine, `--minimal-builtins` omits the released server's li
 | Missing TTL | Labeled default retains 50/55-minute scheduling |
 | Configuration | Explicit settings work; environment takes priority over merged settings |
 | Reload | Settings, conversation OFF and session identity preserved without replay; an in-flight operation recovers through its native receipt and exact command boundary without a second model request |
+| Leftover request | An expired request left prepared in a running launch refuses only the first manual `/compact`; the next two run as the user's own, each with its own boundary. After a plugin reload, a request left prepared by the previous instance is retired as unsent |
 | Concurrent conversations | Two conversations compact at the same time; each operation's receipt and completed command boundary stay with its own conversation, a second request for a held conversation returns the existing operation, and each native session is unchanged |
 | Downtime | An already-due reservation expires when the plugin returns |
 | Daemon recovery | OFF persists; reopening the same conversation supports a fresh reservation |

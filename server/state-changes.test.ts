@@ -23,7 +23,7 @@ async function plugin(t: TestContext, prefix: string) {
   const host = pluginHost();
   const stopPlugin = contribute(host.server);
   let stopped = false;
-  const stop = () => { if (!stopped) { stopped = true; stopPlugin(); } };
+  const stop = async () => { if (!stopped) { stopped = true; await stopPlugin(); } };
   scope.defer(stop);
   const toggle = (agentId: string, enabled: boolean) =>
     host.handler<Toggle>(toggleRpc.name)({ agentId, enabled }, { paseo });
@@ -86,7 +86,7 @@ test("an aborted subscription hears nothing more, and a stopped plugin leaves no
   await f.toggle("a", false);
   assert.equal(ended.events.length, 1);
   assert.deepEqual(open.events.slice(1).map(event => event.agentId), ["a"]);
-  f.stop();
+  await f.stop();
   // The host aborts what is still open once the plugin has stopped.
   open.abort();
   await f.drained();

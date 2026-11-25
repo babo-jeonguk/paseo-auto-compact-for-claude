@@ -4,6 +4,7 @@ import { createScheduler, TICK_INTERVAL_MS } from "./server/scheduler";
 import { createCachedStore, createStore } from "./server/store";
 import { createStateChanges } from "./server/state-changes";
 import { createObserver } from "./server/observer";
+import { createDurableWrites, type DurableFiles } from "./server/durable";
 import { createReporter } from "./server/report";
 import { claudeProvider } from "./shared/providers";
 import {
@@ -18,9 +19,12 @@ import {
 } from "./shared/rpc";
 import { compactSettings } from "./shared/settings";
 
-export default function contribute(server: PluginServerContext) {
+// Paseo passes only the server; tests hold file steps through `files`.
+export default function contribute(server: PluginServerContext, options: { files?: DurableFiles } = {}) {
   const settings = server.registerSettings(compactSettings);
-  const observer = createObserver();
+  // One lifetime for every durable write: the state store and the observer.
+  const writes = createDurableWrites(options.files);
+  const observer = createObserver({ writes });
   const host = createGateway({ observer });
   // Work cut off by shutdown recovers from durable state on next start; see
   // server/report.ts for how its errors are told apart from real ones.
@@ -30,7 +34,7 @@ export default function contribute(server: PluginServerContext) {
   // changes no matter which part of the plugin saved them.
   const changes = createStateChanges();
   const scheduler = createScheduler({
-    store: createCachedStore(createStore(), changes.saved),
+    store: createCachedStore(createStore(undefined, writes), changes.saved),
     gateway: host.gateway,
     receipts: { remove: observer.removeReceipt, sweep: observer.sweepReceipts },
     settings: async () => {
@@ -142,7 +146,13 @@ export default function contribute(server: PluginServerContext) {
     void scheduler.tick(host.connected()).catch(report);
     if (host.connected()) void scheduler.observe({ kind: "periodic" }).catch(report);
   }, TICK_INTERVAL_MS);
-  return () => {
+  return async () => {
+    // Paseo asks the plugin to stop, then awaits this cleanup before it closes
+    // the process and starts the replacement (SIGTERM 2 s after, SIGKILL 2 s
+    // later). Closing first stops new writes; draining last lets a write
+    // already issued land before the next instance starts, while a publication
+    // that was never issued never happens at all.
+    writes.close();
     reporter.dispose();
     clearInterval(timer);
     scheduler.stop();
@@ -151,5 +161,6 @@ export default function contribute(server: PluginServerContext) {
     // A settings subscription may end asynchronously, after the reporter is
     // disposed; a defect in it is still logged.
     for (const stop of stops) void Promise.resolve(stop()).catch(reporter.teardown);
+    await writes.drain();
   };
 }

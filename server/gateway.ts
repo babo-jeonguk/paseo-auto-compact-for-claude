@@ -1,7 +1,7 @@
 import type { PluginHandlerContext, PluginHookEvents } from "@getpaseo/plugin/server";
 import { randomUUID } from "node:crypto";
 import { Refusal, readable, targetOf, unchanged, type Gateway, type Observation, type DispatchGuard, type ExecutionContext,
-  type OperationEvidence, type StoredOperation } from "./model";
+  type LeftoverDecision, type OperationEvidence, type StoredOperation } from "./model";
 import type { createObserver } from "./observer";
 import { bounded, CLEANUP_TIMEOUT_MS, deadlineOf, LIVE_OBSERVATION_MS, observationEndBy, pause, readWithin, SEND_DEADLINE_MS,
   SEND_TIMEOUT_MS, systemTimers, type Timers } from "./deadline";
@@ -155,6 +155,11 @@ export function createGateway(options: {
           turn.end();
         }
       },
+      // Startup retires what an earlier instance left prepared, as the
+      // scheduler's leftover decision says; each conversation's failure is the
+      // scheduler's to report.
+      recover: async (decide: LeftoverDecision, report: (error: unknown) => void) =>
+        observer.recoverPrepared(decide, report),
     } : {}),
     compact: (id, expected, execution) => compact(id, expected, false, undefined, execution),
     async inspect(operation) {
@@ -234,7 +239,10 @@ export function createGateway(options: {
         preparing = observer.prepare(before, automatic, observationEndBy(sendBy), id);
         operation = await read(preparing);
         const { launchId, generation, sessionId, revision } = operation;
-        evidence.native = { id, launchId, generation, sessionId, revision };
+        // The preparation names this exact request, so a receipt from another
+        // preparation of the same operation cannot settle it.
+        evidence.native = { id, launchId, generation, sessionId, revision,
+          ...(operation.preparation ? { preparation: operation.preparation } : {}) };
         await checkpoint(true);
       } else if (automatic) throw new Refusal("Claude observer unavailable");
       pending.set(agentId, entry);
@@ -329,11 +337,11 @@ export function createGateway(options: {
       }
       const cleanupMs = options.cleanupTimeoutMs ?? CLEANUP_TIMEOUT_MS;
       // A preparation that outlives the wait on it is still retired once it
-      // lands; the cleanup wait bounds waiting, it does not cancel the work.
-      // The turn ends with those writes, however late.
-      // When the plugin stops after dispatch, leave the prepared request intact
-      // so a restarting query can still attribute its refusal; the next instance's
-      // reconciliation retires it once the operation settles.
+      // lands while the plugin runs; the cleanup wait bounds waiting, it does
+      // not cancel the work. The turn ends with those writes, however late.
+      // Once the plugin's durable writes have closed (it stopped after dispatch),
+      // the retirement is refused and the next instance's startup recovery
+      // retires the request, so a restarting query can still attribute its refusal.
       const prepared = operation !== undefined ? Promise.resolve(operation) : preparing;
       const retire = prepared && !(sent && stopped)
         ? prepared.then(value => observer!.cancel(value, sent), () => undefined)

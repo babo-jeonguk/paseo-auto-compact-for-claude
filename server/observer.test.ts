@@ -8,11 +8,21 @@ import { observerAsset } from './observer-assets.generated';
 import type { PluginSessionOpenRequest } from '@getpaseo/plugin/server';
 import type { Observation, StoredOperation } from './model';
 import { cleanupScope, type CleanupScope } from '../tests/support/scope';
+import { createDurableWrites, type DurableFiles } from './durable';
+import { createGateway } from './gateway';
+import { Refusal } from './model';
+import { Stopped } from './deadline';
+import { SESSION_RESUME_REQUIRED } from '../shared/rpc';
+import { heldFiles } from '../tests/support/files';
+import { fakeTimers } from '../tests/support/timers';
+import { drainer } from '../tests/support/drained';
+import type { PluginHandlerContext } from '@getpaseo/plugin/server';
 
-async function fixture(scope: CleanupScope) {
+async function fixture(scope: CleanupScope, files?: DurableFiles) {
   const home = await scope.folder('compact-observer-');
   let time = 1_000_000;
-  const observer = createObserver({ home, now: () => time });
+  const writes = createDurableWrites(files);
+  const observer = createObserver({ home, now: () => time, writes });
   // A complete session-open request, which the observer must preserve.
   const request = { agentId: 'a', workspaceId: 'w', provider: 'claude',
     purpose: 'interactive', reason: 'create', cwd: home, title: 'Conversation',
@@ -37,8 +47,8 @@ async function fixture(scope: CleanupScope) {
   await save();
   const agent: Observation = { agentId: 'a', title: null, workspace: home, provider: 'claude',
     revision: new Date(time).toISOString(), tokens: 210_000, eligible: true, idle: true, sessionId: 'native-a' };
-  return { home, request, prepared, observer, agent, ledger, save, directory, parent, manifest,
-    advance(ms: number) { time += ms; } };
+  return { home, request, prepared, observer, agent, ledger, save, directory, parent, manifest, writes,
+    now: () => time, advance(ms: number) { time += ms; } };
 }
 
 test('observer session preparation preserves provider environment and ignores history/non-Claude sessions', async (t) => {
@@ -79,7 +89,9 @@ const READABLE_BUILDS = ['f8a02403e4f6c17e010ddda4d0385109fe8c480dfc379c9bb91d30
   // v1.2.2
   '61b60834478e92325dc73fdb2b9235805997f990fe5ab8664bfef7ccc8f06d61',
   // main after the lint cleanup: why-comments and a named heartbeat only
-  '4ab2a02a0d279eb0db390fa1462b83db78aa1dea74c8e12af7f07174eb7789b5'];
+  '4ab2a02a0d279eb0db390fa1462b83db78aa1dea74c8e12af7f07174eb7789b5',
+  // main after per-preparation /compact checks (#35)
+  '5a63cf937b60c41787f011a1384a22e8cabb02a67249d86b17f22fa6c1f2afe6'];
 
 test('the current observer build is listed, so the build it replaces stays checked', () => {
   assert(READABLE_BUILDS.includes(observerAsset.version),
@@ -426,5 +438,340 @@ test('a confirmed query-restart refusal is accepted by both receipt and result; 
       await f.save();
       assert.equal(await f.observer.result('a', operation), null, `result must reject: ${name}`);
     }
+  }
+});
+
+const requestFile = async (directory: string) => JSON.parse(await readFile(join(directory, 'request.json'), 'utf8'));
+
+test('each preparation of a request has its own identity, and retiring one never retires another', async (t) => {
+  const f = await fixture(cleanupScope(t));
+  const first = await f.observer.prepare(f.agent, false, 1_030_000, 'same-operation');
+  const second = await f.observer.prepare(f.agent, false, 1_030_000, 'same-operation');
+  assert.equal(typeof first.preparation, 'string');
+  assert.notEqual(first.preparation, second.preparation, 'a retry of the same operation is a new preparation');
+  assert.equal((await requestFile(f.directory)).preparation, second.preparation);
+  // A late retirement of the earlier preparation, by the attempt or by release.
+  await f.observer.cancel(first, false);
+  await f.observer.release('a', { id: 'same-operation', launchId: first.launchId, preparation: first.preparation }, true);
+  assert.equal((await requestFile(f.directory)).status, 'prepared');
+  assert.equal((await requestFile(f.directory)).preparation, second.preparation);
+  await f.observer.cancel(second, false);
+  assert.deepEqual(await requestFile(f.directory),
+    { id: 'same-operation', preparation: second.preparation, status: 'settled' },
+    'the retired request still names the preparation it retired');
+});
+
+test('a request an earlier release prepared, without a preparation identity, is still retired by its operation', async (t) => {
+  const f = await fixture(cleanupScope(t));
+  await writeFile(join(f.directory, 'request.json'), JSON.stringify({ id: 'earlier', launchId: f.manifest.launchId,
+    generation: 'generation-1', sessionId: 'native-a', revision: 1, preparedAt: 1_000_000, expiresAt: 1_030_000,
+    requireCache: false, cacheDeadline: null, clockEpoch: 0, status: 'prepared' }));
+  // Evidence an earlier release recorded names no preparation either.
+  await f.observer.release('a', { id: 'earlier', launchId: f.manifest.launchId }, false);
+  assert.equal((await requestFile(f.directory)).status, 'settled');
+});
+
+test('a retirement and a newer preparation of the same request land in the order they were asked for', async (t) => {
+  const { files, holdRename } = heldFiles();
+  const f = await fixture(cleanupScope(t), files);
+  const drained = drainer();
+  const first = await f.observer.prepare(f.agent, false, 1_030_000, 'same-operation');
+  // The newer preparation's rename is issued and held at the file system.
+  const held = holdRename(join(f.directory, 'request.json'));
+  const preparing = f.observer.prepare(f.agent, false, 1_030_000, 'same-operation');
+  await held.reached;
+  // A late retirement of the earlier preparation, asked for after it, waits
+  // for that rename to land rather than reading the request beneath it.
+  let retired = false;
+  const retiring = f.observer.cancel(first, false).then(() => { retired = true; });
+  await drained();
+  assert.equal(retired, false, 'the retirement waits for the preparation asked for before it');
+  held.release();
+  const second = await preparing;
+  await retiring;
+  const request = await requestFile(f.directory);
+  assert.equal(request.status, 'prepared', 'the retirement cannot replace the newer preparation');
+  assert.equal(request.preparation, second.preparation);
+});
+
+test('a delayed publication of an earlier launch cannot replace a newer active launch', async (t) => {
+  const { files, holdRename } = heldFiles();
+  const f = await fixture(cleanupScope(t), files);
+  const drained = drainer();
+  const manifestPath = join(f.parent, 'current.json');
+  const held = holdRename(manifestPath);
+  const earlier = f.observer.prepareSession(f.request, true);
+  await held.reached;
+  let opened = false;
+  const later = f.observer.prepareSession(f.request, true).then(value => { opened = true; return value; });
+  await drained();
+  assert.equal(opened, false, 'the later launch waits for the earlier publication');
+  held.release();
+  await earlier;
+  const newest = await later;
+  const launch = newest.env.CLAUDE_CODE_PLUGIN_DIRS.split(delimiter).at(-1)!.split(/[\\/]/).at(-2);
+  assert.equal(JSON.parse(await readFile(manifestPath, 'utf8')).launchId, launch);
+  assert.equal(f.observer.startedHere('a', launch!), true);
+});
+
+test('once durable writes close, no launch, preparation or retirement is written', async (t) => {
+  const f = await fixture(cleanupScope(t));
+  const prepared = await f.observer.prepare(f.agent, false, 1_030_000, 'operation');
+  const manifest = await readFile(join(f.parent, 'current.json'), 'utf8');
+  f.writes.close();
+  await assert.rejects(f.observer.prepareSession(f.request, true), Stopped);
+  await assert.rejects(f.observer.prepare(f.agent, false, 1_030_000, 'another'), Stopped);
+  await assert.rejects(f.observer.cancel(prepared, false), Stopped);
+  assert.equal(await readFile(join(f.parent, 'current.json'), 'utf8'), manifest);
+  assert.equal((await requestFile(f.directory)).preparation, prepared.preparation);
+  assert.equal((await requestFile(f.directory)).status, 'prepared');
+  await f.writes.drain();
+});
+
+test('after a reload the gateway sends nothing to the launch the previous instance started, until a fresh launch opens', async (t) => {
+  const scope = cleanupScope(t);
+  const f = await fixture(scope);
+  // The next plugin instance, on the same data directory.
+  const next = createObserver({ home: f.home, now: f.now, writes: createDurableWrites() });
+  const host = createGateway({ observer: next, now: f.now, timers: fakeTimers() });
+  scope.defer(() => host.stop());
+  let sends = 0;
+  let sentOnce!: () => void;
+  const sent = new Promise<void>(resolve => { sentOnce = resolve; });
+  const agent = { id: 'a', provider: 'claude', cwd: f.home, title: null, labels: {}, status: 'idle', activeTurn: null,
+    pendingPermissions: [], lastUserMessageAt: f.agent.revision, persistence: { sessionId: 'native-a' } };
+  host.attach({ config: { get: async () => ({ config: { providers: {} } }) },
+    agents: { ref: () => ({ refresh: async () => ({ agent }), send: async () => { sends++; sentOnce(); },
+      timeline: { subscribe: () => ({ ready: Promise.resolve(), release() {} }) } }) },
+  } as unknown as PluginHandlerContext['paseo']);
+  assert.equal((await host.gateway.refresh('a'))!.resumeRequired, true);
+  await assert.rejects(host.gateway.compact('a'),
+    (error: unknown) => error instanceof Refusal && error.message === SESSION_RESUME_REQUIRED);
+  // An ordinary message reopens the session, which prepares a fresh launch.
+  const reopened = await next.prepareSession(f.request, true);
+  const launchId = reopened.env.CLAUDE_CODE_PLUGIN_DIRS.split(delimiter).at(-1)!.split(/[\\/]/).at(-2)!;
+  await writeFile(join(f.parent, launchId, 'ledger.json'), JSON.stringify({ ...f.ledger, launchId }));
+  assert.equal((await host.gateway.refresh('a'))!.resumeRequired, undefined);
+  assert.equal(sends, 0);
+  // The next request then goes to the fresh launch.
+  void host.gateway.compact('a').catch(() => {});
+  await sent;
+  assert.equal(sends, 1);
+  const request = await requestFile(join(f.parent, launchId));
+  assert.equal(request.status, 'prepared');
+  assert.equal(request.launchId, launchId);
+});
+
+test('requests an earlier instance left prepared are retired as decided, once, and this instance leaves its own alone', async (t) => {
+  const f = await fixture(cleanupScope(t));
+  // Left prepared by the instance before a reload.
+  const left = await f.observer.prepare(f.agent, false, 1_030_000, 'left');
+  const next = createObserver({ home: f.home, now: f.now, writes: createDurableWrites() });
+  const offered: unknown[] = [];
+  const reported: unknown[] = [];
+  const report = (error: unknown) => { reported.push(error); };
+  await next.recoverPrepared(request => { offered.push(request); return { sent: false }; }, report);
+  assert.deepEqual(offered, [{ id: 'left', preparation: left.preparation }]);
+  assert.deepEqual(await requestFile(f.directory), { id: 'left', preparation: left.preparation, status: 'settled' });
+  await next.recoverPrepared(() => assert.fail('a retired request is not offered again'), report);
+  // A preparation this instance made is its own attempt's to retire.
+  const own = await next.prepare(f.agent, false, 1_030_000, 'own');
+  await next.recoverPrepared(() => assert.fail('an own preparation is not a leftover'), report);
+  assert.equal((await requestFile(f.directory)).preparation, own.preparation);
+  // A leftover still needed for observation stays prepared; one that may have
+  // been sent is retired as sent, here without any record that Claude consumed it.
+  const kept = await f.observer.prepare(f.agent, false, 1_030_000, 'observed');
+  const later = createObserver({ home: f.home, now: f.now, writes: createDurableWrites() });
+  await later.recoverPrepared(() => null, report);
+  assert.equal((await requestFile(f.directory)).status, 'prepared');
+  await later.recoverPrepared(() => ({ sent: true }), report);
+  assert.deepEqual(await requestFile(f.directory), { id: 'observed', preparation: kept.preparation, status: 'cancelled' });
+  assert.deepEqual(reported, []);
+});
+
+test('a native record from another preparation of the same operation settles nothing; one naming none still does', async (t) => {
+  const f = await fixture(cleanupScope(t));
+  const operation = await f.observer.prepare(f.agent, true, 1_030_000, 'operation');
+  const native = { ...operation, preparation: operation.preparation };
+  const receipt = (preparation?: string) => writeFile(join(f.parent, 'receipts', 'operation.json'), JSON.stringify({
+    id: 'operation', launchId: operation.launchId, generation: operation.generation, sessionId: operation.sessionId,
+    revision: operation.revision, status: 'failed', reason: 'Reservation expired', observedAt: 1_000_050,
+    ...(preparation ? { preparation } : {}) }));
+  await receipt('another-preparation');
+  assert.equal(await f.observer.receipt('a', native), null);
+  f.ledger.compact = { id: 'operation', revision: 1, status: 'failed', preparation: 'another-preparation' } as typeof f.ledger.compact;
+  await f.save();
+  assert.equal(await f.observer.result('a', native), null);
+  await receipt(operation.preparation);
+  assert.equal((await f.observer.receipt('a', native))?.status, 'failed');
+  // An observer build from an earlier release records no preparation.
+  await receipt();
+  assert.equal((await f.observer.receipt('a', native))?.status, 'failed');
+  f.ledger.compact = { id: 'operation', revision: 1, status: 'failed' }; await f.save();
+  assert.equal((await f.observer.result('a', native))?.status, 'failed');
+});
+
+test('a retirement counts only a record of its own preparation as Claude having consumed the request', async (t) => {
+  const f = await fixture(cleanupScope(t));
+  const first = await f.observer.prepare(f.agent, true, 1_030_000, 'operation');
+  // A /compact was checked against the first preparation and Claude ran it.
+  await writeFile(join(f.parent, 'receipts', 'operation.json'), JSON.stringify({ id: 'operation',
+    launchId: first.launchId, generation: first.generation, sessionId: first.sessionId, revision: first.revision,
+    status: 'completed', reason: null, observedAt: 1_000_050, preparation: first.preparation }));
+  f.ledger.compact = { id: 'operation', revision: 1, status: 'completed', preparation: first.preparation } as typeof f.ledger.compact;
+  await f.save();
+  // A retry, sent and never observed: its late /compact must stay refused.
+  const second = await f.observer.prepare(f.agent, true, 1_030_000, 'operation');
+  await f.observer.cancel(second, true);
+  assert.deepEqual(await requestFile(f.directory), { id: 'operation', preparation: second.preparation, status: 'cancelled' });
+  // Startup recovery retires a leftover by the same rule.
+  const third = await f.observer.prepare(f.agent, true, 1_030_000, 'operation');
+  const next = createObserver({ home: f.home, now: f.now, writes: createDurableWrites() });
+  const reported: unknown[] = [];
+  await next.recoverPrepared(() => ({ sent: true }), error => { reported.push(error); });
+  assert.deepEqual(reported, []);
+  assert.deepEqual(await requestFile(f.directory), { id: 'operation', preparation: third.preparation, status: 'cancelled' });
+});
+
+test('a live record of another preparation is no answer yet, whatever its revision', async (t) => {
+  const f = await fixture(cleanupScope(t));
+  const first = await f.observer.prepare(f.agent, true, 1_030_000, 'operation');
+  const second = await f.observer.prepare(f.agent, true, 1_030_000, 'operation');
+  f.ledger.compact = { id: 'operation', revision: 0, status: 'completed', preparation: first.preparation } as typeof f.ledger.compact;
+  await f.save();
+  assert.equal(await f.observer.result('a', second), null);
+});
+
+test('evidence naming no preparation, as an earlier release or a rollback left it, matches a record that names one', async (t) => {
+  const f = await fixture(cleanupScope(t));
+  const operation = await f.observer.prepare(f.agent, true, 1_030_000, 'operation');
+  const { preparation, ...untagged } = operation;
+  await writeFile(join(f.parent, 'receipts', 'operation.json'), JSON.stringify({ id: 'operation',
+    launchId: operation.launchId, generation: operation.generation, sessionId: operation.sessionId,
+    revision: operation.revision, status: 'failed', reason: 'Reservation expired', observedAt: 1_000_050, preparation }));
+  assert.equal((await f.observer.receipt('a', untagged))?.status, 'failed');
+  f.ledger.compact = { id: 'operation', revision: 1, status: 'failed', preparation } as typeof f.ledger.compact;
+  await f.save();
+  assert.equal((await f.observer.result('a', untagged))?.status, 'failed');
+});
+
+test('a request that does not validate is never rewritten by a retirement or recovery', async (t) => {
+  const f = await fixture(cleanupScope(t));
+  const operation = await f.observer.prepare(f.agent, false, 1_030_000, 'operation');
+  const malformed = JSON.stringify({ ...await requestFile(f.directory), preparation: 5 });
+  await writeFile(join(f.directory, 'request.json'), malformed);
+  await assert.rejects(f.observer.cancel(operation, false));
+  assert.equal(await readFile(join(f.directory, 'request.json'), 'utf8'), malformed);
+  const next = createObserver({ home: f.home, now: f.now, writes: createDurableWrites() });
+  const reported: unknown[] = [];
+  await next.recoverPrepared(() => ({ sent: false }), error => { reported.push(error); });
+  assert.equal(reported.length, 1);
+  assert.equal(await readFile(join(f.directory, 'request.json'), 'utf8'), malformed);
+});
+
+// A leftover prepared request in conversation `agentId`'s active launch.
+async function leftover(f: Awaited<ReturnType<typeof fixture>>, agentId: string) {
+  const opened = await f.observer.prepareSession({ ...f.request, agentId }, true);
+  const directory = opened.env.CLAUDE_CODE_PLUGIN_DIRS.split(delimiter).at(-1)!.split(/[\\/]mod$/)[0];
+  await writeFile(join(directory, 'request.json'), JSON.stringify({ id: `${agentId}-operation`,
+    preparation: `${agentId}-preparation`, status: 'prepared' }));
+  return directory;
+}
+
+test('recovery reports each conversation it cannot read and still retires the others', async (t) => {
+  const f = await fixture(cleanupScope(t));
+  const good = await leftover(f, 'good');
+  for (const agentId of ['b', 'c']) {
+    const directory = await leftover(f, agentId);
+    await writeFile(join(directory, '..', 'current.json'), '{ unreadable');
+  }
+  const next = createObserver({ home: f.home, now: f.now, writes: createDurableWrites() });
+  const reported: unknown[] = [];
+  await next.recoverPrepared(() => ({ sent: false }), error => { reported.push(error); });
+  assert.equal(reported.length, 2, 'each failure is reported on its own');
+  assert(reported.every(error => error instanceof SyntaxError));
+  assert.equal((await requestFile(good)).status, 'settled');
+});
+
+test('a conversation whose retirement is held does not hold another conversation\'s', async (t) => {
+  const { files, holdRename } = heldFiles();
+  const f = await fixture(cleanupScope(t));
+  const first = await leftover(f, 'b');
+  const second = await leftover(f, 'c');
+  const next = createObserver({ home: f.home, now: f.now, writes: createDurableWrites(files) });
+  const heldFirst = holdRename(join(first, 'request.json'));
+  const heldSecond = holdRename(join(second, 'request.json'));
+  const reported: unknown[] = [];
+  const recovering = next.recoverPrepared(() => ({ sent: false }), error => { reported.push(error); });
+  // Both reach their own write while neither has landed.
+  await Promise.all([heldFirst.reached, heldSecond.reached]);
+  heldSecond.release();
+  await heldSecond.landed;
+  assert.equal((await requestFile(second)).status, 'settled');
+  assert.equal((await requestFile(first)).status, 'prepared');
+  heldFirst.release();
+  await recovering;
+  assert.equal((await requestFile(first)).status, 'settled');
+  assert.deepEqual(reported, []);
+});
+
+test('across a reload, a retirement the stopped instance had issued lands before the next instance prepares the same request', async (t) => {
+  const { files, holdRename } = heldFiles();
+  const f = await fixture(cleanupScope(t), files);
+  const drained = drainer();
+  const first = await f.observer.prepare(f.agent, false, 1_030_000, 'operation');
+  // A late retirement, issued and held at the file system.
+  const held = holdRename(join(f.directory, 'request.json'));
+  void f.observer.cancel(first, true).catch(() => {});
+  await held.reached;
+  // The host stops the plugin (its writes close, then drain) and starts the
+  // next instance only once that stop has ended.
+  f.writes.close();
+  let stopped = false;
+  const stopping = f.writes.drain().then(() => { stopped = true; });
+  await drained();
+  assert.equal(stopped, false, 'the stop waits for the issued retirement');
+  held.release();
+  await stopping;
+  const next = createObserver({ home: f.home, now: f.now, writes: createDurableWrites() });
+  await next.recoverPrepared(() => assert.fail('the stopped instance already retired its request'),
+    () => assert.fail('nothing fails'));
+  const second = await next.prepare(f.agent, false, 1_030_000, 'operation');
+  const request = await requestFile(f.directory);
+  assert.equal(request.status, 'prepared', 'the next instance\'s preparation of the same request is intact');
+  assert.equal(request.preparation, second.preparation);
+});
+
+test('across a reload, a launch publication the stopped instance had issued lands before the next instance opens one', async (t) => {
+  const { files, holdRename } = heldFiles();
+  const f = await fixture(cleanupScope(t), files);
+  const drained = drainer();
+  const manifestPath = join(f.parent, 'current.json');
+  const held = holdRename(manifestPath);
+  void f.observer.prepareSession(f.request, true).catch(() => {});
+  await held.reached;
+  f.writes.close();
+  let stopped = false;
+  const stopping = f.writes.drain().then(() => { stopped = true; });
+  await drained();
+  assert.equal(stopped, false, 'the stop waits for the issued publication');
+  held.release();
+  await stopping;
+  const next = createObserver({ home: f.home, now: f.now, writes: createDurableWrites() });
+  const reopened = await next.prepareSession(f.request, true);
+  const launchId = reopened.env.CLAUDE_CODE_PLUGIN_DIRS.split(delimiter).at(-1)!.split(/[\\/]/).at(-2)!;
+  assert.equal(JSON.parse(await readFile(manifestPath, 'utf8')).launchId, launchId,
+    'the earlier publication cannot replace the next instance\'s launch');
+});
+
+test('a retirement leaves a request that is no longer prepared, or in a state it does not know, as it is', async (t) => {
+  const f = await fixture(cleanupScope(t));
+  const operation = await f.observer.prepare(f.agent, false, 1_030_000, 'operation');
+  for (const status of ['settled', 'future-state', undefined]) {
+    const record = JSON.stringify({ id: 'operation', preparation: operation.preparation, ...(status ? { status } : {}) });
+    await writeFile(join(f.directory, 'request.json'), record);
+    await f.observer.cancel(operation, true);
+    await f.observer.release('a', operation, true);
+    assert.equal(await readFile(join(f.directory, 'request.json'), 'utf8'), record, `${status}`);
   }
 });

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createOperationWorker, recoverOperations } from "./operations";
+import { createOperationWorker, leftoverRetirement, recoverOperations } from "./operations";
 import { TICK_INTERVAL_MS } from "./scheduler";
 import { dueAt } from "./policy";
 import { changes } from "../tests/support/changes";
@@ -796,4 +796,34 @@ test("a confirmed query-restart refusal finishes as failed_after_dispatch after 
     assert.equal(f.sends, 0, `${kind}: reconciliation must not send again`);
     assert.deepEqual(released, [`${f.operation.id}:failed`], kind);
   }
+});
+
+test("a request an earlier instance left prepared is kept only while its operation may still be observed", () => {
+  const base: StoredOperation = { id: "op", agentId: "a", revision: "rev", target: { sessionId: "native", activityKey: null },
+    kind: "manual", state: "observing", createdAt: 1, updatedAt: 1, result: null, inputFingerprint: null };
+  const native = { id: "op", launchId: "launch", generation: "generation", sessionId: "native", revision: 1 };
+  const marked = (operation: Partial<StoredOperation>, preparation?: string): StoredOperation => ({ ...base, ...operation,
+    evidence: { dispatchStartedAt: 1, native: { ...native, ...(preparation ? { preparation } : {}) } } });
+  const unmarked = (operation: Partial<StoredOperation>): StoredOperation => ({ ...base, ...operation,
+    evidence: { native: { ...native, preparation: "p" } } });
+  const request = (preparation?: string) => ({ id: "op", ...(preparation ? { preparation } : {}) });
+  // Possibly sent and still observed: the observer needs the request to attribute its outcome.
+  assert.equal(leftoverRetirement(request("p"), marked({ state: "observing" }, "p")), null);
+  assert.equal(leftoverRetirement(request(), marked({ state: "observing" })), null,
+    "evidence from an earlier release names no preparation, so the request is kept");
+  assert.equal(leftoverRetirement(request(), marked({ state: "observing" }, "p")), null,
+    "a request from an earlier release names no preparation, so it is matched by its operation");
+  // Another preparation of a possibly sent operation is not what it sent against.
+  assert.deepEqual(leftoverRetirement(request("q"), marked({ state: "observing" }, "p")), { sent: true });
+  // Pending without the marker: the earlier instance never sent it, and a retry prepares anew.
+  for (const state of ["requested", "dispatching"] as const)
+    assert.deepEqual(leftoverRetirement(request("p"), unmarked({ state })), { sent: false }, state);
+  // Finished: retired as the worker's release would, sent once the marker exists.
+  for (const state of ["succeeded", "failed", "unknown"] as const)
+    assert.deepEqual(leftoverRetirement(request("p"), marked({ state, result: { code: "unknown", message: "m" } }, "p")),
+      { sent: true }, state);
+  assert.deepEqual(leftoverRetirement(request("p"), unmarked({ state: "expired",
+    result: { code: "expired_before_dispatch", message: "m" } })), { sent: false });
+  // An operation no longer retained ended at least the retention period ago.
+  assert.deepEqual(leftoverRetirement(request("p"), undefined), { sent: false });
 });

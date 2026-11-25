@@ -1,10 +1,11 @@
-import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, writeFile, rm } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { z } from "zod";
 import { JobSchema, StoredOperationSchema, type State, type StateStore } from "./model";
 import { finishedState } from "../shared/rpc";
+import { createDurableWrites, type DurableWrites } from "./durable";
 
 // Jobs as v1.0.2 wrote them, plus their operation link. Unknown keys are dropped,
 // just as v1.0.2 drops ours.
@@ -94,7 +95,8 @@ export function createStore(
     "plugin-data",
     "auto-compact-for-claude",
     "state.json"
-  )
+  ),
+  writes: DurableWrites = createDurableWrites()
 ): StateStore {
   return {
     async read() {
@@ -119,16 +121,10 @@ export function createStore(
     },
     async write(state: State) {
       StateSchema.parse(state);
-      await mkdir(dirname(path), { recursive: true });
-      const temp = `${path}.${randomUUID()}.tmp`;
-      try {
-        await writeFile(temp, JSON.stringify(state, null, 2) + "\n", {
-          mode: 0o600,
-        });
-        await rename(temp, path);
-      } finally {
-        await rm(temp, { force: true });
-      }
+      await writes.run(async () => {
+        await mkdir(dirname(path), { recursive: true });
+        await writes.replace(path, JSON.stringify(state, null, 2) + "\n");
+      });
     },
   };
 }
