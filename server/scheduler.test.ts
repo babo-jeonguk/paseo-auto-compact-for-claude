@@ -6,11 +6,11 @@ import {
   type Settings,
 } from "../shared/settings";
 import { createScheduler, FULL_SCAN_INTERVAL_MS, TICK_INTERVAL_MS } from "./scheduler";
-import { INSPECT_TIMEOUT_MS, Stopped } from "./deadline";
+import { INSPECT_TIMEOUT_MS, Stopped, type Timers } from "./deadline";
 import { DELIVERY_WINDOW_MS } from "./policy";
 import { HISTORY_RETENTION_MS, HISTORY_SWEEP_INTERVAL_MS, type OperationReceipts } from "./retention";
 import { changes } from "../tests/support/changes";
-import { fakeTimers } from "../tests/support/timers";
+import { fakeTimers, undefinedHandleTimers } from "../tests/support/timers";
 import { drainer } from "../tests/support/drained";
 import { gate, type Gate } from "../tests/support/gate";
 import { cleanupScope } from "../tests/support/scope";
@@ -147,7 +147,7 @@ function fixture(automatic = true) {
       await receiptHolds.get("sweep")?.pass();
     },
   };
-  const make = (options: { receipts?: boolean } = {}) =>
+  const make = (options: { receipts?: boolean; timers?: Timers } = {}) =>
     createScheduler({
       store,
       onError: error => errors.push(error),
@@ -164,7 +164,7 @@ function fixture(automatic = true) {
         }
       },
       now: () => time,
-      timers,
+      timers: options.timers ?? timers,
     });
   const addAgent = (id = "b") => {
     const agent = { ...agents[0], agentId: id, title: `Session ${id}`, sessionId: `native-${id}` };
@@ -2667,6 +2667,21 @@ for (const [at, stopAt] of Object.entries(schedulerStopPoints)) {
     assert.equal(f.timers.pending, 0, `${at}: no wait is armed`);
   });
 }
+
+// An opaque `Timers` may return no handle; clearing by what setTimeout returned
+// still clears the timer, as `bounded()` does.
+test("with timers that return no handle, the scheduler clears every timer it arms, the single-flight one too", async () => {
+  const f = fixture();
+  const opaque = undefinedHandleTimers();
+  let armed = 0;
+  const s = f.make({ timers: { ...opaque, setTimeout: (callback, ms) => { armed++; return opaque.setTimeout(callback, ms); } } });
+  await s.ready;
+  await s.observe({ kind: "full" });
+  await f.drained();
+  s.stop();
+  assert.ok(armed > 0, "the pass armed its bounds and the single-flight timer");
+  assert.equal(opaque.cleared.length, armed, "each one is cleared by the handle it returned");
+});
 
 test("a stopped scheduler starts no read, write, host call or timer for a call made after it stopped", async () => {
   const f = fixture();

@@ -19,10 +19,11 @@ test('a unit test that checks nothing is pending passes on a cold loader cache',
   assert.equal(node, 'node');
   // The scope gives the child a temp directory of its own, where the loader
   // would keep its cache, so nothing compiled earlier is reused. The child
-  // does not inherit this process's loader setting, so only its own command
-  // can turn the cache off.
+  // inherits neither this process's cache setting nor its preloads, so only
+  // its own command can turn the cache off.
   const env = { ...process.env };
   delete env.TSX_DISABLE_CACHE;
+  delete env.NODE_OPTIONS;
   const { temp } = await cleanupScope(t).run(process.execPath, [...flags, 'tests/support/drained-after-load.ts'],
     { cwd: root, env, timeout: CHILD_MS });
   assert.deepEqual((await readdir(temp)).filter(name => name.startsWith('tsx')), []);

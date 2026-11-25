@@ -65,13 +65,18 @@ const globalCall = (names) => `:matches(CallExpression, NewExpression):matches([
   `[callee.property.value=${names}], ` +
   `[callee.property.expressions.length=0][callee.property.quasis.0.value.cooked=${names}]))`;
 const timersModule = "/^(node:)?timers(\\/promises)?$/";
+// A key at `field` of a node whose `computed` sits beside it (`computed` is at
+// `field` with its last step replaced), written as a name, a string or a
+// template without interpolation. `key` is an esquery value: a quoted name or a
+// regular expression.
+const writtenAt = (field, key) => {
+  const computed = field.replace(/[^.]*$/, "computed");
+  return `:matches([${computed}=false][${field}.name=${key}], [${field}.value=${key}], ` +
+    `[${field}.expressions.length=0][${field}.quasis.0.value.cooked=${key}])`;
+};
 // The key of the member expression at `path` ("" for the node itself, or
-// "callee." and "object." for one below it), written as a name, a string or a
-// template without interpolation.
-// `key` is an esquery value: a quoted name or a regular expression.
-const writtenKeyMatching = (key, path = "") => `:matches([${path}computed=false][${path}property.name=${key}], ` +
-  `[${path}property.value=${key}], ` +
-  `[${path}property.expressions.length=0][${path}property.quasis.0.value.cooked=${key}])`;
+// "callee." and "object." for one below it).
+const writtenKeyMatching = (key, path = "") => writtenAt(`${path}property`, key);
 const writtenKey = (name, path = "") => writtenKeyMatching(`'${name}'`, path);
 // The timer modules loaded at run time, named by a string or a template
 // without interpolation: import(), require(), or process.getBuiltinModule()
@@ -152,9 +157,7 @@ const mockTimersRules = [{
 // A timer fake of a test's own: an object or class that provides both
 // setTimeout and clearTimeout under written names. One that spreads the shared
 // fake and overrides one of them observes it and passes.
-const ownKey = (name) => ":matches(Property, MethodDefinition, PropertyDefinition)" +
-  `:matches([computed=false][key.name='${name}'], [key.value='${name}'], ` +
-  `[key.expressions.length=0][key.quasis.0.value.cooked='${name}'])`;
+const ownKey = (name) => `:matches(Property, MethodDefinition, PropertyDefinition)${writtenAt("key", `'${name}'`)}`;
 const ownTimerFakeRules = [{
   selector: `:matches(ObjectExpression, ClassBody):has(> ${ownKey("setTimeout")}):has(> ${ownKey("clearTimeout")})`,
   message: ownTimerFake,
