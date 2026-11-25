@@ -1,6 +1,6 @@
 # Interface screenshots
 
-These images show the real Auto Compact client in the stock **Paseo 0.16.0 web app**, captured on **2026-11-17** in the light theme. The declared minimum Paseo support is 0.12; these captures establish the tested version only.
+These images show the real Auto Compact client in the stock **Paseo 0.16.0 web app**, captured on **2026-11-17** in the light theme. The plugin requires Paseo 0.16.2 or later; these captures show its interface and do not establish a supported version.
 
 | File | Size | Content |
 | --- | --- | --- |
