@@ -21,8 +21,8 @@ import {
 import { useQuery } from "@tanstack/react-query";
 import { compactSettings } from "../shared/settings";
 import { listRpc } from "../shared/rpc";
-import { listPollDelay } from "./cadence";
-import { formatTokenThreshold, listKey, parseTokenThreshold } from "./format";
+import { formatTokenThreshold, parseTokenThreshold } from "./format";
+import { settingsListQuery } from "./settings-list";
 import { useStateChanges } from "./state-events";
 import { useSurfaceActive } from "./surface";
 
@@ -214,11 +214,12 @@ export function CompactSettingsScreen({ theme, host }: PluginSurfaceProps) {
   const toast = useToast();
   const live = useStateChanges({ hostId: host.id });
   const active = useSurfaceActive();
-  const query = useQuery({
-    queryKey: listKey(host.id),
-    queryFn: () => list({}),
-    refetchInterval: () => listPollDelay({ live, active }),
-  });
+  const query = useQuery(settingsListQuery({
+    hostId: host.id,
+    read: () => list({}),
+    live,
+    active,
+  }));
   const providers = [...(query.data?.providers ?? [])].sort(
     (a, b) =>
       Number(b.id === "claude") - Number(a.id === "claude") ||

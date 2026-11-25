@@ -62,10 +62,12 @@ export function sessionPollDelay(input: { active: boolean; failures: number }): 
   return input.failures >= SESSION_BACKOFF_FAILURES ? SESSION_BACKOFF_MS : SESSION_POLL_MS;
 }
 
-// A live subscription refreshes the list on every change; without one the list has nothing else.
-export function listPollDelay(input: { live: boolean; active: boolean }): number | false {
-  if (input.live || !input.active) return false;
-  return SESSION_POLL_MS;
+// A failed read would otherwise stay failed until the next change; a live
+// subscription refreshes the list on every change, and without one the list has
+// nothing else.
+export function listPollDelay(input: { live: boolean; active: boolean; failed: boolean }): number | false {
+  if (!input.active) return false;
+  return !input.live || input.failed ? SESSION_POLL_MS : false;
 }
 
 // Changes arrive through the subscription; this lookup only covers a surface
