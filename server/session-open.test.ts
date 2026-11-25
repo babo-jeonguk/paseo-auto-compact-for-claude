@@ -2,48 +2,17 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { delimiter, join } from "node:path";
-import type { PluginServerContext, PluginSessionOpenRequest } from "@getpaseo/plugin/server";
+import type { PluginSessionOpenRequest } from "@getpaseo/plugin/server";
 import contribute from "../index.server";
-import { cleanupScope, type CleanupScope } from "../tests/support/scope";
+import { cleanupScope } from "../tests/support/scope";
+import { paseoHome, pluginHost } from "../tests/support/plugin-host";
 
-type Handler = (payload: never, context: unknown) => Promise<unknown>;
 type Before = (input: { request: PluginSessionOpenRequest }, context: unknown) => Promise<PluginSessionOpenRequest>;
 
 // Every hook the plugin registers. Each one has its current name; the
 // deprecated `on` and `before` names are announced for removal upstream.
 const HOOKS = ["agent.turn.before", "agent.turn.after", "agent.permission.before", "agent.permission.after",
   "agent.archive.after", "agent.close.after", "agent.create.after", "agent.open.before"];
-
-// A plugin host with only the current registration API. It records each hook
-// the plugin adds and how often its cleanup ran.
-function pluginHost() {
-  const hooks = new Map<string, { handler: Handler; stops: number }>();
-  const server = {
-    registerSettings: () => ({ read: async () => ({ status: "loading" }), subscribe: () => () => {} }),
-    addHook: (name: string, handler: Handler) => {
-      assert(!hooks.has(name), `${name} is registered once`);
-      const hook = { handler, stops: 0 };
-      hooks.set(name, hook);
-      return () => { hook.stops++; };
-    },
-    handle: () => {},
-  } as unknown as PluginServerContext;
-  return { server, hooks, hook: <T>(name: string) => hooks.get(name)!.handler as unknown as T };
-}
-
-// A Paseo home for the plugin under test. PASEO_HOME points at it until the
-// test ends and then goes back to what the other tests in this process read;
-// the plugin a test starts on it stops before either.
-async function paseoHome(scope: CleanupScope, prefix: string) {
-  const home = await scope.folder(prefix);
-  const previous = process.env.PASEO_HOME;
-  process.env.PASEO_HOME = home;
-  scope.defer(() => {
-    if (previous === undefined) delete process.env.PASEO_HOME;
-    else process.env.PASEO_HOME = previous;
-  });
-  return home;
-}
 
 test("plugin state or observer failures cannot prevent a Claude session from opening", async (t) => {
   const scope = cleanupScope(t);

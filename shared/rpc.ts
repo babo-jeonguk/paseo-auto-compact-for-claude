@@ -1,4 +1,4 @@
-import { defineRpc } from "@getpaseo/plugin";
+import { defineRpc, defineSubscription } from "@getpaseo/plugin";
 import { z } from "zod";
 
 export const StatusSchema = z.enum([
@@ -174,4 +174,16 @@ export const operationRpc = defineRpc({
   name: "auto-compact.operation",
   input: z.object({ operationId: z.string().min(1) }),
   output: z.object({ operation: CompactOperationSchema.nullable() }),
+});
+// Pushed when a save changes what a screen shows of the plugin's state. It
+// names only what changed: the conversation, or null when settings changed or
+// the change cannot be narrowed, which means "read everything again". Screens
+// read the state itself through the RPCs above, so a missed or late event
+// never shows wrong state. Narrowed to one conversation, a subscription still
+// hears the null events. The revision moves on with every event a plugin
+// instance pushes and starts again when it restarts.
+export const stateChangedSubscription = defineSubscription({
+  name: "auto-compact.state-changed",
+  input: z.object({ agentId: z.string().min(1).optional() }),
+  event: z.object({ agentId: z.string().min(1).nullable(), revision: z.number().int().nonnegative() }),
 });
