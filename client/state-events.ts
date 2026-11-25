@@ -29,21 +29,27 @@ export function changedQueries(event: StateChangeEvent, view: StateChangeView) {
 // TanStack Query reuses a first read that is still in flight, so a change heard
 // during it would be lost when that read captured the state from before the
 // change. A plugin RPC request cannot be stopped once sent, so instead of
-// cancelling the read, wait for it to end and then read again. Every change
-// that waited on the same read shares one new read (`cancelRefetch: false`).
+// cancelling a read, each query the change touches waits for its own read in
+// flight to end and then reads again; a slow read of one query does not hold up
+// another. Every change that waited on the same read shares one new read
+// (`cancelRefetch: false`).
 export async function refetchChanged(
   queryClient: QueryClient,
   queries: NonNullable<ReturnType<typeof changedQueries>>,
 ): Promise<void> {
-  if (queryClient.isFetching(queries) > 0)
-    await new Promise<void>(resolve => {
-      const unsubscribe = queryClient.getQueryCache().subscribe(() => {
-        if (queryClient.isFetching(queries) > 0) return;
-        unsubscribe();
-        resolve();
+  const cache = queryClient.getQueryCache();
+  await Promise.all(cache.findAll(queries).map(async query => {
+    const own = { queryKey: query.queryKey, exact: true };
+    if (queryClient.isFetching(own) > 0)
+      await new Promise<void>(resolve => {
+        const unsubscribe = cache.subscribe(() => {
+          if (queryClient.isFetching(own) > 0) return;
+          unsubscribe();
+          resolve();
+        });
       });
-    });
-  await queryClient.invalidateQueries(queries, { cancelRefetch: false });
+    await queryClient.invalidateQueries(own, { cancelRefetch: false });
+  }));
 }
 
 export function useStateChanges(view: StateChangeView): boolean {
