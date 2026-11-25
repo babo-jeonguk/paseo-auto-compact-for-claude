@@ -6,11 +6,13 @@ import {
   type Settings,
 } from "../shared/settings";
 import { createScheduler, FULL_SCAN_INTERVAL_MS, TICK_INTERVAL_MS } from "./scheduler";
-import { INSPECT_TIMEOUT_MS } from "./deadline";
+import { INSPECT_TIMEOUT_MS, Stopped, type Timers } from "./deadline";
 import { DELIVERY_WINDOW_MS } from "./policy";
+import { HISTORY_RETENTION_MS, HISTORY_SWEEP_INTERVAL_MS, type OperationReceipts } from "./retention";
 import { changes } from "../tests/support/changes";
-import { fakeTimers } from "../tests/support/timers";
+import { fakeTimers, undefinedHandleTimers } from "../tests/support/timers";
 import { drainer } from "../tests/support/drained";
+import { gate, type Gate } from "../tests/support/gate";
 import { cleanupScope } from "../tests/support/scope";
 import type { Blocked } from "../shared/rpc";
 import { Refusal, type Gateway, type Observation, type State, type StateStore } from "./model";
@@ -26,10 +28,21 @@ function fixture(automatic = true) {
   const listedHolds = new Map<string, () => Promise<void>>();
   // A held settings read, `skip` reads from when it was set.
   let settingsHold: { skip: number; hold: () => Promise<void> } | null = null;
+  // A held state read: the first to start once `when` holds; it reads once released.
+  let readHold: { when: () => boolean; held: Gate } | null = null;
+  // The next state write, held once it has started; it lands once released.
+  let writeHold: { held: Gate; carries?: State } | null = null;
+  const errors: unknown[] = [];
+  // Receipt removals and sweeps as they start, and the one held until released.
+  const receiptCalls: string[] = [];
+  const receiptHolds = new Map<string, Gate>();
   // Resource use the optimization promises to bound.
   const counts = {
-    reads: 0, writes: 0, lists: 0, refreshes: [] as string[],
-    reset() { this.reads = 0; this.writes = 0; this.lists = 0; this.refreshes = []; },
+    reads: 0, writes: 0, lists: 0, settings: 0, settingsEnded: 0, readiness: 0, refreshes: [] as string[],
+    reset() {
+      this.reads = 0; this.writes = 0; this.lists = 0; this.settings = 0; this.settingsEnded = 0;
+      this.readiness = 0; this.refreshes = [];
+    },
   };
   let listGate: Promise<void> | null = null;
   // Listings waiting at the gate `holdList` set, and listings running now and
@@ -60,10 +73,14 @@ function fixture(automatic = true) {
   const store: StateStore = {
     read: async () => {
       counts.reads++;
+      const hold = readHold;
+      if (hold?.when()) { readHold = null; await hold.held.pass(); }
       return structuredClone(state);
     },
     write: async (next) => {
       counts.writes++;
+      const hold = writeHold;
+      if (hold) { writeHold = null; hold.carries = structuredClone(next); await hold.held.pass(); }
       state = structuredClone(next);
       signal.changed();
     },
@@ -117,17 +134,37 @@ function fixture(automatic = true) {
     compact,
     ...(automatic ? { automatic: async (expected: Observation) => compact(expected.agentId) } : {}),
   };
-  const make = () =>
+  // Passed to the scheduler only by a test that asks for history cleanup.
+  const receipts: OperationReceipts = {
+    remove: async (_agentId, operationId) => {
+      receiptCalls.push(`remove ${operationId}`);
+      signal.changed();
+      await receiptHolds.get("remove")?.pass();
+    },
+    sweep: async () => {
+      receiptCalls.push("sweep");
+      signal.changed();
+      await receiptHolds.get("sweep")?.pass();
+    },
+  };
+  const make = (options: { receipts?: boolean; timers?: Timers } = {}) =>
     createScheduler({
       store,
+      onError: error => errors.push(error),
+      ...options.receipts ? { receipts } : {},
       gateway,
       settings: async () => {
+        counts.settings++;
         const held = settingsHold;
-        if (held && held.skip-- === 0) { settingsHold = null; await held.hold(); }
-        return config;
+        try {
+          if (held && held.skip-- === 0) { settingsHold = null; await held.hold(); }
+          return config;
+        } finally {
+          counts.settingsEnded++;
+        }
       },
       now: () => time,
-      timers,
+      timers: options.timers ?? timers,
     });
   const addAgent = (id = "b") => {
     const agent = { ...agents[0], agentId: id, title: `Session ${id}`, sessionId: `native-${id}` };
@@ -149,6 +186,31 @@ function fixture(automatic = true) {
     holdSettings(skip: number, hold: () => Promise<void>) {
       settingsHold = { skip, hold };
     },
+    // Holds the first state read that starts once `when` holds, before it reads.
+    holdRead(when = () => true): Gate {
+      const held = gate();
+      readHold = { when, held };
+      return held;
+    },
+    // Answers readiness checks with `check`, counting each one as it starts.
+    readiness(check: NonNullable<Gateway["readiness"]>) {
+      gateway.readiness = async (...args) => { counts.readiness++; return check(...args); };
+    },
+    // Holds the next state write once it has started; `carries` is the state it
+    // lands once released.
+    holdWrite() {
+      const hold: { held: Gate; carries?: State } = { held: gate() };
+      writeHold = hold;
+      return { ...hold.held, carries: () => hold.carries };
+    },
+    // Holds the next receipt removal or sweep once it has started.
+    holdReceipts(kind: "remove" | "sweep"): Gate {
+      const held = gate();
+      receiptHolds.set(kind, held);
+      return held;
+    },
+    receiptCalls,
+    errors,
     // Hold one listed conversation's observation, not the listing itself.
     holdListed(agentId: string, hold: () => Promise<void>) {
       listedHolds.set(agentId, hold);
@@ -192,6 +254,7 @@ function fixture(automatic = true) {
     },
   };
 }
+
 
 async function waitForStatus(f: ReturnType<typeof fixture>, status: State["jobs"][number]["status"]) {
   const agentId = f.state.jobs[0]?.agentId;
@@ -894,7 +957,7 @@ test("unreadable settings and stopped plugin never send", async () => {
   assert.equal(f.calls, 0);
   f.config = { ...DEFAULT_SETTINGS };
   s.stop();
-  await s.tick();
+  await assert.rejects(s.tick(), Stopped);
   assert.equal(f.calls, 0);
 });
 
@@ -1347,7 +1410,7 @@ test("a scheduler stopped mid-request cannot put back state a newer instance rep
   const second = f.make(); await second.ready;
   await second.compactNow("a", f.agents[0].revision!, "request-new");
   release();
-  await assert.rejects(stale, /Plugin stopped/);
+  await assert.rejects(stale, Stopped);
   assert.deepEqual(f.state.operations.map(operation => operation.id), ["request-new"]);
 });
 
@@ -2365,4 +2428,285 @@ test("a blocked reservation stores its reason code with its detail and shows it 
     f.state.jobs[0].blockedReason = blockedReason;
     assert.equal((await s.session("a"))!.blockedReason, undefined);
   }
+});
+
+type Scheduler = ReturnType<ReturnType<typeof fixture>["make"]>;
+// `lands` is the state a held write carries: started before the stop, it
+// still lands once released, and nothing after it does.
+type Stopping = { s: Scheduler; run: Promise<unknown>; held: { reached: Promise<void>; release(): void };
+  lands?: () => State | undefined };
+// A scheduler holding a reservation for "a", not yet due.
+// Its readiness checks are counted, so a late one shows.
+async function scheduled(f: ReturnType<typeof fixture>) {
+  f.readiness(async () => null);
+  const s = f.make();
+  await s.ready;
+  await s.observedTurn(f.agents[0]);
+  return s;
+}
+// A scheduler whose reservation for "a" is due.
+async function due(f: ReturnType<typeof fixture>) {
+  const s = await scheduled(f);
+  f.advance(55 * 60_000);
+  return s;
+}
+// A scheduler with two operations past their retention, which the next
+// tick's history cleanup removes one after the other.
+async function retired(f: ReturnType<typeof fixture>) {
+  const s = f.make({ receipts: true });
+  await s.ready;
+  for (const id of ["retired-1", "retired-2"])
+    f.state.operations.push({ id, agentId: "a", revision: f.agents[0].revision!,
+      target: { sessionId: "native-a", activityKey: null }, kind: "manual", state: "succeeded",
+      createdAt: f.time - HISTORY_RETENTION_MS, updatedAt: f.time - HISTORY_RETENTION_MS, inputFingerprint: null,
+      result: { code: "completed", message: "done" } });
+  f.advance(HISTORY_SWEEP_INTERVAL_MS);
+  return s;
+}
+// Each await of a pass, held: what the scheduler reaches while the test holds it.
+const schedulerStopPoints: Record<string, (f: ReturnType<typeof fixture>) => Promise<Stopping>> = {
+  "recovery's state read": async f => {
+    const held = f.holdRead();
+    const s = f.make();
+    return { s, run: s.ready, held };
+  },
+  "recovery's state write": async f => {
+    const held = f.holdWrite();
+    const s = f.make();
+    return { s, run: s.ready, held, lands: held.carries };
+  },
+  "recovery's settings read": async f => {
+    const held = gate();
+    f.holdSettings(0, held.pass);
+    const s = f.make();
+    return { s, run: s.ready, held };
+  },
+  "a tick queued behind another transaction's read": async f => {
+    const s = await retired(f);
+    const held = f.holdRead();
+    // Its own outcome is not this test's; it ends with the stop too.
+    void s.toggle("a", false).catch(() => {});
+    return { s, run: s.tick(), held };
+  },
+  "a tick queued behind another transaction's write": async f => {
+    const s = await retired(f);
+    const held = f.holdWrite();
+    void s.toggle("a", false).catch(() => {});
+    return { s, run: s.tick(), held, lands: held.carries };
+  },
+  "the history cleanup's state read": async f => {
+    const s = await retired(f);
+    return { s, held: f.holdRead(), run: s.tick() };
+  },
+  "a receipt's removal": async f => {
+    const s = await retired(f);
+    return { s, held: f.holdReceipts("remove"), run: s.tick() };
+  },
+  "the history cleanup's write": async f => {
+    const s = await retired(f);
+    const held = f.holdWrite();
+    return { s, held, lands: held.carries, run: s.tick() };
+  },
+  "the receipts' sweep": async f => {
+    const s = await retired(f);
+    return { s, held: f.holdReceipts("sweep"), run: s.tick() };
+  },
+  "the tick's settings read": async f => {
+    const s = await due(f);
+    const held = gate();
+    f.holdSettings(0, held.pass);
+    return { s, held, run: s.tick() };
+  },
+  "the reservation pass's state read": async f => {
+    const s = await due(f);
+    // The pass reads state once it has read the settings.
+    const before = f.counts.settingsEnded;
+    return { s, held: f.holdRead(() => f.counts.settingsEnded > before), run: s.tick() };
+  },
+  "a due conversation's host read": async f => {
+    const s = await due(f);
+    const held = gate();
+    f.holdRefresh("a", held.pass);
+    return { s, held, run: s.tick() };
+  },
+  "a due conversation's readiness check": async f => {
+    const s = await due(f);
+    const held = gate();
+    f.readiness(async () => { await held.pass(); return null; });
+    return { s, held, run: s.tick() };
+  },
+  "a due conversation's second settings read": async f => {
+    const s = await due(f);
+    const held = gate();
+    f.holdSettings(1, held.pass);
+    return { s, held, run: s.tick() };
+  },
+  "the reservation's state read": async f => {
+    const s = await due(f);
+    // The reservation reads state once its conversation's readiness is checked.
+    const before = f.counts.readiness;
+    return { s, held: f.holdRead(() => f.counts.readiness > before), run: s.tick() };
+  },
+  "a full scan's listing": async f => {
+    f.agents.splice(0, 1, nativeAgent(f, "a"));
+    const s = f.make();
+    await s.ready;
+    const release = f.holdList();
+    return { s, held: { reached: f.listingHeld(), release }, run: s.observe({ kind: "full" }) };
+  },
+  "a listed conversation's observation": async f => {
+    f.agents.splice(0, 1, nativeAgent(f, "a"));
+    const s = f.make();
+    await s.ready;
+    const held = gate();
+    f.holdListed("a", held.pass);
+    return { s, held, run: s.observe({ kind: "full" }) };
+  },
+  "an attention pass's state read": async f => {
+    f.agents.splice(0, 1, nativeAgent(f, "a"));
+    const s = f.make();
+    await s.ready;
+    // The first periodic pass is a full scan; the next within a minute is not.
+    await s.observe({ kind: "periodic" });
+    f.advance(10_000);
+    return { s, held: f.holdRead(), run: s.observe({ kind: "periodic" }) };
+  },
+  "an attention pass's host read": async f => {
+    f.agents.splice(0, 1, nativeAgent(f, "a"));
+    const s = f.make();
+    await s.ready;
+    await s.observe({ kind: "periodic" });
+    f.advance(10_000);
+    const held = gate();
+    f.holdRefresh("a", held.pass);
+    return { s, held, run: s.observe({ kind: "periodic" }) };
+  },
+  "the observed turn's state read": async f => {
+    f.agents.splice(0, 1, nativeAgent(f, "a"));
+    const s = f.make();
+    await s.ready;
+    return { s, held: f.holdRead(), run: s.observe({ kind: "agent", agentId: "a" }) };
+  },
+  "the observed turn's write": async f => {
+    f.agents.splice(0, 1, nativeAgent(f, "a"));
+    const s = f.make();
+    await s.ready;
+    const held = f.holdWrite();
+    return { s, held, lands: held.carries, run: s.observe({ kind: "agent", agentId: "a" }) };
+  },
+  "a status read's host read": async f => {
+    const s = f.make();
+    await s.ready;
+    const held = gate();
+    f.holdRefresh("a", held.pass);
+    return { s, held, run: s.session("a") };
+  },
+  "a status row's readiness check": async f => {
+    const s = await scheduled(f);
+    const held = gate();
+    f.readiness(async () => { await held.pass(); return null; });
+    return { s, held, run: s.session("a") };
+  },
+  "the conversation list's listing": async f => {
+    const s = f.make();
+    await s.ready;
+    const release = f.holdList();
+    return { s, held: { reached: f.listingHeld(), release }, run: s.list() };
+  },
+  "Compact now's settings read": async f => {
+    const s = f.make();
+    await s.ready;
+    const held = gate();
+    f.holdSettings(0, held.pass);
+    return { s, held, run: s.compactNow("a", f.agents[0].revision!, "request-a") };
+  },
+  "Compact now's host read": async f => {
+    const s = f.make();
+    await s.ready;
+    const held = gate();
+    f.holdRefresh("a", held.pass);
+    return { s, held, run: s.compactNow("a", f.agents[0].revision!, "request-a") };
+  },
+  "a skip's host read": async f => {
+    const s = await scheduled(f);
+    const held = gate();
+    f.holdRefresh("a", held.pass);
+    return { s, held, run: s.skip("a", f.agents[0].revision!) };
+  },
+};
+
+// One test each, so a call that outlives its stop fails at the runner's bound
+// on its own.
+for (const [at, stopAt] of Object.entries(schedulerStopPoints)) {
+  test(`a scheduler stopped at ${at} ends the call at once, and reads, writes, submits, removes and reports nothing`, async (t) => {
+    const scope = cleanupScope(t);
+    const f = fixture();
+    const { s, run, held, lands } = await stopAt(f);
+    scope.defer(() => s.stop());
+    // Its outcome is checked once it settles; a rejection is not left unhandled meanwhile.
+    const settled = run.then(() => null, (error: unknown) => error);
+    await held.reached;
+    // Taken before stop(), so what stop() itself did counts too.
+    const before = (state: State = f.state) => JSON.stringify({ state, reads: f.counts.reads,
+      writes: f.counts.writes, settings: f.counts.settings, readiness: f.counts.readiness,
+      refreshes: f.counts.refreshes.length, lists: f.counts.lists, sent: f.calls,
+      receipts: f.receiptCalls.length, errors: f.errors.map(String) });
+    const snapshot = before(lands?.());
+    s.stop();
+    assert.equal(f.timers.pending, 0, `${at}: stopping ends every wait and clears its timer`);
+    // The call ends while its step is still held; one still waiting fails
+    // here, at the runner's bound.
+    const outcome = await settled;
+    assert.ok(outcome === null || outcome instanceof Stopped, `${at}: the call ends by stopping, not ${String(outcome)}`);
+    assert.equal(f.timers.pending, 0, `${at}: the ended call armed nothing on its way out`);
+    await s.idle();
+    held.release();
+    // What the released step does next has run once the queued callbacks have.
+    await f.drained();
+    assert.equal(before(), snapshot, `${at}: nothing is read, written, submitted, removed or reported`);
+    assert.equal(f.timers.pending, 0, `${at}: no wait is armed`);
+  });
+}
+
+// An opaque `Timers` may return no handle; clearing by what setTimeout returned
+// still clears the timer, as `bounded()` does.
+test("with timers that return no handle, the scheduler clears every timer it arms, the single-flight one too", async () => {
+  const f = fixture();
+  const opaque = undefinedHandleTimers();
+  let armed = 0;
+  const s = f.make({ timers: { ...opaque, setTimeout: (callback, ms) => { armed++; return opaque.setTimeout(callback, ms); } } });
+  await s.ready;
+  await s.observe({ kind: "full" });
+  await f.drained();
+  s.stop();
+  assert.ok(armed > 0, "the pass armed its bounds and the single-flight timer");
+  assert.deepEqual(opaque.cleared, Array.from({ length: armed }, () => undefined),
+    "each one is cleared by the handle it returned");
+});
+
+test("a stopped scheduler starts no read, write, host call or timer for a call made after it stopped", async () => {
+  const f = fixture();
+  const s = await scheduled(f);
+  s.stop();
+  f.counts.reset();
+  const revision = f.agents[0].revision!;
+  const calls: [string, () => Promise<unknown>][] = [
+    ["tick", () => s.tick()], ["reconcile", () => s.reconcile()],
+    ["full scan", () => s.observe({ kind: "full" })], ["periodic pass", () => s.observe({ kind: "periodic" })],
+    ["turn end", () => s.observe({ kind: "agent", agentId: "a" })], ["observed turn", () => s.observedTurn(f.agents[0])],
+    ["status", () => s.session("a")], ["list", () => s.list()], ["toggle", () => s.toggle("a", false)],
+    ["skip", () => s.skip("a", revision)], ["undo", () => s.undoSkip("a", revision, "skip")],
+    ["operation", () => s.operation("request-a")], ["Compact now", () => s.compactNow("a", revision, "request-a")],
+    ["invalidate", () => s.invalidate("a")],
+  ];
+  for (const [name, call] of calls) {
+    const outcome = await call().then(() => null, (error: unknown) => error);
+    assert.ok(outcome === null || outcome instanceof Stopped, `${name} ends by stopping, not ${String(outcome)}`);
+  }
+  await f.drained();
+  const { reads, writes, lists, settings, readiness, refreshes } = f.counts;
+  assert.deepEqual({ reads, writes, lists, settings, readiness, refreshes },
+    { reads: 0, writes: 0, lists: 0, settings: 0, readiness: 0, refreshes: [] },
+    "nothing is read, written or asked of the host");
+  assert.deepEqual([f.calls, f.receiptCalls.length, f.errors.length, f.timers.pending], [0, 0, 0, 0]);
 });

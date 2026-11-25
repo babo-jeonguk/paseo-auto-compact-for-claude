@@ -138,6 +138,28 @@ test('unit tests outside tests/support move product time only through fakeTimers
   for (const code of ['await timers.tick(5_000);', "t.mock.method(console, 'error');"]) passes('server/a.test.ts', code);
 });
 
+// A timer fake written in a test is a second fake of the injected timers,
+// whose semantics (when a due callback runs, what a cleared handle does) the
+// next test could copy instead of the shared one's.
+test('unit tests outside tests/support define no timer fake of their own', () => {
+  const ownFakes = [
+    'const timers = { setTimeout: (callback) => queue.push(callback), clearTimeout: () => {} };',
+    'function fakeTimers() { return { now: () => time, setTimeout(callback, ms) { return 1; }, clearTimeout(id) {} }; }',
+    "const timers = { 'setTimeout': schedule, 'clearTimeout': cancel };",
+    'class Timers { setTimeout(callback, ms) { return 1; } clearTimeout(handle) {} }',
+    'const timers = { [`setTimeout`]: schedule, [`clearTimeout`]: cancel };',
+  ];
+  for (const file of ['server/a.test.ts', 'scripts/a.test.ts', 'tests/a.test.mjs'])
+    for (const code of ownFakes) flags(file, code, /fakeTimers\(\)[^]*CODING_STANDARDS\.md "Tests"/);
+  for (const code of ownFakes) passes('tests/support/a.ts', code);
+  for (const code of [
+    'const timers = fakeTimers();',
+    // Wrapping the shared fake to observe one call is not a second fake.
+    'const timers = { ...fakeTimers(), setTimeout: (callback, ms) => { armed.push(ms); return inner.setTimeout(callback, ms); } };',
+    'const clock = createSharedClock({ now: () => time });',
+  ]) passes('server/a.test.ts', code);
+});
+
 // A test stopped at the runner's bound never reaches its finally, so cleanup
 // that waits is registered with the test's cleanup scope, whose hook the
 // runner still runs.

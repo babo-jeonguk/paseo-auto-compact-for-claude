@@ -28,6 +28,10 @@ const countedWait = 'A unit test waits for a condition through a signal, not by 
 const mockTimers = 'Unit tests move product time only through fakeTimers() in tests/support/timers.ts, the one ' +
   'fake of the injected Timers that product code waits on; Node\'s mock timers replace the global timers with ' +
   'other semantics, such as when a due callback runs (CODING_STANDARDS.md "Tests").';
+const ownTimerFake = 'A unit test fakes the injected timers only with fakeTimers() in tests/support/timers.ts, ' +
+  'which also gives the time they keep (now(), tick(), jump()). A fake written in a test has its own semantics, such ' +
+  'as when a due callback runs, which the next test could copy; a fake the shared one cannot express belongs in ' +
+  'tests/support/timers.ts with its tests (CODING_STANDARDS.md "Tests").';
 const contextMock = 'A unit test mocks through its test context (t.mock), which the runner restores even when the ' +
   'test stops at its bound and its finally never runs; a mock on the shared tracker would outlive it ' +
   '(CODING_STANDARDS.md "Tests").';
@@ -61,13 +65,18 @@ const globalCall = (names) => `:matches(CallExpression, NewExpression):matches([
   `[callee.property.value=${names}], ` +
   `[callee.property.expressions.length=0][callee.property.quasis.0.value.cooked=${names}]))`;
 const timersModule = "/^(node:)?timers(\\/promises)?$/";
+// A key at `field` of a node whose `computed` sits beside it (`computed` is at
+// `field` with its last step replaced), written as a name, a string or a
+// template without interpolation. `key` is an esquery value: a quoted name or a
+// regular expression.
+const writtenAt = (field, key) => {
+  const computed = field.replace(/[^.]*$/, "computed");
+  return `:matches([${computed}=false][${field}.name=${key}], [${field}.value=${key}], ` +
+    `[${field}.expressions.length=0][${field}.quasis.0.value.cooked=${key}])`;
+};
 // The key of the member expression at `path` ("" for the node itself, or
-// "callee." and "object." for one below it), written as a name, a string or a
-// template without interpolation.
-// `key` is an esquery value: a quoted name or a regular expression.
-const writtenKeyMatching = (key, path = "") => `:matches([${path}computed=false][${path}property.name=${key}], ` +
-  `[${path}property.value=${key}], ` +
-  `[${path}property.expressions.length=0][${path}property.quasis.0.value.cooked=${key}])`;
+// "callee." and "object." for one below it).
+const writtenKeyMatching = (key, path = "") => writtenAt(`${path}property`, key);
 const writtenKey = (name, path = "") => writtenKeyMatching(`'${name}'`, path);
 // The timer modules loaded at run time, named by a string or a template
 // without interpolation: import(), require(), or process.getBuiltinModule()
@@ -145,6 +154,14 @@ const mockTimersRules = [{
   selector: `${sharedTrackerTimers}, ${mockTimersAt(`[object.type='MemberExpression']${writtenKey("mock", "object.")}`)}`,
   message: mockTimers,
 }];
+// A timer fake of a test's own: an object or class that provides both
+// setTimeout and clearTimeout under written names. One that spreads the shared
+// fake and overrides one of them observes it and passes.
+const ownKey = (name) => `:matches(Property, MethodDefinition, PropertyDefinition)${writtenAt("key", `'${name}'`)}`;
+const ownTimerFakeRules = [{
+  selector: `:matches(ObjectExpression, ClassBody):has(> ${ownKey("setTimeout")}):has(> ${ownKey("clearTimeout")})`,
+  message: ownTimerFake,
+}];
 const sharedMockTimersRules = [{ selector: sharedTrackerTimers, message: contextMock }];
 // Cleanup that bypasses the test's scope: a temporary folder made directly,
 // whose removal the caller registers only afterwards, a hook of the test
@@ -212,7 +229,7 @@ export const projectRules = [
   {
     files: unitTests,
     ignores: testSupport,
-    rules: { "no-restricted-syntax": ["error", ...unitTestRules, ...mockTimersRules, ...turnWaitRules, ...scopeRules] },
+    rules: { "no-restricted-syntax": ["error", ...unitTestRules, ...mockTimersRules, ...ownTimerFakeRules, ...turnWaitRules, ...scopeRules] },
   },
   {
     files: testSupport,

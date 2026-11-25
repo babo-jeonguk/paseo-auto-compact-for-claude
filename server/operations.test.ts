@@ -7,6 +7,7 @@ import { changes } from "../tests/support/changes";
 import { fakeTimers } from "../tests/support/timers";
 import { cleanupScope } from "../tests/support/scope";
 import { drainer } from "../tests/support/drained";
+import { gate } from "../tests/support/gate";
 import { DEFAULT_SETTINGS, type Settings } from "../shared/settings";
 import { Refusal, type CompactOutcome, type ExecutionContext, type Gateway, type Observation,
   type State, type StoredOperation } from "./model";
@@ -82,8 +83,11 @@ function fixture(options: { agents?: string[] } = {}) {
       return value;
     });
     tail = result.catch(() => {});
+    updated?.(result);
     return result;
   };
+  // Shown each transaction's result as the worker gets it.
+  let updated: ((result: Promise<unknown>) => void) | null = null;
   // The next state read waits for its release before it reads.
   let readHold: ReturnType<typeof gate> | null = null;
   const make = (settings = async (): Promise<Settings | null> => ({ ...DEFAULT_SETTINGS })) => createOperationWorker({ gateway,
@@ -126,6 +130,8 @@ function fixture(options: { agents?: string[] } = {}) {
     },
     // Holds the next state read before it reads.
     holdRead(): Held { readHold = gate(); return readHold; },
+    // Calls `hook` with each transaction's result as the worker gets it.
+    onUpdate(hook: ((result: Promise<unknown>) => void) | null) { updated = hook; },
     advance(ms: number) { time += ms; },
     recover() { recoverOperations(state, time); },
   };
@@ -246,13 +252,6 @@ test("the worker wakes itself for a retry instead of waiting for the next tick",
 });
 
 type Held = { reached: Promise<void>; release(): void };
-// A step the worker waits on: `pass` resolves `reached`, then waits for `release`.
-function gate() {
-  let reach!: () => void, release!: () => void;
-  const reached = new Promise<void>(resolve => { reach = resolve; });
-  const released = new Promise<void>(resolve => { release = resolve; });
-  return { reached, release, pass: async () => { reach(); await released; } };
-}
 type Fixture = ReturnType<typeof fixture>;
 const NATIVE = { id: "operation-a", launchId: "launch", generation: "gen-1", sessionId: "native", revision: 1 };
 // Sends as the gateway does: an attempt whose worker is no longer current
@@ -405,6 +404,26 @@ for (const [at, stopAt] of Object.entries(stopPoints)) {
     assert.equal(f.timers.pending, 0, `${at}: no wait or wake-up is armed`);
   });
 }
+
+// The run resumes a turn after its claim lands, and a stop can come in between,
+// as one from a callback queued behind the claim does.
+test("a worker stopped as its claim lands starts no host or settings read", async () => {
+  const f = fixture();
+  const reads: string[] = [];
+  f.gateway.refresh = async id => { reads.push(`host ${id}`); return f.agent; };
+  const worker = f.make(async () => { reads.push("settings"); return { ...DEFAULT_SETTINGS }; });
+  f.onUpdate(result => {
+    f.onUpdate(null);
+    // Queued once the run waits on the claim, so the stop comes after the
+    // claim lands and before the run goes on.
+    queueMicrotask(() => void result.then(() => worker.stop()));
+  });
+  await worker.reconcile();
+  await worker.idle();
+  assert.equal(f.operation.state, "dispatching", "the claim landed");
+  assert.deepEqual(reads, [], "no read started after the stop");
+  assert.deepEqual([f.sends, f.errors.length, f.timers.pending], [0, 0, 0]);
+});
 
 test("a gateway fault before the dispatch marker is retried; nothing is sent until it passes", async () => {
   const f = fixture(), worker = f.make();

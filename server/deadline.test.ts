@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { bounded, DeadlineExceeded, Stopped } from "./deadline";
-import { fakeTimers } from "../tests/support/timers";
+import { bounded, createLifetime, DeadlineExceeded, Stopped } from "./deadline";
+import { fakeTimers, reusedHandleTimers, undefinedHandleTimers } from "../tests/support/timers";
 
 test("a bounded wait runs on the caller's timers and clears its timer once the work settles", async () => {
   const timers = fakeTimers();
@@ -57,33 +57,54 @@ test("a wait with no deadline of its own arms no timer and ends only when its at
 
 test("a stopped wait clears its timer whatever handle the timers returned", async () => {
   // Timers is opaque about handles, so one may be undefined.
-  const cleared: unknown[] = [];
-  const timers = { setTimeout: () => undefined, clearTimeout: (handle: unknown) => { cleared.push(handle); } };
+  const timers = undefinedHandleTimers();
   const attempt = new AbortController();
   const waiting = bounded(new Promise<never>(() => {}), 5_000, timers, attempt.signal);
   attempt.abort();
   await assert.rejects(waiting, Stopped);
-  assert.deepEqual(cleared, [undefined], "the armed deadline is cleared");
+  assert.deepEqual(timers.cleared, [undefined], "the armed deadline is cleared");
 });
 
 test("a bounded wait clears only its own timer, even on timers that reuse a retired handle", async () => {
   // Numbered handles, the lowest free one reused, as some timer implementations do.
-  const due = new Map<number, () => void>();
-  const timers = {
-    setTimeout(callback: () => void) { let id = 1; while (due.has(id)) id++; due.set(id, callback); return id; },
-    clearTimeout(handle: unknown) { due.delete(handle as number); },
-  };
-  const fire = (id: number) => { const callback = due.get(id)!; due.delete(id); callback(); };
+  const timers = reusedHandleTimers();
   let fail!: (error: Error) => void;
   const work = new Promise<never>((_resolve, reject) => { fail = reject; });
   const first = bounded(work, 5_000, timers);
-  fire(1);
+  timers.fire(1);
   await assert.rejects(first, DeadlineExceeded);
   // The next wait takes the retired handle; then the first wait's work settles late.
   const second = bounded(new Promise<never>(() => {}), 5_000, timers);
   fail(new Error("late"));
   await work.catch(() => {});
-  assert.equal(due.size, 1, "the second wait's deadline is still armed");
-  fire(1);
+  assert.equal(timers.pending, 1, "the second wait's deadline is still armed");
+  timers.fire(1);
   await assert.rejects(second, DeadlineExceeded);
+});
+
+test("ending a lifetime ends every wait on it at once, and a wait after it arms nothing", async () => {
+  const timers = fakeTimers();
+  const lifetime = createLifetime(timers);
+  const unbounded = lifetime.wait(new Promise<never>(() => {}));
+  const bounded = lifetime.wait(new Promise<never>(() => {}), 5_000);
+  assert.equal(timers.pending, 1, "only the wait with a deadline arms a timer");
+  assert.equal(lifetime.live(), true);
+  lifetime.end();
+  assert.equal(lifetime.live(), false);
+  assert.equal(timers.pending, 0);
+  await assert.rejects(unbounded, Stopped);
+  await assert.rejects(bounded, Stopped);
+  await assert.rejects(lifetime.wait(Promise.resolve("late"), 5_000), Stopped);
+  assert.equal(timers.pending, 0);
+});
+
+test("a lifetime begins work only while it lasts", async () => {
+  const timers = fakeTimers();
+  const lifetime = createLifetime(timers);
+  const begun: string[] = [];
+  assert.equal(await lifetime.begin(async () => { begun.push("live"); return "read"; }), "read");
+  lifetime.end();
+  await assert.rejects(lifetime.begin(async () => { begun.push("ended"); return "read"; }), Stopped);
+  assert.deepEqual(begun, ["live"]);
+  assert.equal(timers.pending, 0);
 });

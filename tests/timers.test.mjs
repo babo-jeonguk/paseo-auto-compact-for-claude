@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { fakeTimers } from './support/timers.ts';
+import { fakeTimers, reusedHandleTimers, undefinedHandleTimers } from './support/timers.ts';
+
+// A promise chain of many steps, which settles after all of them, as work a
+// callback starts does. A later turn comes after every one; a microtask that
+// stood in for that turn would come after the first few.
+const chain = (steps) => Array.from({ length: steps }).reduce(step => step.then(() => {}), Promise.resolve());
 
 test('fake timers run only when moved on, earliest first, and report each one armed', async () => {
   let armed = 0;
@@ -62,10 +67,80 @@ test('microtasks a due callback queued run before the next due callback', async 
   let second;
   timers.setTimeout(() => {
     ran.push('first');
-    void (async () => { await null; await null; timers.clearTimeout(second); })();
+    void chain(20).then(() => timers.clearTimeout(second));
   }, 10);
   second = timers.setTimeout(() => ran.push('second'), 10);
   await timers.tick(10);
   assert.deepEqual(ran, ['first']);
   assert.equal(timers.pending, 0);
+});
+
+test('the time moves with each tick, at once, so callbacks that run late all see where the tick ended', async () => {
+  const timers = fakeTimers(undefined, 5_000);
+  const seen = [];
+  timers.setTimeout(() => seen.push(timers.now()), 100);
+  timers.setTimeout(() => seen.push(timers.now()), 300);
+  assert.equal(timers.now(), 5_000);
+  assert.deepEqual(timers.dueTimes, [5_100, 5_300]);
+  const ticking = timers.tick(500);
+  assert.equal(timers.now(), 5_500, 'the time has moved before any due callback runs');
+  assert.equal(timers.pending, 2, 'and the due timers are still pending');
+  await ticking;
+  assert.deepEqual(seen, [5_500, 5_500]);
+  assert.deepEqual(timers.dueTimes, []);
+});
+
+test('a jump runs each timer at its own due time, including those armed on the way', async () => {
+  const timers = fakeTimers();
+  const seen = [];
+  const every = (ms) => timers.setTimeout(() => { seen.push(timers.now()); every(ms); }, ms);
+  every(1_000);
+  timers.setTimeout(() => seen.push(`once ${timers.now()}`), 2_500);
+  await timers.jump(3_200);
+  assert.deepEqual(seen, [1_000, 2_000, 'once 2500', 3_000]);
+  assert.equal(timers.now(), 3_200);
+  assert.deepEqual(timers.dueTimes, [4_000]);
+});
+
+test('a jump runs each callback on a later turn, so one can still clear the next', async () => {
+  const timers = fakeTimers();
+  const ran = [];
+  let second;
+  timers.setTimeout(() => {
+    ran.push('first');
+    void chain(20).then(() => timers.clearTimeout(second));
+  }, 10);
+  second = timers.setTimeout(() => ran.push('second'), 20);
+  const jumping = timers.jump(30);
+  assert.deepEqual(ran, [], 'nothing runs within the turn that started the jump');
+  await jumping;
+  assert.deepEqual(ran, ['first']);
+});
+
+test('a jump past no timer still ends on a later turn, at the time it moved to', async () => {
+  const timers = fakeTimers();
+  let ended = false;
+  const jumping = timers.jump(50).then(() => { ended = true; });
+  await chain(20);
+  assert.equal(ended, false);
+  await jumping;
+  assert.equal(timers.now(), 50);
+});
+
+test('the handle fakes keep the forms bounded() must clear by: no handle, and a reused number', () => {
+  const none = undefinedHandleTimers();
+  assert.equal(none.setTimeout(() => {}, 10), undefined);
+  none.clearTimeout(undefined);
+  assert.deepEqual(none.cleared, [undefined]);
+
+  const reused = reusedHandleTimers();
+  const ran = [];
+  assert.equal(reused.setTimeout(() => ran.push('first'), 10), 1);
+  assert.equal(reused.setTimeout(() => ran.push('second'), 10), 2);
+  reused.fire(1);
+  assert.equal(reused.setTimeout(() => ran.push('third'), 10), 1, 'the lowest free number is reused');
+  reused.clearTimeout(2);
+  assert.equal(reused.pending, 1);
+  reused.fire(1);
+  assert.deepEqual(ran, ['first', 'third']);
 });
