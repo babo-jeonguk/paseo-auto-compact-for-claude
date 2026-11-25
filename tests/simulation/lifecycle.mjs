@@ -7,14 +7,15 @@ import { fileURLToPath } from 'node:url';
 import { randomUUID, createHash } from 'node:crypto';
 import { startFixture, waitFor } from './fixture.mjs';
 import { startModel } from './model.mjs';
+import { paseoPackages } from './paseo-versions.mjs';
 const here = dirname(fileURLToPath(import.meta.url)), plugin = resolve(here, '../..');
 const require = createRequire(join(here, 'package.json'));
 const option = (name, fallback) => {
   const at = process.argv.indexOf(name);
   return at < 0 ? fallback : process.argv[at + 1];
 };
-const version = option('--paseo', '0.14.0');
-const cliAlias = new Map([['0.14.0', '@getpaseo/cli-0-14'], ['0.16.0-beta.1', '@getpaseo/cli-0-16-beta'], ['0.16.0', '@getpaseo/cli-0-16-stable']]).get(version);
+const version = option('--paseo', '0.16.2');
+const cliAlias = paseoPackages.get(version);
 assert(cliAlias, `Unsupported Paseo lifecycle version: ${version}`);
 const cliPackage = require.resolve(`${cliAlias}/package.json`);
 const binary = join(dirname(require.resolve(`@anthropic-ai/claude-code-${process.platform}-${process.arch}/package.json`)), process.platform === 'win32' ? 'claude.exe' : 'claude');

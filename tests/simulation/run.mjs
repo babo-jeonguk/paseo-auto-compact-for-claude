@@ -16,7 +16,7 @@ import { paseoPackages } from './paseo-versions.mjs';
 const here = dirname(fileURLToPath(import.meta.url));
 const plugin = resolve(here, '../..');
 if (process.argv.includes('--help')) {
-  console.log('npm run test:simulation:0.12 -- [--expect-platform linux|win32] [--claude /native/claude] [--tools /npm/prefix] [--report-dir /results]');
+  console.log('npm run test:simulation:0.16.2 -- [--expect-platform linux|win32] [--claude /native/claude] [--tools /npm/prefix] [--report-dir /results]');
   process.exit(0);
 }
 const value = (name, fallback) => {
@@ -25,7 +25,7 @@ const value = (name, fallback) => {
   if (!process.argv[at + 1] || process.argv[at + 1].startsWith('--')) throw new Error(`Missing value: ${name}`);
   return process.argv[at + 1];
 };
-const paseoRequested = value('--paseo', '0.12.0');
+const paseoRequested = value('--paseo', '0.16.2');
 assert(paseoPackages.has(paseoRequested), `Unsupported Paseo simulation version: ${paseoRequested}`);
 const reportRoot = resolve(value('--report-dir', join(plugin, 'test-results', `${process.platform}-${process.arch}`)));
 const reportDir = join(reportRoot, `paseo-${paseoRequested}`);

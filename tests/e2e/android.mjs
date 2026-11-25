@@ -22,7 +22,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const simulation = resolve(here, '../simulation');
 const PACKAGE = 'sh.paseo';
 const run = promisify(execFile);
-const arg = parseOptions('android.mjs', [['--paseo', '0.13.0'], ['--to', 'main'], ['--apk', ''],
+const arg = parseOptions('android.mjs', [['--paseo', '0.16.2'], ['--to', 'main'], ['--apk', ''],
   ['--source', DEFAULT_SOURCE],
   ['--sdk', process.env.ANDROID_HOME ?? join(homedir(), 'Android', 'Sdk')],
   ['--system-image', 'system-images;android-34;google_apis;x86_64'], ['--avd-home', join(tmpdir(), 'auto-compact-e2e-avd')],

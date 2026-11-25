@@ -20,7 +20,7 @@ const option = (name, fallback) => {
   const at = process.argv.indexOf(name);
   return at < 0 ? fallback : process.argv[at + 1];
 };
-const version = option('--paseo', '0.15.0');
+const version = option('--paseo', '0.16.2');
 const minimalBuiltins = process.argv.includes('--minimal-builtins');
 const suite = option('--suite', 'all');
 assert(['all', 'restart', 'browser', 'recovery', 'graceful-recovery', 'completed', 'interrupted', 'forced-interrupted', 'hooks'].includes(suite),

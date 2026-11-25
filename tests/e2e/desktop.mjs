@@ -22,7 +22,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const simulation = resolve(here, '../simulation');
 const isWin = process.platform === 'win32';
 const run = promisify(execFile);
-const arg = parseOptions('desktop.mjs', [['--paseo', '0.13.0'], ['--to', 'main'], ['--app', ''],
+const arg = parseOptions('desktop.mjs', [['--paseo', '0.16.2'], ['--to', 'main'], ['--app', ''],
   ['--source', DEFAULT_SOURCE], ['--expect-platform', process.platform],
   ['--claude', ''], ['--tools', simulation], ['--report-dir', join(resolve(here, '../..'), 'test-results', 'e2e')]],
   [['--app', 'the extracted Paseo desktop app of the same version']]);

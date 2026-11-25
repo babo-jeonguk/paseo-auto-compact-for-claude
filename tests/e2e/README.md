@@ -27,12 +27,12 @@ No model request leaves the host and no real account is used.
 ## Run
 
 ```sh
-npm run test:e2e -- --paseo 0.13.0 --to <branch, tag or commit>
+npm run test:e2e -- --paseo 0.16.2 --to <branch, tag or commit>
 ```
 
 | Flag | Meaning |
 |---|---|
-| `--paseo` | A version pinned in `tests/simulation/paseo-versions.mjs`, such as `0.12.0`, `0.16.2` or `0.17.1` (default `0.13.0`) |
+| `--paseo` | A version pinned in `tests/simulation/paseo-versions.mjs`, such as `0.16.2` or `0.17.1` (default `0.16.2`) |
 | `--from` | Release installed first and rolled back to (default `v1.2.2`, the latest release; `v1.0.2` checks the migration from state without operation history) |
 | `--to` | Ref under test (default `main`) |
 | `--source` | Plugin Git source (default `git:babo-jeonguk/paseo-auto-compact-for-claude`) |
@@ -50,7 +50,7 @@ Each run writes `report.json` and the daemon logs to `<report-dir>/<platform>-pa
 |---|---|
 | 1 | `--from` installs from GitHub at the expected revision and answers its RPCs |
 | 2 | `--from` records a real reservation, a conversation OFF and a completed Compact now in state v1. v1.1.0 and later accept Compact now as a durable operation and record it |
-| 3 | Update to `--to` at the expected revision: the state stays version 1, keeps OFF and the reservation time, and keeps the earlier compaction as a queryable operation: the recorded `manual` operation from v1.1.0 and later, or a migrated `legacy` operation from v1.0.2. A new Compact now of the same activity sends nothing; then Compact now of a fresh activity on `--to` compacts once. On Paseo 0.14 and later the reservation is instead held as `blocked` until an ordinary message resumes the session, which then earns a new reservation |
+| 3 | Update to `--to` at the expected revision: the state stays version 1, keeps OFF, and keeps the earlier compaction as a queryable operation: the recorded `manual` operation from v1.1.0 and later, or a migrated `legacy` operation from v1.0.2. A new Compact now of the same activity sends nothing; then Compact now of a fresh activity on `--to` compacts once. The reservation of the conversation opened before the update is held as `blocked` until an ordinary message resumes the session, which then earns a new reservation |
 | 4 | All native simulation scenarios (`tests/simulation/scenarios.mjs`) against the updated install |
 | 5 | Rollback to `--from` reads the state, keeps OFF, shows both compacted activities as completed, so its timer will not repeat them, and sends nothing |
 | 6 | Update to `--to` again keeps OFF and the compaction history without replay: v1.1.0 and later keep their operations; history v1.0.2 dropped comes back as `legacy` operations that still guard their activities |
@@ -70,7 +70,7 @@ Get the app of the same Paseo version from its [GitHub release](https://github.c
 | Windows x64 | `Paseo-Setup-<version>-x64.zip` | the directory holding `Paseo.exe` |
 
 ```sh
-xvfb-run -a -s '-screen 0 1440x900x24' npm run test:e2e:desktop -- --paseo 0.13.0 --app <dir> --to <ref>
+xvfb-run -a -s '-screen 0 1440x900x24' npm run test:e2e:desktop -- --paseo 0.16.2 --app <dir> --to <ref>
 ```
 
 Linux needs a display; `xvfb-run` provides one. On Windows the app window appears on the desktop for the few minutes of the run. The app uses `PASEO_HOME` for its daemon and `PASEO_ELECTRON_USER_DATA_DIR` for its own data, both temporary, and its daemon is stopped at the end.
@@ -105,7 +105,7 @@ Requirements:
 - The APK of the same Paseo version from its [GitHub release](https://github.com/getpaseo/paseo/releases): `paseo-v<version>-android.apk`.
 
 ```sh
-npm run test:e2e:android -- --paseo 0.13.0 --apk paseo-v0.13.0-android.apk --to <ref>
+npm run test:e2e:android -- --paseo 0.16.2 --apk paseo-v0.16.2-android.apk --to <ref>
 ```
 
 The run creates its own AVD under `--avd-home` (a temporary directory by default) and leaves other AVDs alone. It wipes its data on every boot and stops the emulator at the end. `adb reverse` maps the device's `127.0.0.1:<port>` to the daemon, so no password, relay or network setup is needed. The emulator needs about 2 GB of memory. On a heavily loaded host its own watchdog may stop it ("detected a hanging thread"); the run then fails at that step and should be repeated when the host is quieter. The emulator sometimes reports its System UI as not responding; the run taps Wait and counts these in `anrDismissed`.

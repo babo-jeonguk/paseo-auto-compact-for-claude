@@ -3,7 +3,7 @@
   "name": "Auto Compact for Claude",
   "description": "Monitor large idle Claude conversations and compact them when cache evidence permits",
   "requirements": {
-    "paseo": ">=0.12.0"
+    "paseo": ">=0.16.2"
   },
   "media": [
     "assets/conversations.png",
