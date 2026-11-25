@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { canSubscribe, changedQueries } from "../client/state-events.ts";
+import { QueryClient, QueryObserver } from "@tanstack/react-query";
+import { changedQueries, refetchChanged } from "../client/state-events.ts";
+import { cleanupScope } from "./support/scope.ts";
 import { listKey } from "../client/format.ts";
 import { operationKey, sessionKey } from "../client/session-state.ts";
 import { stateChangedSubscription } from "../shared/rpc.ts";
@@ -29,9 +31,26 @@ test("the conversation list reads again for any change, without reading each con
     assert.deepEqual(changedQueries(event(agentId), view), { queryKey: listKey("h"), exact: true });
 });
 
-test("an app without plugin subscriptions is detected by what it offers, and leaves the surface on its safety poll", () => {
-  // The daemon requires 0.16.2, but a phone or desktop app can be older than it.
-  assert.equal(canSubscribe({ useSubscription: () => ({ status: "connecting" }) }), true);
-  assert.equal(canSubscribe({}), false);
-  assert.equal(canSubscribe({ useSubscription: "not a hook" }), false);
+test("a change heard while a screen's first read is in flight reads again after it, instead of keeping that read", async (t) => {
+  const scope = cleanupScope(t);
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  scope.defer(() => client.clear());
+  let reads = 0;
+  let firstStarted, releaseFirst;
+  const started = new Promise(resolve => { firstStarted = resolve; });
+  // The first read captures the state from before the change and answers after the change's event.
+  const queryFn = () => {
+    reads++;
+    if (reads > 1) return Promise.resolve("after the change");
+    firstStarted();
+    return new Promise(resolve => { releaseFirst = () => resolve("before the change"); });
+  };
+  const observer = new QueryObserver(client, { queryKey: listKey("h"), queryFn });
+  scope.defer(observer.subscribe(() => {}));
+  await started;
+  const refreshed = refetchChanged(client, changedQueries(event(null), { hostId: "h" }));
+  releaseFirst();
+  await refreshed;
+  assert.equal(reads, 2);
+  assert.equal(client.getQueryData(listKey("h")), "after the change");
 });

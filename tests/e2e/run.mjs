@@ -65,8 +65,8 @@ async function moveTo(ref, key) {
 }
 const pluginLog = () => pluginStderr([1, 2, 3, 4].map(n => join(reportDir, `daemon-${n}.log`)));
 // The fixture stops a daemon by signalling its whole process group, so the plugin can exit before
-// Paseo delivers agent.closed during that shutdown. That is the harness, not the plugin.
-const shutdownNoise = line => /^Lifecycle hook agent\.closed failed: Plugin process exited/.test(line);
+// Paseo delivers agent.close.after during that shutdown. That is the harness, not the plugin.
+const shutdownNoise = line => /^Lifecycle hook agent\.close\.after failed: Plugin process exited/.test(line);
 
 // ---- 1. install the release a user has ------------------------------------------------------------
 const legacy = {};
@@ -81,7 +81,11 @@ check(`install ${FROM} from GitHub with paseo plugin install`, async () => {
 });
 
 // ---- 2. data the older release writes ------------------------------------------------------------
-check(`${FROM} records a reservation, a conversation OFF and a completed Compact now`, async () => {
+check(`${FROM} records settings, a reservation, a conversation OFF and a completed Compact now`, async () => {
+  // Settings a user changed, which the update must keep. Excluding a provider no scenario uses
+  // leaves the Claude conversations below unaffected.
+  legacy.defaults = await fixture.settings();
+  legacy.settings = await fixture.settings({ disabledProviders: ['codex'] });
   for (const key of ['reserved', 'off', 'compacted']) {
     legacy[key] = await fixture.agent();
     await fixture.turn(legacy[key], `LEGACY_${key.toUpperCase()}: reply without tools.`);
@@ -109,10 +113,11 @@ check(`${FROM} records a reservation, a conversation OFF and a completed Compact
 });
 
 // ---- 3. update to the version under test -----------------------------------------------------------
-check(`update to ${TO} keeps state v1, policy, reservation and compaction history`, async () => {
+check(`update to ${TO} keeps state v1, settings, policy, reservation and compaction history`, async () => {
   await moveTo(TO, 'to');
   const state = await waitFor(async () => { const s = await readState(); return Array.isArray(s.operations) ? s : null; }, 'operation history');
   assert.equal(state.version, 1, 'additive fields keep the version the release reads');
+  assert.deepEqual(await fixture.settings(), legacy.settings, 'settings survive');
   assert.equal((await fixture.row(legacy.off)).enabled, false, 'conversation OFF survives');
   // Paseo reopens a plugin session that a reloaded plugin no longer owns just before its next prompt.
   // Until an ordinary message has done so, the plugin compacts nothing there (docs/runtime.md), so the
@@ -158,6 +163,7 @@ check(`update to ${TO} keeps state v1, policy, reservation and compaction histor
   // Leave later scenarios a quiet host: their one-minute timers would otherwise also reach these.
   for (const id of Object.values(legacy).filter(v => typeof v === 'string'))
     await fixture.rpc('toggle', { agentId: id, enabled: false });
+  await fixture.settings(legacy.defaults);
 });
 
 // ---- 4. main features on the updated install --------------------------------------------------------

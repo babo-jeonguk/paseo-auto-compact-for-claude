@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { countdownTickDelay, directoryRefreshDelay, nextRenderAt, operationPollDelay, pollFailures,
+import { countdownTickDelay, directoryRefreshDelay, listPollDelay, nextRenderAt, operationPollDelay, pollFailures,
   sessionPollDelay, surfaceActive, DIRECTORY_REFRESH_MS, OPERATION_LOOKUP_MS,
   SESSION_BACKOFF_MS, SESSION_POLL_MS, STATUS_FRESH_MS } from "../client/cadence.ts";
 
@@ -46,6 +46,13 @@ test("an operation that is never found stops being looked up after 30 seconds", 
   assert.equal(lookup(0), 10_000);
   assert.equal(lookup(29_999), 10_000);
   assert.equal(lookup(30_000), false);
+});
+
+test("the conversation list reads again at the safety interval only while its subscription is not live", () => {
+  // A live subscription refreshes the list on every change; without one it has nothing else.
+  assert.equal(listPollDelay({ live: true, active: true }), false);
+  assert.equal(listPollDelay({ live: false, active: true }), SESSION_POLL_MS);
+  assert.equal(listPollDelay({ live: false, active: false }), false);
 });
 
 test("a countdown above one minute next changes at its minute boundary", () => {

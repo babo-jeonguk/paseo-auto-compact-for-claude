@@ -530,35 +530,46 @@ export const scenarios = [
     async run({ fixture: f, model }) {
       await f.settings({ idleMinutes: 50 });
       const id = await f.agent();
+      const other = await f.agent();
       await f.turn(id, 'SUBSCRIPTION_READY: reply without tools.');
       const row = await scheduled(f, id);
       const subscription = await f.subscribe({ agentId: id });
+      const everything = await f.subscribe();
+      // A screen reads only when it hears an event: wait for each new event, read once after it,
+      // and stop at the first read that shows what the screen should.
+      const afterEvents = async (wanted, label) => {
+        let heard = subscription.events.length;
+        return waitFor(async () => {
+          if (subscription.events.length === heard) return null;
+          heard = subscription.events.length;
+          const current = await f.row(id);
+          return wanted(current) ? current : null;
+        }, label);
+      };
       try {
         // Each subscription starts by asking its screen to read everything.
         await waitFor(() => subscription.events.length, 'the first event');
         assert.equal(subscription.events[0].agentId, null);
         const compact = model.holdNext();
-        const beforeStart = subscription.events.length;
+        const started = afterEvents(current => current.status === 'running', 'a read after an event shows the compaction running');
         const accepted = await f.rpc('now', { agentId: id, revision: row.revision, target: row.target });
         assert.equal(accepted.status, 'running'); assert(accepted.operationId);
         await waitFor(() => compact.requestId, 'in-flight compaction');
-        await waitFor(() => subscription.events.slice(beforeStart).some(event => event.agentId === id),
-          'an event for the started compaction');
-        assert.equal((await f.row(id)).status, 'running');
-        const beforeEnd = subscription.events.length;
+        await started;
+        const finished = afterEvents(current => current.latestOperation?.id === accepted.operationId &&
+          current.latestOperation?.state === 'succeeded', 'a read after an event shows the finished compaction');
         compact.release();
-        await waitFor(async () => (await f.rpc('operation', { operationId: accepted.operationId })).operation
-          ?.state === 'succeeded', 'compaction completes');
-        await waitFor(() => subscription.events.slice(beforeEnd).some(event => event.agentId === id),
-          'an event for the finished compaction');
-        const finished = await f.row(id);
-        assert.equal(finished.latestOperation?.id, accepted.operationId);
-        assert.equal(finished.latestOperation?.state, 'succeeded');
+        assert.notEqual((await finished).status, 'running');
+        // A change to another conversation reaches a subscription to everything, not this one.
+        const heardOther = () => everything.events.some(event => event.agentId === other);
+        assert((await f.rpc('toggle', { agentId: other, enabled: false })).changed);
+        await waitFor(heardOther, 'the other conversation\'s event on a subscription to everything');
         assert(subscription.events.every(event => event.agentId === null || event.agentId === id),
           'a subscription narrowed to this conversation hears no other');
         return { events: subscription.events.length };
       } finally {
         await subscription.close();
+        await everything.close();
         await f.rpc('toggle', { agentId: id, enabled: false });
       }
     },

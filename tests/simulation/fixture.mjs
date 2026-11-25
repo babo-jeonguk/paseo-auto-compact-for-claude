@@ -120,6 +120,12 @@ export async function startFixture({ root, plugin, cliPackage, appVersion, binar
     }
     daemon = undefined;
   }
+  // A client made by connect() gives up a connection attempt after a second and retries at once at
+  // first, then at most every second: the daemon is local, so a slower client only slows a scenario
+  // that drops its connection, and none waits on a real network.
+  const CONNECT_TIMEOUT_MS = 1000;
+  const RECONNECT_BASE_MS = 200;
+  const RECONNECT_MAX_MS = 1000;
   const fixture = {
     root, home, claude, binary, target, get client() { return client; },
     rpc: (name, input = {}) => client.invokePluginRpc('auto-compact-for-claude', `auto-compact.${name}`, input),
@@ -128,8 +134,8 @@ export async function startFixture({ root, plugin, cliPackage, appVersion, binar
     // proxy (proxy.mjs) at that URL. The caller closes it.
     async connect({ via } = {}) {
       const other = new DaemonClient({ url: via ? `${via.replace(/^http/, 'ws')}/ws` : `ws://${target}/ws`,
-        clientId: `auto-compact-simulation-${randomUUID()}`, clientType: 'cli', appVersion, connectTimeoutMs: 1000,
-        reconnect: { enabled: true, baseDelayMs: 200, maxDelayMs: 1000 },
+        clientId: `auto-compact-simulation-${randomUUID()}`, clientType: 'cli', appVersion, connectTimeoutMs: CONNECT_TIMEOUT_MS,
+        reconnect: { enabled: true, baseDelayMs: RECONNECT_BASE_MS, maxDelayMs: RECONNECT_MAX_MS },
         localCredential: async () => readLocalCredentialForTarget(home, target) ?? undefined,
         webSocketFactory: (url, options) => new WebSocket(url, options?.protocols, { headers: options?.headers }) });
       await other.connect();

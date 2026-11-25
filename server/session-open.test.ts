@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { delimiter, join } from "node:path";
-import type { PluginSessionOpenRequest } from "@getpaseo/plugin/server";
+import type { PluginHookEvents, PluginSessionOpenRequest } from "@getpaseo/plugin/server";
 import contribute from "../index.server";
 import { cleanupScope } from "../tests/support/scope";
 import { paseoHome, pluginHost } from "../tests/support/plugin-host";
@@ -44,10 +44,12 @@ test("turn-ended hooks use native activity without reading the deprecated timeli
   const home = await paseoHome(scope, "compact-empty-timeline-");
   const { server, hook } = pluginHost();
   scope.defer(contribute(server));
-  const ended = hook<(event: unknown, context: unknown) => Promise<void>>("agent.turn.after");
-  const event = {
+  type Ended = PluginHookEvents["agent.turn.after"];
+  const ended = hook<(event: Ended, context: unknown) => Promise<void>>("agent.turn.after");
+  // The payload the host sends, including the fields the SDK requires.
+  const event: Ended = {
     agent: { id: "a", provider: "claude", cwd: home, title: null,
-      parentAgentId: null, workspaceId: "w" },
+      parentAgentId: null, workspaceId: "w", background: false, metadata: {} },
     turnId: "ordinary-1",
     outcome: { kind: "completed" },
   };
@@ -75,9 +77,13 @@ test("the plugin registers every hook through addHook under its current name and
   const scope = cleanupScope(t);
   await paseoHome(scope, "compact-hooks-");
   const { server, hooks } = pluginHost();
+  // Stop is deferred first, so a failed check below still stops the plugin.
+  let stopped = false;
   const stop = contribute(server);
+  scope.defer(() => { if (!stopped) stop(); });
   assert.deepEqual([...hooks.keys()].sort(), [...HOOKS].sort());
   stop();
+  stopped = true;
   assert.deepEqual([...hooks.values()].map(hook => hook.stops), HOOKS.map(() => 1));
 });
 
