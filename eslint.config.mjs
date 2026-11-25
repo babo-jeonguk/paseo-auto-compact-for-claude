@@ -153,7 +153,8 @@ const mockTimersRules = [{
 // setTimeout and clearTimeout under written names. One that spreads the shared
 // fake and overrides one of them observes it and passes.
 const ownKey = (name) => ":matches(Property, MethodDefinition, PropertyDefinition)" +
-  `:matches([computed=false][key.name='${name}'], [key.value='${name}'])`;
+  `:matches([computed=false][key.name='${name}'], [key.value='${name}'], ` +
+  `[key.expressions.length=0][key.quasis.0.value.cooked='${name}'])`;
 const ownTimerFakeRules = [{
   selector: `:matches(ObjectExpression, ClassBody):has(> ${ownKey("setTimeout")}):has(> ${ownKey("clearTimeout")})`,
   message: ownTimerFake,

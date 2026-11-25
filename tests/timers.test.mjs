@@ -2,6 +2,11 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { fakeTimers, reusedHandleTimers, undefinedHandleTimers } from './support/timers.ts';
 
+// A promise chain of many steps, which settles after all of them, as work a
+// callback starts does. A later turn comes after every one; a microtask that
+// stood in for that turn would come after the first few.
+const chain = (steps) => Array.from({ length: steps }).reduce(step => step.then(() => {}), Promise.resolve());
+
 test('fake timers run only when moved on, earliest first, and report each one armed', async () => {
   let armed = 0;
   const timers = fakeTimers(() => { armed++; });
@@ -62,7 +67,7 @@ test('microtasks a due callback queued run before the next due callback', async 
   let second;
   timers.setTimeout(() => {
     ran.push('first');
-    void (async () => { await null; await null; timers.clearTimeout(second); })();
+    void chain(20).then(() => timers.clearTimeout(second));
   }, 10);
   second = timers.setTimeout(() => ran.push('second'), 10);
   await timers.tick(10);
@@ -103,7 +108,7 @@ test('a jump runs each callback on a later turn, so one can still clear the next
   let second;
   timers.setTimeout(() => {
     ran.push('first');
-    void (async () => { await null; timers.clearTimeout(second); })();
+    void chain(20).then(() => timers.clearTimeout(second));
   }, 10);
   second = timers.setTimeout(() => ran.push('second'), 20);
   const jumping = timers.jump(30);
@@ -116,7 +121,7 @@ test('a jump past no timer still ends on a later turn, at the time it moved to',
   const timers = fakeTimers();
   let ended = false;
   const jumping = timers.jump(50).then(() => { ended = true; });
-  await Promise.resolve();
+  await chain(20);
   assert.equal(ended, false);
   await jumping;
   assert.equal(timers.now(), 50);

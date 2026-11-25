@@ -147,6 +147,7 @@ test('unit tests outside tests/support define no timer fake of their own', () =>
     'function fakeTimers() { return { now: () => time, setTimeout(callback, ms) { return 1; }, clearTimeout(id) {} }; }',
     "const timers = { 'setTimeout': schedule, 'clearTimeout': cancel };",
     'class Timers { setTimeout(callback, ms) { return 1; } clearTimeout(handle) {} }',
+    'const timers = { [`setTimeout`]: schedule, [`clearTimeout`]: cancel };',
   ];
   for (const file of ['server/a.test.ts', 'scripts/a.test.ts', 'tests/a.test.mjs'])
     for (const code of ownFakes) flags(file, code, /fakeTimers\(\)[^]*CODING_STANDARDS\.md "Tests"/);

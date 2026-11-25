@@ -12,6 +12,7 @@ import { HISTORY_RETENTION_MS, HISTORY_SWEEP_INTERVAL_MS, type OperationReceipts
 import { changes } from "../tests/support/changes";
 import { fakeTimers } from "../tests/support/timers";
 import { drainer } from "../tests/support/drained";
+import { gate, type Gate } from "../tests/support/gate";
 import { cleanupScope } from "../tests/support/scope";
 import type { Blocked } from "../shared/rpc";
 import { Refusal, type Gateway, type Observation, type State, type StateStore } from "./model";
@@ -27,8 +28,8 @@ function fixture(automatic = true) {
   const listedHolds = new Map<string, () => Promise<void>>();
   // A held settings read, `skip` reads from when it was set.
   let settingsHold: { skip: number; hold: () => Promise<void> } | null = null;
-  // A held state read, `skip` reads from when it was set; it reads once released.
-  let readHold: { skip: number; held: Gate } | null = null;
+  // A held state read: the first to start once `when` holds; it reads once released.
+  let readHold: { when: () => boolean; held: Gate } | null = null;
   // The next state write, held once it has started; it lands once released.
   let writeHold: { held: Gate; carries?: State } | null = null;
   const errors: unknown[] = [];
@@ -37,8 +38,11 @@ function fixture(automatic = true) {
   const receiptHolds = new Map<string, Gate>();
   // Resource use the optimization promises to bound.
   const counts = {
-    reads: 0, writes: 0, lists: 0, settings: 0, refreshes: [] as string[],
-    reset() { this.reads = 0; this.writes = 0; this.lists = 0; this.settings = 0; this.refreshes = []; },
+    reads: 0, writes: 0, lists: 0, settings: 0, settingsEnded: 0, readiness: 0, refreshes: [] as string[],
+    reset() {
+      this.reads = 0; this.writes = 0; this.lists = 0; this.settings = 0; this.settingsEnded = 0;
+      this.readiness = 0; this.refreshes = [];
+    },
   };
   let listGate: Promise<void> | null = null;
   // Listings waiting at the gate `holdList` set, and listings running now and
@@ -70,7 +74,7 @@ function fixture(automatic = true) {
     read: async () => {
       counts.reads++;
       const hold = readHold;
-      if (hold && hold.skip-- === 0) { readHold = null; await hold.held.pass(); }
+      if (hold?.when()) { readHold = null; await hold.held.pass(); }
       return structuredClone(state);
     },
     write: async (next) => {
@@ -152,8 +156,12 @@ function fixture(automatic = true) {
       settings: async () => {
         counts.settings++;
         const held = settingsHold;
-        if (held && held.skip-- === 0) { settingsHold = null; await held.hold(); }
-        return config;
+        try {
+          if (held && held.skip-- === 0) { settingsHold = null; await held.hold(); }
+          return config;
+        } finally {
+          counts.settingsEnded++;
+        }
       },
       now: () => time,
       timers,
@@ -178,11 +186,15 @@ function fixture(automatic = true) {
     holdSettings(skip: number, hold: () => Promise<void>) {
       settingsHold = { skip, hold };
     },
-    // Holds the state read `skip` reads from now before it reads.
-    holdRead(skip = 0): Gate {
+    // Holds the first state read that starts once `when` holds, before it reads.
+    holdRead(when = () => true): Gate {
       const held = gate();
-      readHold = { skip, held };
+      readHold = { when, held };
       return held;
+    },
+    // Answers readiness checks with `check`, counting each one as it starts.
+    readiness(check: NonNullable<Gateway["readiness"]>) {
+      gateway.readiness = async (...args) => { counts.readiness++; return check(...args); };
     },
     // Holds the next state write once it has started; `carries` is the state it
     // lands once released.
@@ -243,14 +255,6 @@ function fixture(automatic = true) {
   };
 }
 
-type Gate = ReturnType<typeof gate>;
-// A step the code under test waits on: `pass` resolves `reached`, then waits for `release`.
-function gate() {
-  let reach!: () => void, release!: () => void;
-  const reached = new Promise<void>(resolve => { reach = resolve; });
-  const released = new Promise<void>(resolve => { release = resolve; });
-  return { reached, release, pass: async () => { reach(); await released; } };
-}
 
 async function waitForStatus(f: ReturnType<typeof fixture>, status: State["jobs"][number]["status"]) {
   const agentId = f.state.jobs[0]?.agentId;
@@ -2432,7 +2436,9 @@ type Scheduler = ReturnType<ReturnType<typeof fixture>["make"]>;
 type Stopping = { s: Scheduler; run: Promise<unknown>; held: { reached: Promise<void>; release(): void };
   lands?: () => State | undefined };
 // A scheduler holding a reservation for "a", not yet due.
+// Its readiness checks are counted, so a late one shows.
 async function scheduled(f: ReturnType<typeof fixture>) {
+  f.readiness(async () => null);
   const s = f.make();
   await s.ready;
   await s.observedTurn(f.agents[0]);
@@ -2463,6 +2469,11 @@ const schedulerStopPoints: Record<string, (f: ReturnType<typeof fixture>) => Pro
     const held = f.holdRead();
     const s = f.make();
     return { s, run: s.ready, held };
+  },
+  "recovery's state write": async f => {
+    const held = f.holdWrite();
+    const s = f.make();
+    return { s, run: s.ready, held, lands: held.carries };
   },
   "recovery's settings read": async f => {
     const held = gate();
@@ -2508,8 +2519,9 @@ const schedulerStopPoints: Record<string, (f: ReturnType<typeof fixture>) => Pro
   },
   "the reservation pass's state read": async f => {
     const s = await due(f);
-    // The worker's scan of pending work reads first.
-    return { s, held: f.holdRead(1), run: s.tick() };
+    // The pass reads state once it has read the settings.
+    const before = f.counts.settingsEnded;
+    return { s, held: f.holdRead(() => f.counts.settingsEnded > before), run: s.tick() };
   },
   "a due conversation's host read": async f => {
     const s = await due(f);
@@ -2520,7 +2532,7 @@ const schedulerStopPoints: Record<string, (f: ReturnType<typeof fixture>) => Pro
   "a due conversation's readiness check": async f => {
     const s = await due(f);
     const held = gate();
-    f.gateway.readiness = async () => { await held.pass(); return null; };
+    f.readiness(async () => { await held.pass(); return null; });
     return { s, held, run: s.tick() };
   },
   "a due conversation's second settings read": async f => {
@@ -2531,8 +2543,9 @@ const schedulerStopPoints: Record<string, (f: ReturnType<typeof fixture>) => Pro
   },
   "the reservation's state read": async f => {
     const s = await due(f);
-    // After the worker's scan and the reservation pass's read.
-    return { s, held: f.holdRead(2), run: s.tick() };
+    // The reservation reads state once its conversation's readiness is checked.
+    const before = f.counts.readiness;
+    return { s, held: f.holdRead(() => f.counts.readiness > before), run: s.tick() };
   },
   "a full scan's listing": async f => {
     f.agents.splice(0, 1, nativeAgent(f, "a"));
@@ -2574,6 +2587,13 @@ const schedulerStopPoints: Record<string, (f: ReturnType<typeof fixture>) => Pro
     await s.ready;
     return { s, held: f.holdRead(), run: s.observe({ kind: "agent", agentId: "a" }) };
   },
+  "the observed turn's write": async f => {
+    f.agents.splice(0, 1, nativeAgent(f, "a"));
+    const s = f.make();
+    await s.ready;
+    const held = f.holdWrite();
+    return { s, held, lands: held.carries, run: s.observe({ kind: "agent", agentId: "a" }) };
+  },
   "a status read's host read": async f => {
     const s = f.make();
     await s.ready;
@@ -2584,7 +2604,7 @@ const schedulerStopPoints: Record<string, (f: ReturnType<typeof fixture>) => Pro
   "a status row's readiness check": async f => {
     const s = await scheduled(f);
     const held = gate();
-    f.gateway.readiness = async () => { await held.pass(); return null; };
+    f.readiness(async () => { await held.pass(); return null; });
     return { s, held, run: s.session("a") };
   },
   "the conversation list's listing": async f => {
@@ -2628,7 +2648,8 @@ for (const [at, stopAt] of Object.entries(schedulerStopPoints)) {
     await held.reached;
     // Taken before stop(), so what stop() itself did counts too.
     const before = (state: State = f.state) => JSON.stringify({ state, reads: f.counts.reads,
-      writes: f.counts.writes, refreshes: f.counts.refreshes.length, lists: f.counts.lists, sent: f.calls,
+      writes: f.counts.writes, settings: f.counts.settings, readiness: f.counts.readiness,
+      refreshes: f.counts.refreshes.length, lists: f.counts.lists, sent: f.calls,
       receipts: f.receiptCalls.length, errors: f.errors.map(String) });
     const snapshot = before(lands?.());
     s.stop();
@@ -2649,7 +2670,6 @@ for (const [at, stopAt] of Object.entries(schedulerStopPoints)) {
 
 test("a stopped scheduler starts no read, write, host call or timer for a call made after it stopped", async () => {
   const f = fixture();
-  f.gateway.readiness = async () => null;
   const s = await scheduled(f);
   s.stop();
   f.counts.reset();
@@ -2668,8 +2688,9 @@ test("a stopped scheduler starts no read, write, host call or timer for a call m
     assert.ok(outcome === null || outcome instanceof Stopped, `${name} ends by stopping, not ${String(outcome)}`);
   }
   await f.drained();
-  const { reads, writes, lists, settings, refreshes } = f.counts;
-  assert.deepEqual({ reads, writes, lists, settings, refreshes }, { reads: 0, writes: 0, lists: 0, settings: 0, refreshes: [] },
+  const { reads, writes, lists, settings, readiness, refreshes } = f.counts;
+  assert.deepEqual({ reads, writes, lists, settings, readiness, refreshes },
+    { reads: 0, writes: 0, lists: 0, settings: 0, readiness: 0, refreshes: [] },
     "nothing is read, written or asked of the host");
   assert.deepEqual([f.calls, f.receiptCalls.length, f.errors.length, f.timers.pending], [0, 0, 0, 0]);
 });
