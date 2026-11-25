@@ -308,7 +308,9 @@ export function createScheduler(options: {
     }
     await store.write(state);
     await cleanup();
-    return state;
+    // History cleanup may have pruned operations and saved a newer state; a
+    // leftover request is decided against what is retained after it.
+    return store.read();
   }
   async function cleanup() {
     if (!receipts) return;

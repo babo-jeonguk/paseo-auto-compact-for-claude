@@ -5,7 +5,7 @@ import { join, delimiter, sep } from 'node:path';
 import { homedir } from 'node:os';
 import { z } from 'zod';
 import { observerAsset } from './observer-assets.generated';
-import { Refusal, type NativeOperation, type Observation, type StoredOperation } from './model';
+import { Refusal, samePreparation, type NativeOperation, type Observation, type StoredOperation } from './model';
 import type { Blocked } from '../shared/rpc';
 import { createCacheReader } from './cache';
 import { CLOCK_STEP_TOLERANCE_MS } from './deadline';
@@ -63,13 +63,6 @@ type NativeRecord = {
   refusal?: string | null; preparation?: string;
   prepared?: z.infer<typeof PreparedIdentitySchema> | null;
 };
-// A record and a request or evidence belong to the same preparation unless both
-// name a preparation and the two differ. A record or evidence naming none, from
-// an earlier release or a rollback, is matched by the operation ID alone.
-function samePreparation(recordPreparation: string | undefined, attribution: string | undefined) {
-  return recordPreparation === undefined || attribution === undefined ||
-    recordPreparation === attribution;
-}
 // One rule for both durable receipts and live ledger polls: a record settles
 // `operation` when it comes from the exact prepared observer identity and
 // revision, or when a newer generation in the same launch and Claude session
@@ -273,19 +266,30 @@ export function createObserver(options: { home?: string; now?: () => number; wri
       detail: `Idle delay exceeds the ${ledger.cache?.ttlMinutes}-minute cache window (${ledger.cache?.source})` };
     return null;
   }
-  async function cancel(operation: { directory: string; id: string; preparation?: string }, sent = true) {
-    const path = join(operation.directory, 'request.json');
-    // The read, the check and the write are one writer of this file, so they
-    // cannot be split by a newer preparation landing in between.
+  // One retirement path for a launch directory's request.json. The read, the
+  // check and the write are one writer of this file, so they cannot be split by
+  // a newer preparation landing in between. Only a prepared request is retired:
+  // retiring a retired one again could turn `settled` into `cancelled`, and a
+  // state this release does not know is not ours to rewrite.
+  async function retirePrepared(directory: string,
+    choose: (request: { id: string; preparation?: string }) => { sent: boolean } | null) {
+    const path = join(directory, 'request.json');
     await writes.run(() => requestLock(path, async () => {
       const request = await readRequest(path);
-      if (request.id !== operation.id) return;
-      // Retire only the preparation this call is about; a retry's newer
-      // preparation of the same operation is left alone.
-      if (!samePreparation(request.preparation, operation.preparation)) return;
-      await writes.replace(path, JSON.stringify(retiredRecord(operation.id, request.preparation,
-        await retiredStatus(operation.directory, operation.id, request.preparation, sent))));
+      if (request.status !== 'prepared' || typeof request.id !== 'string') return;
+      const { id, preparation } = request;
+      const decision = choose({ id, ...(preparation !== undefined ? { preparation } : {}) });
+      if (decision === null) return;
+      await writes.replace(path, JSON.stringify(retiredRecord(id, preparation,
+        await retiredStatus(directory, id, preparation, decision.sent))));
     }));
+  }
+  async function cancel(operation: { directory: string; id: string; preparation?: string }, sent = true) {
+    // Retire only the preparation this call is about; a retry's newer
+    // preparation of the same operation is left alone.
+    return retirePrepared(operation.directory, request =>
+      request.id === operation.id && samePreparation(request.preparation, operation.preparation)
+        ? { sent } : null);
   }
   return {
     read,
@@ -460,23 +464,13 @@ export function createObserver(options: { home?: string; now?: () => number; wri
           const info = await lstat(parent);
           if (!info.isDirectory() || info.isSymbolicLink()) return;
           const manifest = ManifestSchema.parse(JSON.parse(await readFile(join(parent, 'current.json'), 'utf8')));
-          const directory = join(parent, manifest.launchId), path = join(directory, 'request.json');
-          await writes.run(() => requestLock(path, async () => {
-            let request: z.infer<typeof RequestSchema>;
-            try {
-              request = await readRequest(path);
-            } catch (error) {
-              if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
-              throw error;
-            }
-            if (request.status !== 'prepared' || request.id === undefined) return;
-            if (request.preparation !== undefined && preparations.has(request.preparation)) return;
-            const decision = decide({ id: request.id,
-              ...(request.preparation !== undefined ? { preparation: request.preparation } : {}) });
-            if (decision === null) return;
-            await writes.replace(path, JSON.stringify(retiredRecord(request.id, request.preparation,
-              await retiredStatus(directory, request.id, request.preparation, decision.sent))));
-          }));
+          const directory = join(parent, manifest.launchId);
+          await retirePrepared(directory, request => {
+            // A request this instance prepared belongs to its own attempt and
+            // is left alone.
+            if (request.preparation !== undefined && preparations.has(request.preparation)) return null;
+            return decide(request);
+          });
         } catch (error) {
           // A missing manifest or launch is a conversation with nothing prepared.
           if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
@@ -486,9 +480,7 @@ export function createObserver(options: { home?: string; now?: () => number; wri
     },
     async release(agentId: string, operation: Pick<NativeOperation, 'id' | 'launchId' | 'preparation'>, sent: boolean) {
       const directory = join(agentDirectory(agentId), operation.launchId);
-      const request = await readRequest(join(directory, 'request.json'));
-      if (request.id === operation.id && request.status === 'prepared')
-        await cancel({ directory, id: operation.id, preparation: operation.preparation }, sent);
+      await cancel({ directory, id: operation.id, preparation: operation.preparation }, sent);
     },
   };
 }

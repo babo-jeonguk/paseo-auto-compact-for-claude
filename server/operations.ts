@@ -1,8 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import { finishedState, operationRowStatus, operationPending, type CompactOperation, type CompactTarget,
   type ResultCode } from "../shared/rpc";
-import { Refusal, readable, unchanged, type CompactOutcome, type Gateway, type LeftoverRequest, type State,
-  type StateStore, type StoredOperation } from "./model";
+import { Refusal, readable, samePreparation, unchanged, type CompactOutcome, type Gateway, type LeftoverRequest,
+  type State, type StateStore, type StoredOperation } from "./model";
 import type { Settings } from "../shared/settings";
 import { createLifetime, deadlineOf, INSPECT_TIMEOUT_MS, OBSERVATION_MS, readWithin, Stopped, systemTimers,
   type Timers } from "./deadline";
@@ -45,10 +45,10 @@ export function leftoverRetirement(request: LeftoverRequest, operation: StoredOp
     // and a retry prepares a fresh request.
     if (operation.evidence?.dispatchStartedAt === undefined) return { sent: false };
     // Possibly sent and still observed with the same preparation: the observer
-    // needs the request to attribute its outcome. Evidence from an earlier
-    // release names no preparation, so the request is kept.
+    // needs the request to attribute its outcome. A side naming no preparation,
+    // from an earlier release, is matched by the operation.
     const native = operation.evidence.native?.preparation;
-    return native === undefined || native === request.preparation ? null : { sent: true };
+    return samePreparation(request.preparation, native) ? null : { sent: true };
   }
   // Finished: retired as the worker's release would, sent once the marker exists.
   return { sent: operation.evidence?.dispatchStartedAt !== undefined };

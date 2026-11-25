@@ -78,6 +78,14 @@ export function readable<T extends Observation | null>(agent: T): T {
   return agent;
 }
 
+// A record and a request or evidence belong to the same preparation unless both
+// name a preparation and the two differ. A record or evidence naming none, from
+// an earlier release or a rollback, is matched by the operation ID alone.
+export function samePreparation(recordPreparation: string | undefined, attribution: string | undefined) {
+  return recordPreparation === undefined || attribution === undefined ||
+    recordPreparation === attribution;
+}
+
 export const targetOf = (agent: Pick<Observation, "sessionId" | "activityKey">): CompactTarget =>
   ({ sessionId: agent.sessionId, activityKey: agent.activityKey ?? null });
 // The one test that a conversation is still exactly the one work was accepted
