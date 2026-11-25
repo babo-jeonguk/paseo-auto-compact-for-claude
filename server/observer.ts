@@ -9,6 +9,8 @@ import { Refusal, type NativeOperation, type Observation, type StoredOperation }
 import type { Blocked } from '../shared/rpc';
 import { createCacheReader } from './cache';
 import { CLOCK_STEP_TOLERANCE_MS } from './deadline';
+import type { DurableWrites } from './durable';
+import type { LeftoverDecision } from './model';
 
 // Must equal QUERY_RESTARTED_REFUSAL in server/observer-source.mjs.
 export const QUERY_RESTARTED_REFUSAL = 'query_restarted';
@@ -108,7 +110,7 @@ export function placeholderReason(preparedAt: number, agent: Pick<Observation, '
     : { reason: 'observer_starting', detail: 'Claude observer starting; waiting for a completed reply' };
 }
 
-export function createObserver(options: { home?: string; now?: () => number } = {}) {
+export function createObserver(options: { home?: string; now?: () => number; writes?: DurableWrites } = {}) {
   const base = join(options.home ?? process.env.PASEO_HOME ?? join(homedir(), '.paseo'),
     'plugin-data', 'auto-compact-for-claude', 'observers');
   const now = options.now ?? Date.now;
@@ -203,7 +205,7 @@ export function createObserver(options: { home?: string; now?: () => number } = 
       detail: `Idle delay exceeds the ${ledger.cache?.ttlMinutes}-minute cache window (${ledger.cache?.source})` };
     return null;
   }
-  async function cancel(operation: { directory: string; id: string }, sent = true) {
+  async function cancel(operation: { directory: string; id: string; preparation?: string }, sent = true) {
     const path = join(operation.directory, 'request.json');
     const request = JSON.parse(await readFile(path, 'utf8'));
     if (request.id !== operation.id) return;
@@ -317,7 +319,7 @@ export function createObserver(options: { home?: string; now?: () => number } = 
       if (ledger.activeTurns.length || ledger.pendingInputs || ledger.compact?.status === 'running')
         throw new Refusal('Claude is still working');
       if (requireCache) { const blocked = reason(ledger, agent); if (blocked) throw new Refusal(blocked.detail); }
-      const request = { id, launchId: ledger.launchId, generation: ledger.generation,
+      const request = { id, preparation: randomUUID() as string, launchId: ledger.launchId, generation: ledger.generation,
         sessionId: ledger.sessionId, revision: ledger.revision, preparedAt: now(), expiresAt,
         requireCache, cacheDeadline: ledger.cacheDeadline, clockEpoch: ledger.clockEpoch, status: 'prepared' };
       const receipts = join(agentDirectory(agent.agentId), 'receipts');
@@ -363,7 +365,11 @@ export function createObserver(options: { home?: string; now?: () => number } = 
     // A finished operation whose call did not end normally, such as one
     // recovered after a restart, may leave its native request prepared. Retire
     // it so that it can no longer claim a later /compact.
-    async release(agentId: string, operation: Pick<NativeOperation, 'id' | 'launchId'>, sent: boolean) {
+    async recoverPrepared(decide: LeftoverDecision) {
+      void decide;
+      throw new Error('Not implemented');
+    },
+    async release(agentId: string, operation: Pick<NativeOperation, 'id' | 'launchId' | 'preparation'>, sent: boolean) {
       const directory = join(agentDirectory(agentId), operation.launchId);
       const request = JSON.parse(await readFile(join(directory, 'request.json'), 'utf8'));
       if (request.id === operation.id && request.status === 'prepared') await cancel({ directory, id: operation.id }, sent);

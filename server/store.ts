@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { z } from "zod";
 import { JobSchema, StoredOperationSchema, type State, type StateStore } from "./model";
 import { finishedState } from "../shared/rpc";
+import { createDurableWrites, type DurableWrites } from "./durable";
 
 // Jobs as v1.0.2 wrote them, plus their operation link. Unknown keys are dropped,
 // just as v1.0.2 drops ours.
@@ -94,8 +95,10 @@ export function createStore(
     "plugin-data",
     "auto-compact-for-claude",
     "state.json"
-  )
+  ),
+  writes: DurableWrites = createDurableWrites()
 ): StateStore {
+  void writes;
   return {
     async read() {
       try {

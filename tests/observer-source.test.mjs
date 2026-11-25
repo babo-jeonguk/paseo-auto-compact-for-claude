@@ -76,6 +76,12 @@ function fixture(env = {}, settings = {}) {
     },
     holdUsage() { let release; usageGate = new Promise(resolve => { release = () => { usageGate = null; waiting.clear(); resolve(); }; }); return release; },
     async start() { await event('session.start'); },
+    // The next observer generation of the same launch, as when Paseo restarts
+    // Claude's query: it registers afresh on the same files and starts.
+    async newGeneration() {
+      registerObserver((name, ...rest) => { hooks.set(name, rest.at(-1)); return { catch() {} }; }, configuration);
+      await event('session.start');
+    },
     async ordinary(reported = usage, responseDelay = 0) {
       await event('prompt.submit', { text: 'ordinary input' });
       await event('turn.start', { text: 'ordinary input', turnId: 'user-1' });
@@ -692,4 +698,52 @@ test('different launch, different session or generic cancellation never records 
     assert.equal(receipt.refusal, undefined, name);
     assert.equal(receipt.prepared, undefined, name);
   }
+});
+
+test('a request left prepared causes at most one refusal, whatever commands and compactions follow', async () => {
+  // Requests from this release carry a preparation identity; earlier ones do not.
+  for (const preparation of ['preparation-1', undefined]) {
+    const f = fixture(); await f.start(); await f.ordinary();
+    f.request({ expiresAt: 0, ...(preparation ? { preparation } : {}) });
+    let runs = 0;
+    const manual = () => f.compact(async () => { runs++; });
+    assert.match((await manual()).text, /expired/i, `${preparation}: the first command is checked and refused`);
+    await manual();
+    await f.ordinary();
+    await manual();
+    assert.equal((await f.event('classic.PreCompact', { trigger: 'manual' })).block, undefined, `${preparation}`);
+    assert.equal(runs, 2, `${preparation}: every later command runs as the user's own`);
+    assert.equal(f.ledger().compact.id, null, `${preparation}`);
+  }
+});
+
+test('another preparation of the same operation is checked on its own', async () => {
+  for (const [first, second] of [[{ preparation: 'first' }, { preparation: 'second' }],
+    [{ preparedAt: 1_000_000 }, { preparedAt: 1_000_001 }]]) {
+    const f = fixture(); await f.start(); await f.ordinary();
+    f.request({ expiresAt: 0, ...first });
+    assert.match((await f.compact()).text, /expired/i);
+    f.request(second);
+    await f.compact(async () => {
+      await f.event('classic.PreCompact', { trigger: 'manual' });
+      await f.event('classic.PostCompact');
+    });
+    const compact = f.ledger().compact;
+    assert.equal(compact.id, 'operation-1', `${JSON.stringify(second)}: admitted as the plugin's request`);
+    assert.equal(compact.status, 'completed');
+    const receipt = JSON.parse(f.files.get('/receipts/operation-1.json'));
+    assert.equal(receipt.status, 'completed');
+    assert.equal(receipt.preparation, second.preparation, 'the receipt names the preparation it settles, if any');
+  }
+});
+
+test('the next generation of a launch remembers which preparation was already checked', async () => {
+  const f = fixture(); await f.start(); await f.ordinary();
+  f.request({ expiresAt: 0, preparation: 'left' });
+  assert.match((await f.compact()).text, /expired/i);
+  await f.newGeneration();
+  let ran = false;
+  await f.compact(async () => { ran = true; });
+  assert.equal(ran, true, 'a request already refused is not refused again after a query restart');
+  assert.equal(f.ledger().compact.id, null);
 });

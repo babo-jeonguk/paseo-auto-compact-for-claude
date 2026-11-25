@@ -1,8 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import { finishedState, operationRowStatus, operationPending, type CompactOperation, type CompactTarget,
   type ResultCode } from "../shared/rpc";
-import { Refusal, readable, unchanged, type CompactOutcome, type Gateway, type State, type StateStore,
-  type StoredOperation } from "./model";
+import { Refusal, readable, unchanged, type CompactOutcome, type Gateway, type LeftoverRequest, type State,
+  type StateStore, type StoredOperation } from "./model";
 import type { Settings } from "../shared/settings";
 import { createLifetime, deadlineOf, INSPECT_TIMEOUT_MS, OBSERVATION_MS, readWithin, Stopped, systemTimers,
   type Timers } from "./deadline";
@@ -36,6 +36,11 @@ export function sameActivity(operation: Pick<CompactOperation, "agentId" | "revi
 // proves that nothing was sent. Legacy history never recorded the marker.
 export const mayHaveSent = (operation: StoredOperation) => operation.kind === "legacy" ||
   !(operation.state === "expired" || (operation.state === "failed" && operation.evidence?.dispatchStartedAt === undefined));
+
+export function leftoverRetirement(request: LeftoverRequest, operation: StoredOperation | undefined): { sent: boolean } | null {
+  void request; void operation;
+  throw new Error("Not implemented");
+}
 
 // Jobs keep the fields v1.0.2 reads, so a rollback neither replays an attempted
 // reservation nor blocks a retry of one that sent nothing. The scheduler applies
