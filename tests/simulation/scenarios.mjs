@@ -763,6 +763,62 @@ export const scenarios = [
     },
   },
   {
+    name: 'a request an earlier instance left prepared refuses at most one /compact and is retired on reload',
+    async run({ fixture: f }) {
+      const id = await f.agent();
+      await f.turn(id, 'LEFTOVER_READY: reply without tools.');
+      // Off, so no reservation of the plugin's own runs in between.
+      await f.rpc('toggle', { agentId: id, enabled: false });
+      const parent = join(f.home, 'plugin-data/auto-compact-for-claude/observers',
+        createHash('sha256').update(id).digest('hex'));
+      const { launchId } = JSON.parse(await readFile(join(parent, 'current.json'), 'utf8'));
+      const requestPath = join(parent, launchId, 'request.json');
+      // An expired request for an operation the state does not hold, as an
+      // interrupted earlier instance can leave it in a running launch.
+      const leave = async () => {
+        const ledger = await f.ledger(id);
+        const request = { id: randomUUID(), preparation: randomUUID(), launchId, generation: ledger.generation,
+          sessionId: ledger.sessionId, revision: ledger.revision, preparedAt: Date.now() - 600_000,
+          expiresAt: Date.now() - 300_000, requireCache: false, cacheDeadline: null, clockEpoch: ledger.clockEpoch,
+          status: 'prepared' };
+        await writeFile(requestPath, JSON.stringify(request));
+        return request;
+      };
+      const compactions = async () => boundaries(await f.timeline(id)).length;
+      const idle = async () => (await f.row(id)).status !== 'busy';
+      const left = await leave();
+      const before = await compactions();
+      await f.send(id, '/compact');
+      // Claude checks the command against the leftover and refuses it.
+      const refused = await waitFor(async () => {
+        const { compact } = await f.ledger(id);
+        return compact?.id === left.id && compact.status === 'failed' && await idle() ? compact : null;
+      }, 'first /compact refused against the leftover');
+      assert.match(refused.reason ?? '', /expired/i);
+      assert.equal(await compactions(), before, 'the refused command compacted nothing');
+      // Every later command runs as the user's own, each with its own boundary,
+      // also after new activity that the leftover was prepared before. Each
+      // follows an ordinary reply: right after a compaction, Claude has nothing
+      // to compact and returns without one.
+      for (const [index, label] of ['second', 'third'].entries()) {
+        await f.turn(id, `LEFTOVER_${label.toUpperCase()}: reply without tools.`);
+        await f.send(id, '/compact');
+        await waitFor(async () => await compactions() === before + index + 1 && await idle(),
+          `${label} /compact runs as the user's own`, 90_000);
+        assert.equal((await f.ledger(id)).compact?.id, null, label);
+      }
+      // Left by the instance a reload replaces: the next one retires it at
+      // startup, as unsent, since the state holds no such operation.
+      const stranded = await leave();
+      assert.equal((await f.client.reloadPlugin('auto-compact-for-claude')).status, 'running');
+      const retired = await waitFor(async () => {
+        const request = JSON.parse(await readFile(requestPath, 'utf8'));
+        return request.status !== 'prepared' ? request : null;
+      }, 'leftover request retired after reload');
+      assert.deepEqual(retired, { id: stranded.id, preparation: stranded.preparation, status: 'settled' });
+    },
+  },
+  {
     name: 'plugin reload preserves settings, conversation OFF and existing session without replay',
     async run({ fixture: f, model, id, sessionId }) {
       await f.rpc('toggle', { agentId: id, enabled: false });

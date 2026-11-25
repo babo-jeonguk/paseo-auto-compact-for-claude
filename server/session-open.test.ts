@@ -80,10 +80,10 @@ test("the plugin registers every hook through addHook under its current name and
   // Stop is deferred first, so a failed check below still stops the plugin.
   let stopped = false;
   const stop = contribute(server);
-  scope.defer(() => { if (!stopped) stop(); });
+  scope.defer(() => stopped ? undefined : stop());
   assert.deepEqual([...hooks.keys()].sort(), [...HOOKS].sort());
-  stop();
   stopped = true;
+  await stop();
   assert.deepEqual([...hooks.values()].map(hook => hook.stops), HOOKS.map(() => 1));
 });
 
