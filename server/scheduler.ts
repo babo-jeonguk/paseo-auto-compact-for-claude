@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { bounded, INSPECT_TIMEOUT_MS, SEND_DEADLINE_MS, systemTimers, type Timers } from "./deadline";
+import { createLifetime, INSPECT_TIMEOUT_MS, SEND_DEADLINE_MS, Stopped, systemTimers, type Timers } from "./deadline";
 import type { Settings } from "../shared/settings";
 import { knownBlockedReason, operationPending, operationRowStatus, SESSION_RESUME_REQUIRED, type Blocked, type BlockedReason,
   type CompactTarget, type Row } from "../shared/rpc";
@@ -61,7 +61,7 @@ function staleActivity(prior: string | undefined, next: string | undefined) {
 
 // Apply one finished native turn to the state in memory. Returns whether the
 // state changed; the caller decides when to persist it.
-function applyObservation(state: State, agent: Observation, endedAt: number, stopped: boolean) {
+function applyObservation(state: State, agent: Observation, endedAt: number) {
   const prior = state.jobs.find((job) => job.agentId === agent.agentId);
   if (
     !agent.eligible ||
@@ -73,8 +73,7 @@ function applyObservation(state: State, agent: Observation, endedAt: number, sto
     (agent.activityKey
       ? prior?.activityKey === agent.activityKey ||
         staleActivity(prior?.activityKey, agent.activityKey)
-      : prior?.revision === agent.revision) ||
-    stopped
+      : prior?.revision === agent.revision)
   )
     return false;
   state.jobs = state.jobs.filter((job) => job.agentId !== agent.agentId);
@@ -102,24 +101,47 @@ export function createScheduler(options: {
 }) {
   const { gateway } = options;
   const timers = options.timers ?? systemTimers;
-  let stopped = false;
+  // The scheduler's one lifetime, which stop() ends; the worker has its own,
+  // which stop() ends with it. Every await of a pass waits on it: state reads
+  // and transactions, settings and host reads, readiness checks and receipt
+  // work, and that I/O starts only while it lasts. Every side effect goes
+  // through one owner that does nothing once it has ended: state writes
+  // (`store`), reports (`onError`), receipt removals and sweeps (`receipts`),
+  // the single-flight timer (`finish`) and submissions to the worker, whose
+  // own lifetime ends with this one.
+  const lifetime = createLifetime(timers);
+  const { live, wait, begin } = lifetime;
   // Every write passes through syncJobs, the only writer of jobs' attempt fields.
   // A stopped scheduler cannot write: it would put back state that a newer
-  // instance has replaced since this one read it.
-  const store: StateStore = { read: () => options.store.read(), write: async state => {
-    if (stopped) throw new Error("Plugin stopped");
-    await options.store.write(syncJobs(state));
-  } };
-  const settings = () => bounded(options.settings(), INSPECT_TIMEOUT_MS, timers);
-  const refresh = (id: string) => bounded(gateway.refresh(id), INSPECT_TIMEOUT_MS, timers);
+  // instance has replaced since this one read it. A write in progress is not
+  // cut short: its transaction holds the queue until the write itself ends, so
+  // the next writer waits for it, while the transaction's caller stops waiting.
+  const store: StateStore = {
+    read: () => wait(begin(() => options.store.read())),
+    write: async state => {
+      if (!live()) throw new Stopped();
+      await options.store.write(syncJobs(state));
+    },
+  };
+  const settings = () => wait(begin(() => options.settings()), INSPECT_TIMEOUT_MS);
+  const refresh = (id: string) => wait(begin(() => gateway.refresh(id)), INSPECT_TIMEOUT_MS);
   const now = options.now ?? Date.now;
-  const onError = options.onError ?? (() => {});
+  // What a stopped scheduler's pass meets is its stopping, not a fault.
+  const onError = (error: unknown) => { if (live()) options.onError?.(error); };
+  const host = options.receipts;
+  const receipts: OperationReceipts | undefined = host && {
+    remove: (agentId, operationId) => wait(begin(() => host.remove(agentId, operationId))),
+    sweep: (retained, cutoff) => wait(begin(() => host.sweep(retained, cutoff))),
+  };
   let tail: Promise<unknown> = Promise.resolve();
   let nextCleanupAt = -Infinity;
+  // The state queue. A transaction's caller waits on the lifetime, so one
+  // queued behind a held transaction ends at once on stop; the queue itself
+  // follows the transaction, whose reads and writes then refuse.
   const serialize = <T>(fn: () => Promise<T>): Promise<T> => {
     const result = tail.then(fn);
     tail = result.catch(() => {});
-    return result;
+    return wait(result);
   };
   let nextFullScanAt = -Infinity;
   let observing = false;
@@ -151,7 +173,7 @@ export function createScheduler(options: {
       let changed = false;
       for (const { agent, endedAt, seq } of entries) {
         if (!freshRead(agent.agentId, seq)) continue;
-        if (applyObservation(state, agent, endedAt, stopped)) changed = true;
+        if (applyObservation(state, agent, endedAt)) changed = true;
       }
       if (changed) await store.write(state);
     });
@@ -178,19 +200,19 @@ export function createScheduler(options: {
     const failures: unknown[] = [];
     const track = (observation: Promise<Observation | null>) => {
       started.push(observation);
-      const wait = bounded(observation, INSPECT_TIMEOUT_MS, timers);
-      wait.catch((reason) => { failures.push(reason); });
-      waits.push(wait);
+      const bound = wait(observation, INSPECT_TIMEOUT_MS);
+      bound.catch((reason) => { failures.push(reason); });
+      waits.push(bound);
     };
     if (plan.full) {
-      const listing = gateway.list(track);
+      const listing = begin(() => gateway.list(track));
       // A listing page that fails or times out fails the whole scan, but reads
       // started on any page still hold single-flight until they settle.
       hostWork = (async () => {
         await listing.catch(() => {});
         await Promise.allSettled(started);
       })();
-      await bounded(listing, INSPECT_TIMEOUT_MS, timers);
+      await wait(listing, INSPECT_TIMEOUT_MS);
     } else {
       const ids = new Set(plan.agentIds);
       if (plan.attention) {
@@ -204,7 +226,7 @@ export function createScheduler(options: {
       if (ids.size === 0) return;
       // Paseo cannot list agents by ID, so conversations that need attention
       // are read one by one instead of paging the whole directory.
-      for (const id of ids) track(gateway.refresh(id));
+      for (const id of ids) track(begin(() => gateway.refresh(id)));
       hostWork = Promise.allSettled(started);
     }
     // Each observation is bounded on its own, so one conversation's timeout
@@ -228,13 +250,13 @@ export function createScheduler(options: {
     const next = pending;
     pending = null;
     if (!next) return;
-    if (stopped) { next.resolve(); return; }
     start(next.plan).then(next.resolve, next.reject);
   }
   function finish() {
     // A timed-out host read is not cancelled: keep single-flight until it ends,
-    // but never longer than a full scan interval.
-    if (stopped) return release();
+    // but never longer than a full scan interval. A stopped scheduler arms no
+    // timer for it.
+    if (!live()) return release();
     let released = false;
     const once = () => { if (released) return; released = true; release(); };
     hostWork.then(once, once);
@@ -250,7 +272,6 @@ export function createScheduler(options: {
     return run;
   }
   const observe = (scope: ObservationScope): Promise<void> => {
-    if (stopped) return Promise.resolve();
     const plan = planFor(scope);
     if (!observing) return start(plan);
     if (pending) { mergePlan(pending.plan, plan); return pending.promise; }
@@ -265,7 +286,7 @@ export function createScheduler(options: {
     agent: Observation,
     config: Settings | null
   ) {
-    return !stopped && config && job?.status === "skipped" && job.skip &&
+    return config && job?.status === "skipped" && job.skip &&
       job.attemptedAt === undefined && agent.eligible && agent.idle &&
       job.revision === agent.revision && job.skip.sessionId === agent.sessionId &&
       job.activityKey === agent.activityKey &&
@@ -287,20 +308,20 @@ export function createScheduler(options: {
     await cleanup();
   }
   async function cleanup() {
-    if (stopped || !options.receipts) return;
+    if (!receipts) return;
     const at = now();
     if (at < nextCleanupAt && nextCleanupAt <= at + HISTORY_SWEEP_INTERVAL_MS) return;
     try {
       const state = await store.read();
-      const result = await pruneOperationHistory(state, at, options.receipts, onError);
+      const result = await pruneOperationHistory(state, at, receipts, onError);
       if (result.changed) await store.write(state);
       // Only sweep orphans after the authoritative state commit succeeds.
-      await options.receipts.sweep(state.operations, at - HISTORY_RETENTION_MS);
+      await receipts.sweep(state.operations, at - HISTORY_RETENTION_MS);
       nextCleanupAt = result.backlog ? -Infinity : at + HISTORY_SWEEP_INTERVAL_MS;
     } catch (error) { onError(error); }
   }
-  // The worker bounds its own reads on its lifetime, so it reads the settings
-  // directly: a bound of the scheduler's around them would outlive its stop.
+  // The worker bounds its own reads on its own lifetime, so it reads the
+  // settings directly rather than through the scheduler's bound.
   const worker = createOperationWorker({ store, gateway, settings: options.settings, now, onError, timers,
     // A transaction that changes nothing writes nothing.
     update: change => serialize(async () => {
@@ -361,10 +382,11 @@ export function createScheduler(options: {
       } else if (agent.resumeRequired) {
         block({ reason: "resume_required", detail: SESSION_RESUME_REQUIRED });
       } else if (gateway.readiness) {
-        const blocked = await bounded(gateway.readiness(
+        const readiness = gateway.readiness;
+        const blocked = await wait(begin(() => readiness(
           agent,
           job && config ? due(job, config) : undefined
-        ), INSPECT_TIMEOUT_MS, timers);
+        )), INSPECT_TIMEOUT_MS);
         if (blocked) block(blocked);
       }
     }
@@ -424,7 +446,7 @@ export function createScheduler(options: {
   async function reserveDue(connected: boolean): Promise<void> {
     // Unreadable settings keep every reservation for the next tick.
     const config = await settings();
-    if (!config || stopped) return;
+    if (!config) return;
     // The helpers below close over the narrowed value; keep it explicit.
     const phaseConfig = config;
     // One policy call for every phase; `now` is read at the decision.
@@ -434,7 +456,6 @@ export function createScheduler(options: {
     // conversation already being inspected by an earlier tick is left alone.
     const { candidates, disabled } = await serialize(async () => {
       const state = await store.read();
-      if (stopped) return { candidates: [] as Candidate[], disabled: state.disabled };
       let changed = false;
       const candidates: Candidate[] = [];
       for (const job of [...state.jobs].sort(
@@ -484,8 +505,9 @@ export function createScheduler(options: {
         if (agent.resumeRequired) {
           return { candidate, outcome: { kind: "blocked", reason: "resume_required", detail: SESSION_RESUME_REQUIRED } };
         }
-        const blocked = gateway.readiness
-          ? await bounded(gateway.readiness(agent, dueAt(candidate.endedAt, phaseConfig)), INSPECT_TIMEOUT_MS, timers)
+        const readiness = gateway.readiness;
+        const blocked = readiness
+          ? await wait(begin(() => readiness(agent, dueAt(candidate.endedAt, phaseConfig))), INSPECT_TIMEOUT_MS)
           : null;
         // Like an unreadable observation above: not a change, so keep the reservation.
         if (blocked && TRANSIENT.includes(blocked.reason)) return null;
@@ -513,7 +535,6 @@ export function createScheduler(options: {
     // conversation's inspection or commit.
     async function apply(decision: Decision): Promise<boolean> {
       return serialize(async () => {
-        if (stopped) return false;
         const state = await store.read();
         const { candidate, outcome } = decision;
         const job = state.jobs.find(entry => entry.agentId === candidate.agentId);
@@ -586,7 +607,7 @@ export function createScheduler(options: {
     reconcile: worker.reconcile,
     idle: worker.idle,
     stop() {
-      stopped = true;
+      lifetime.end();
       if (hostTimer !== undefined) { timers.clearTimeout(hostTimer); hostTimer = undefined; }
       release();
       worker.stop();
@@ -632,11 +653,11 @@ export function createScheduler(options: {
       const [state, config, agents] = await Promise.all([
         serialize(() => store.read()),
         settings(),
-        bounded((async () => {
+        wait(begin(async () => {
           const observations: Promise<Observation>[] = [];
           await gateway.list((observation) => observations.push(observation));
           return Promise.all(observations);
-        })(), INSPECT_TIMEOUT_MS, timers),
+        }), INSPECT_TIMEOUT_MS),
       ]);
       return Promise.all(
         agents
@@ -659,10 +680,8 @@ export function createScheduler(options: {
         return true;
       }),
     skip: async (agentId: string, revision: string) => {
-      if (stopped) return false;
       const [config, agent] = await Promise.all([settings(), refresh(agentId)]);
       return serialize(async () => {
-        if (stopped) return false;
         const state = await store.read();
         const job = state.jobs.find(
           (job) => job.agentId === agentId && job.revision === revision
@@ -707,8 +726,6 @@ export function createScheduler(options: {
           ? existingResult(prior)
           : { status: "blocked" as const, detail: "Operation ID was already used with different input",
               operationId: null, operation: null, code: "idempotency_conflict" as const };
-        if (stopped) return { status: "blocked" as const, detail: "Plugin is stopping",
-          operationId: null, operation: null, code: "blocked" as const };
         const pending = pendingOf(state, agentId);
         return pending ? existingResult(pending) : null;
       };
@@ -718,14 +735,12 @@ export function createScheduler(options: {
       // slow inspection must not delay another conversation's state changes.
       const [config, agent] = await Promise.all([settings(), refresh(agentId)]);
       type CompactAnswer = NonNullable<ReturnType<typeof storedAnswer>> |
+        { status: "blocked"; detail: string; operationId: null; operation: null; code: "blocked" } |
         { status: Job["status"]; detail: string; operationId: string | null;
           operation: null; code: "existing" };
       const prepared = await serialize(async (): Promise<
         { result: CompactAnswer } | { job: Job; agent: Observation; operation: StoredOperation }
       > => {
-        // A request already in flight when this instance stopped must fail like
-        // the store's own refusal; a newer instance may own the state now.
-        if (stopped) throw new Error("Plugin stopped");
         const state = await store.read();
         const answered = storedAnswer(state);
         if (answered) return { result: answered };

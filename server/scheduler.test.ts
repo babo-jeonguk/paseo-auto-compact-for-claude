@@ -29,14 +29,16 @@ function fixture(automatic = true) {
   let settingsHold: { skip: number; hold: () => Promise<void> } | null = null;
   // A held state read, `skip` reads from when it was set; it reads once released.
   let readHold: { skip: number; held: Gate } | null = null;
+  // The next state write, held once it has started; it lands once released.
+  let writeHold: { held: Gate; carries?: State } | null = null;
   const errors: unknown[] = [];
   // Receipt removals and sweeps as they start, and the one held until released.
   const receiptCalls: string[] = [];
   const receiptHolds = new Map<string, Gate>();
   // Resource use the optimization promises to bound.
   const counts = {
-    reads: 0, writes: 0, lists: 0, refreshes: [] as string[],
-    reset() { this.reads = 0; this.writes = 0; this.lists = 0; this.refreshes = []; },
+    reads: 0, writes: 0, lists: 0, settings: 0, refreshes: [] as string[],
+    reset() { this.reads = 0; this.writes = 0; this.lists = 0; this.settings = 0; this.refreshes = []; },
   };
   let listGate: Promise<void> | null = null;
   // Listings waiting at the gate `holdList` set, and listings running now and
@@ -73,6 +75,8 @@ function fixture(automatic = true) {
     },
     write: async (next) => {
       counts.writes++;
+      const hold = writeHold;
+      if (hold) { writeHold = null; hold.carries = structuredClone(next); await hold.held.pass(); }
       state = structuredClone(next);
       signal.changed();
     },
@@ -146,6 +150,7 @@ function fixture(automatic = true) {
       ...options.receipts ? { receipts } : {},
       gateway,
       settings: async () => {
+        counts.settings++;
         const held = settingsHold;
         if (held && held.skip-- === 0) { settingsHold = null; await held.hold(); }
         return config;
@@ -178,6 +183,13 @@ function fixture(automatic = true) {
       const held = gate();
       readHold = { skip, held };
       return held;
+    },
+    // Holds the next state write once it has started; `carries` is the state it
+    // lands once released.
+    holdWrite() {
+      const hold: { held: Gate; carries?: State } = { held: gate() };
+      writeHold = hold;
+      return { ...hold.held, carries: () => hold.carries };
     },
     // Holds the next receipt removal or sweep once it has started.
     holdReceipts(kind: "remove" | "sweep"): Gate {
@@ -941,7 +953,7 @@ test("unreadable settings and stopped plugin never send", async () => {
   assert.equal(f.calls, 0);
   f.config = { ...DEFAULT_SETTINGS };
   s.stop();
-  await s.tick();
+  await assert.rejects(s.tick(), Stopped);
   assert.equal(f.calls, 0);
 });
 
@@ -1394,7 +1406,7 @@ test("a scheduler stopped mid-request cannot put back state a newer instance rep
   const second = f.make(); await second.ready;
   await second.compactNow("a", f.agents[0].revision!, "request-new");
   release();
-  await assert.rejects(stale, /Plugin stopped/);
+  await assert.rejects(stale, Stopped);
   assert.deepEqual(f.state.operations.map(operation => operation.id), ["request-new"]);
 });
 
@@ -2415,7 +2427,10 @@ test("a blocked reservation stores its reason code with its detail and shows it 
 });
 
 type Scheduler = ReturnType<ReturnType<typeof fixture>["make"]>;
-type Stopping = { s: Scheduler; run: Promise<unknown>; held: { reached: Promise<void>; release(): void } };
+// `lands` is the state a held write carries: started before the stop, it
+// still lands once released, and nothing after it does.
+type Stopping = { s: Scheduler; run: Promise<unknown>; held: { reached: Promise<void>; release(): void };
+  lands?: () => State | undefined };
 // A scheduler holding a reservation for "a", not yet due.
 async function scheduled(f: ReturnType<typeof fixture>) {
   const s = f.make();
@@ -2429,15 +2444,16 @@ async function due(f: ReturnType<typeof fixture>) {
   f.advance(55 * 60_000);
   return s;
 }
-// A scheduler with an operation past its retention, which the next tick's
-// history cleanup removes.
+// A scheduler with two operations past their retention, which the next
+// tick's history cleanup removes one after the other.
 async function retired(f: ReturnType<typeof fixture>) {
   const s = f.make({ receipts: true });
   await s.ready;
-  f.state.operations.push({ id: "retired", agentId: "a", revision: f.agents[0].revision!,
-    target: { sessionId: "native-a", activityKey: null }, kind: "manual", state: "succeeded",
-    createdAt: f.time - HISTORY_RETENTION_MS, updatedAt: f.time - HISTORY_RETENTION_MS, inputFingerprint: null,
-    result: { code: "completed", message: "done" } });
+  for (const id of ["retired-1", "retired-2"])
+    f.state.operations.push({ id, agentId: "a", revision: f.agents[0].revision!,
+      target: { sessionId: "native-a", activityKey: null }, kind: "manual", state: "succeeded",
+      createdAt: f.time - HISTORY_RETENTION_MS, updatedAt: f.time - HISTORY_RETENTION_MS, inputFingerprint: null,
+      result: { code: "completed", message: "done" } });
   f.advance(HISTORY_SWEEP_INTERVAL_MS);
   return s;
 }
@@ -2454,12 +2470,18 @@ const schedulerStopPoints: Record<string, (f: ReturnType<typeof fixture>) => Pro
     const s = f.make();
     return { s, run: s.ready, held };
   },
-  "a tick queued behind another transaction": async f => {
-    const s = await due(f);
+  "a tick queued behind another transaction's read": async f => {
+    const s = await retired(f);
     const held = f.holdRead();
     // Its own outcome is not this test's; it ends with the stop too.
-    void s.toggle("a", true).catch(() => {});
+    void s.toggle("a", false).catch(() => {});
     return { s, run: s.tick(), held };
+  },
+  "a tick queued behind another transaction's write": async f => {
+    const s = await retired(f);
+    const held = f.holdWrite();
+    void s.toggle("a", false).catch(() => {});
+    return { s, run: s.tick(), held, lands: held.carries };
   },
   "the history cleanup's state read": async f => {
     const s = await retired(f);
@@ -2468,6 +2490,11 @@ const schedulerStopPoints: Record<string, (f: ReturnType<typeof fixture>) => Pro
   "a receipt's removal": async f => {
     const s = await retired(f);
     return { s, held: f.holdReceipts("remove"), run: s.tick() };
+  },
+  "the history cleanup's write": async f => {
+    const s = await retired(f);
+    const held = f.holdWrite();
+    return { s, held, lands: held.carries, run: s.tick() };
   },
   "the receipts' sweep": async f => {
     const s = await retired(f);
@@ -2594,22 +2621,23 @@ for (const [at, stopAt] of Object.entries(schedulerStopPoints)) {
   test(`a scheduler stopped at ${at} ends the call at once, and reads, writes, submits, removes and reports nothing`, async (t) => {
     const scope = cleanupScope(t);
     const f = fixture();
-    const { s, run, held } = await stopAt(f);
+    const { s, run, held, lands } = await stopAt(f);
     scope.defer(() => s.stop());
     // Its outcome is checked once it settles; a rejection is not left unhandled meanwhile.
     const settled = run.then(() => null, (error: unknown) => error);
     await held.reached;
     // Taken before stop(), so what stop() itself did counts too.
-    const before = () => JSON.stringify({ state: f.state, reads: f.counts.reads, writes: f.counts.writes,
-      refreshes: f.counts.refreshes.length, lists: f.counts.lists, sent: f.calls, receipts: f.receiptCalls.length,
-      errors: f.errors.map(String) });
-    const snapshot = before();
+    const before = (state: State = f.state) => JSON.stringify({ state, reads: f.counts.reads,
+      writes: f.counts.writes, refreshes: f.counts.refreshes.length, lists: f.counts.lists, sent: f.calls,
+      receipts: f.receiptCalls.length, errors: f.errors.map(String) });
+    const snapshot = before(lands?.());
     s.stop();
     assert.equal(f.timers.pending, 0, `${at}: stopping ends every wait and clears its timer`);
     // The call ends while its step is still held; one still waiting fails
     // here, at the runner's bound.
     const outcome = await settled;
     assert.ok(outcome === null || outcome instanceof Stopped, `${at}: the call ends by stopping, not ${String(outcome)}`);
+    assert.equal(f.timers.pending, 0, `${at}: the ended call armed nothing on its way out`);
     await s.idle();
     held.release();
     // What the released step does next has run once the queued callbacks have.
@@ -2618,3 +2646,30 @@ for (const [at, stopAt] of Object.entries(schedulerStopPoints)) {
     assert.equal(f.timers.pending, 0, `${at}: no wait is armed`);
   });
 }
+
+test("a stopped scheduler starts no read, write, host call or timer for a call made after it stopped", async () => {
+  const f = fixture();
+  f.gateway.readiness = async () => null;
+  const s = await scheduled(f);
+  s.stop();
+  f.counts.reset();
+  const revision = f.agents[0].revision!;
+  const calls: [string, () => Promise<unknown>][] = [
+    ["tick", () => s.tick()], ["reconcile", () => s.reconcile()],
+    ["full scan", () => s.observe({ kind: "full" })], ["periodic pass", () => s.observe({ kind: "periodic" })],
+    ["turn end", () => s.observe({ kind: "agent", agentId: "a" })], ["observed turn", () => s.observedTurn(f.agents[0])],
+    ["status", () => s.session("a")], ["list", () => s.list()], ["toggle", () => s.toggle("a", false)],
+    ["skip", () => s.skip("a", revision)], ["undo", () => s.undoSkip("a", revision, "skip")],
+    ["operation", () => s.operation("request-a")], ["Compact now", () => s.compactNow("a", revision, "request-a")],
+    ["invalidate", () => s.invalidate("a")],
+  ];
+  for (const [name, call] of calls) {
+    const outcome = await call().then(() => null, (error: unknown) => error);
+    assert.ok(outcome === null || outcome instanceof Stopped, `${name} ends by stopping, not ${String(outcome)}`);
+  }
+  await f.drained();
+  const { reads, writes, lists, settings, refreshes } = f.counts;
+  assert.deepEqual({ reads, writes, lists, settings, refreshes }, { reads: 0, writes: 0, lists: 0, settings: 0, refreshes: [] },
+    "nothing is read, written or asked of the host");
+  assert.deepEqual([f.calls, f.receiptCalls.length, f.errors.length, f.timers.pending], [0, 0, 0, 0]);
+});
