@@ -1458,7 +1458,7 @@ test("what already happened to an activity is answered before whether sending ma
   const revision = f.agents[0].revision!;
   assert.equal((await s.compactNow("a", revision, "request-a")).code, "accepted");
   await waitForStatus(f, "completed");
-  // After a plugin reload on Paseo 0.14 the same, already compacted activity awaits a resume.
+  // After a plugin reload the same, already compacted activity awaits a resume.
   f.agents[0].resumeRequired = true;
   for (const live of [{ resumeRequired: true }, { idle: false }]) {
     Object.assign(f.agents[0], live);

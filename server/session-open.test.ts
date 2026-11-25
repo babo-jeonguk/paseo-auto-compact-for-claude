@@ -6,7 +6,30 @@ import type { PluginServerContext, PluginSessionOpenRequest } from "@getpaseo/pl
 import contribute from "../index.server";
 import { cleanupScope, type CleanupScope } from "../tests/support/scope";
 
+type Handler = (payload: never, context: unknown) => Promise<unknown>;
 type Before = (input: { request: PluginSessionOpenRequest }, context: unknown) => Promise<PluginSessionOpenRequest>;
+
+// Every hook the plugin registers. Each one has its current name; the
+// deprecated `on` and `before` names are announced for removal upstream.
+const HOOKS = ["agent.turn.before", "agent.turn.after", "agent.permission.before", "agent.permission.after",
+  "agent.archive.after", "agent.close.after", "agent.create.after", "agent.open.before"];
+
+// A plugin host with only the current registration API. It records each hook
+// the plugin adds and how often its cleanup ran.
+function pluginHost() {
+  const hooks = new Map<string, { handler: Handler; stops: number }>();
+  const server = {
+    registerSettings: () => ({ read: async () => ({ status: "loading" }), subscribe: () => () => {} }),
+    addHook: (name: string, handler: Handler) => {
+      assert(!hooks.has(name), `${name} is registered once`);
+      const hook = { handler, stops: 0 };
+      hooks.set(name, hook);
+      return () => { hook.stops++; };
+    },
+    handle: () => {},
+  } as unknown as PluginServerContext;
+  return { server, hooks, hook: <T>(name: string) => hooks.get(name)!.handler as unknown as T };
+}
 
 // A Paseo home for the plugin under test. PASEO_HOME points at it until the
 // test ends and then goes back to what the other tests in this process read;
@@ -26,49 +49,33 @@ test("plugin state or observer failures cannot prevent a Claude session from ope
   const scope = cleanupScope(t);
   const home = await paseoHome(scope, "compact-session-open-");
   t.mock.method(console, "error", () => {});
-  let open: Before | undefined;
-  const server = {
-    registerSettings: () => ({ read: async () => ({ status: "loading" }), subscribe: () => () => {} }),
-    on: () => () => {},
-    before: (name: string, handler: Before) => {
-      if (name === "agent.session_open") open = handler;
-      return () => {};
-    },
-    handle: () => {},
-  } as unknown as PluginServerContext;
+  const { server, hook } = pluginHost();
   const data = join(home, "plugin-data", "auto-compact-for-claude");
   await mkdir(data, { recursive: true });
   await writeFile(join(data, "state.json"), "{ corrupt");
   scope.defer(contribute(server));
+  const open = hook<Before>("agent.open.before");
   const request = { agentId: "a", workspaceId: "w", provider: "claude",
     purpose: "interactive", reason: "create", cwd: home, title: "Conversation",
     labels: { retained: "yes" }, metadata: {}, background: false, tools: [], mcpServers: {},
     env: { CLAUDE_CODE_PLUGIN_DIRS: "/existing" } } as PluginSessionOpenRequest;
   const paseo = { config: { get: async () => ({ config: { providers: {} } }) } };
-  const opened = await open!({ request }, { paseo });
+  const opened = await open({ request }, { paseo });
   const dirs = opened.env.CLAUDE_CODE_PLUGIN_DIRS.split(delimiter);
   assert.equal(dirs[0], "/existing");
   assert.match(dirs[1], /observers/);
   // An observer that cannot be written leaves the session unchanged rather than closed.
   await rm(join(data, "observers"), { recursive: true });
   await writeFile(join(data, "observers"), "not a directory");
-  assert.deepEqual(await open!({ request }, { paseo }), request);
+  assert.deepEqual(await open({ request }, { paseo }), request);
 });
 
 test("turn-ended hooks use native activity without reading the deprecated timeline snapshot", async (t) => {
   const scope = cleanupScope(t);
   const home = await paseoHome(scope, "compact-empty-timeline-");
-  let ended: ((event: unknown, context: unknown) => void) | undefined;
-  const server = {
-    registerSettings: () => ({ read: async () => ({ status: "loading" }), subscribe: () => () => {} }),
-    on: (name: string, handler: (event: unknown, context: unknown) => void) => {
-      if (name === "agent.turn_ended") ended = handler;
-      return () => {};
-    },
-    before: () => () => {},
-    handle: () => {},
-  } as unknown as PluginServerContext;
+  const { server, hook } = pluginHost();
   scope.defer(contribute(server));
+  const ended = hook<(event: unknown, context: unknown) => Promise<void>>("agent.turn.after");
   const event = {
     agent: { id: "a", provider: "claude", cwd: home, title: null,
       parentAgentId: null, workspaceId: "w" },
@@ -90,7 +97,27 @@ test("turn-ended hooks use native activity without reading the deprecated timeli
       ref: () => ({ refresh: async () => { observed(); return null; } }),
     },
   };
-  assert.doesNotThrow(() => ended!(event, { paseo }));
+  await ended(event, { paseo });
   await observing;
   assert.equal(timelineRead, false, "turn_ended.timeline must not be read");
+});
+
+test("the plugin registers every hook through addHook under its current name and removes each one on stop", async (t) => {
+  const scope = cleanupScope(t);
+  await paseoHome(scope, "compact-hooks-");
+  const { server, hooks } = pluginHost();
+  const stop = contribute(server);
+  assert.deepEqual([...hooks.keys()].sort(), [...HOOKS].sort());
+  stop();
+  assert.deepEqual([...hooks.values()].map(hook => hook.stops), HOOKS.map(() => 1));
+});
+
+test("a hook the host refuses to register fails the plugin's start", async (t) => {
+  const scope = cleanupScope(t);
+  await paseoHome(scope, "compact-hook-refused-");
+  t.mock.method(console, "error", () => {});
+  const { server } = pluginHost();
+  const refused = new Error("host rejected registration");
+  server.addHook = () => { throw refused; };
+  assert.throws(() => contribute(server), error => error === refused);
 });

@@ -15,7 +15,7 @@ import { drainer } from "../tests/support/drained";
 import { cleanupScope, type CleanupScope } from "../tests/support/scope";
 import type {
   PluginHandlerContext,
-  PluginLifecycleEvents,
+  PluginHookEvents,
 } from "@getpaseo/plugin/server";
 
 // A gateway test's clock and timers. Time moves only with `tick`, which moves
@@ -121,7 +121,7 @@ function fixture(
         turnId: "compact-1",
         outcome,
         timeline: items,
-      } as PluginLifecycleEvents["agent.turn_ended"]);
+      } as PluginHookEvents["agent.turn.after"]);
     },
   };
   host.attach({
@@ -412,12 +412,11 @@ test('an unreadable observer is reported on the observation and is a fault befor
   assert.equal(host.sendCount(), 0);
 });
 
-test('a host that reopens stale plugin sessions never sends against an observer from the prior plugin instance', async (t) => {
+test('a session whose observer this plugin instance did not start never receives a send until it resumes', async (t) => {
   const scope = cleanupScope(t);
   const native = observer(null)!;
   native.startedHere = () => false;
   const host = fixture(scope, [], undefined, false, [], { observer: native });
-  Object.assign(host.ref, { reload: async () => null });
   assert.equal((await host.gateway.refresh('a'))!.resumeRequired, true);
   await assert.rejects(host.gateway.compact('a', (await host.gateway.refresh('a'))!),
     (error: unknown) => error instanceof Refusal && /resume.*message/i.test(error.message));
@@ -427,17 +426,6 @@ test('a host that reopens stale plugin sessions never sends against an observer 
   assert.equal(host.sendCount(), 0);
 });
 
-test('a host without session reopening never requires a resume', async (t) => {
-  const scope = cleanupScope(t);
-  const native = observer({ status: 'completed', detail: 'Native PostCompact' })!;
-  native.startedHere = () => false;
-  const host = fixture(scope, [{ type: "compaction", status: "completed", trigger: "manual" }], undefined, false, undefined,
-    { observer: native });
-  const agent = (await host.gateway.refresh('a'))!;
-  assert.equal(agent.resumeRequired, undefined);
-  assert.equal((await host.gateway.automatic!(agent)).status, 'completed');
-});
-
 test('observer ownership is rechecked at the dispatch boundary, in memory, and ends the attempt at once', async (t) => {
   const scope = cleanupScope(t);
   const native = observer(null)!;
@@ -445,7 +433,6 @@ test('observer ownership is rechecked at the dispatch boundary, in memory, and e
   let markerPersisted = false;
   native.startedHere = () => { ownershipChecks++; return !markerPersisted; };
   const host = fixture(scope, [], undefined, false, [], { observer: native });
-  Object.assign(host.ref, { reload: async () => null });
   const saved: OperationEvidence[] = [];
   const result = await host.gateway.compact('a', (await host.gateway.refresh('a'))!, {
     id: 'ownership-race', sendBy: host.clock.now() + 30_000,
@@ -468,8 +455,7 @@ test('an absent or unreadable observer is not misreported as a session awaiting 
     native.startedHere = () => false;
     native.prepare = async () => { throw new Refusal('Claude observer unavailable'); };
     const host = fixture(scope, [], undefined, false, [], { observer: native });
-    Object.assign(host.ref, { reload: async () => null });
-    const agent = (await host.gateway.refresh('a'))!;
+      const agent = (await host.gateway.refresh('a'))!;
     assert.equal(agent.resumeRequired, undefined);
     await assert.rejects(host.gateway.compact('a', agent),
       (error: unknown) => !/resume.*message/i.test(String(error)));
