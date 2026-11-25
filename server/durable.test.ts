@@ -83,6 +83,7 @@ test("a drain covers every write in flight, and work run through the writes is d
   const { path } = await folder(t);
   const { files, holdRename } = heldFiles();
   const writes = createDurableWrites(files);
+  const drained = drainer();
   const held = holdRename(path);
   let release!: () => void;
   const work = new Promise<void>(resolve => { release = resolve; });
@@ -94,6 +95,7 @@ test("a drain covers every write in flight, and work run through the writes is d
   const draining = writes.drain().then(() => { ended = true; });
   held.release();
   await replacing;
+  await drained();
   assert.equal(ended, false, "the run still holds the drain");
   release();
   await running;

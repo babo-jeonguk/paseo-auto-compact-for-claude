@@ -11,6 +11,10 @@ import { cleanupScope, type CleanupScope } from "../tests/support/scope";
 import { drainer } from "../tests/support/drained";
 import { fakeTimers } from "../tests/support/timers";
 import { heldFiles } from "../tests/support/files";
+import { paseoHome, pluginHost } from "../tests/support/plugin-host";
+import contribute from "../index.server";
+import { createHash } from "node:crypto";
+import type { PluginSessionOpenRequest } from "@getpaseo/plugin/server";
 
 // A plugin reload under one daemon: the host stops the old instance, which
 // closes its durable writes and drains them, and starts the next one only once
@@ -20,7 +24,8 @@ const agent: Observation = { agentId: "a", title: null, workspace: "/work", prov
   revision: new Date(1_000_000).toISOString(), tokens: 210_000, eligible: true, idle: true, sessionId: "native-a" };
 const native = { id: "op", launchId: "launch", generation: "generation", sessionId: "native-a", revision: 1 };
 
-function instance(scope: CleanupScope, path: string, files?: DurableFiles, gateway: Partial<Gateway> = {}) {
+function instance(scope: CleanupScope, path: string, files?: DurableFiles, gateway: Partial<Gateway> = {},
+  onError?: (error: unknown) => void) {
   const writes = createDurableWrites(files);
   const scheduler = createScheduler({
     store: createCachedStore(createStore(path, writes)),
@@ -29,6 +34,7 @@ function instance(scope: CleanupScope, path: string, files?: DurableFiles, gatew
     settings: async () => ({ ...DEFAULT_SETTINGS }),
     now: () => 1_000_000,
     timers: fakeTimers(),
+    onError,
   });
   scope.defer(() => scheduler.stop());
   // What the plugin's cleanup does: close the writes, stop, then drain.
@@ -124,13 +130,92 @@ test("at startup, requests an earlier instance left prepared are retired against
     operation("observed", "observing", true, "p"), operation("unsent", "dispatching", false, "p"),
     operation("finished", "unknown", true, "p") ] }));
   const decisions = new Map<string, unknown>();
+  let recovered!: () => void;
+  const recovery = new Promise<void>(resolve => { recovered = resolve; });
   const next = instance(scope, path, undefined, {
     recover: async decide => {
       for (const id of ["observed", "unsent", "finished", "missing"]) decisions.set(id, decide({ id, preparation: "p" }));
+      recovered();
     },
   });
   await next.scheduler.ready;
+  await recovery;
   assert.deepEqual(Object.fromEntries(decisions), {
     observed: null, unsent: { sent: false }, finished: { sent: true }, missing: { sent: false },
   });
+});
+
+test("a startup recovery held at the file system holds no state change, and its failures are reported", async (t) => {
+  const scope = cleanupScope(t);
+  const path = join(await scope.folder("compact-shutdown-"), "state.json");
+  let release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  let reach!: () => void;
+  const reached = new Promise<void>(resolve => { reach = resolve; });
+  const reported: unknown[] = [];
+  const failure = new Error("one conversation's request could not be read");
+  const next = instance(scope, path, undefined, {
+    recover: async (_decide, report) => {
+      report(failure);
+      reach();
+      await held;
+    },
+  }, error => { reported.push(error); });
+  await reached;
+  await next.scheduler.ready;
+  await next.scheduler.toggle("other", false);
+  assert.deepEqual((await stored(path)).disabled, ["other"], "a state change does not wait for the held recovery");
+  assert.deepEqual(reported, [failure]);
+  release();
+});
+
+// The plugin itself, as Paseo runs it: the cleanup contribute() returns is the
+// stop the host awaits before it starts the next instance.
+async function plugin(scope: CleanupScope, files: DurableFiles) {
+  const home = await paseoHome(scope, "compact-cleanup-");
+  const { server, hook } = pluginHost();
+  const cleanup = contribute(server, { files });
+  let stopping: Promise<void> | undefined;
+  const stop = () => stopping ??= cleanup();
+  scope.defer(stop);
+  type Before = (input: { request: PluginSessionOpenRequest }, context: unknown) => Promise<PluginSessionOpenRequest>;
+  const request = { agentId: "a", workspaceId: "w", provider: "claude", purpose: "interactive", reason: "create",
+    cwd: home, title: "Conversation", labels: {}, metadata: {}, background: false, tools: [], mcpServers: {},
+    env: {} } as PluginSessionOpenRequest;
+  const paseo = { config: { get: async () => ({ config: { providers: {} } }) } };
+  const manifest = join(home, "plugin-data", "auto-compact-for-claude", "observers",
+    createHash("sha256").update("a").digest("hex"), "current.json");
+  return { open: () => hook<Before>("agent.open.before")({ request }, { paseo }), request, manifest, stop };
+}
+
+test("the plugin's stop resolves only once a write it had already issued has landed", async (t) => {
+  const scope = cleanupScope(t);
+  t.mock.method(console, "error", () => {});
+  const { files, holdRename } = heldFiles();
+  const f = await plugin(scope, files);
+  const held = holdRename(f.manifest);
+  const opening = f.open();
+  await held.reached;
+  let landed = false;
+  void held.landed.then(() => { landed = true; });
+  const stopped = f.stop().then(() => landed);
+  held.release();
+  assert.equal(await stopped, true, "the stop waited for the issued rename");
+  await opening;
+  assert.equal(typeof JSON.parse(await readFile(f.manifest, "utf8")).launchId, "string");
+});
+
+test("the plugin's stop closes its writes first, so a publication not yet issued never lands", async (t) => {
+  const scope = cleanupScope(t);
+  t.mock.method(console, "error", () => {});
+  const { files, holdWrite } = heldFiles();
+  const f = await plugin(scope, files);
+  const held = holdWrite(f.manifest);
+  const opening = f.open();
+  await held.reached;
+  const stopping = f.stop();
+  held.release();
+  await stopping;
+  assert.deepEqual(await opening, f.request, "the session opens without an observer");
+  await assert.rejects(readFile(f.manifest, "utf8"), { code: "ENOENT" });
 });

@@ -747,3 +747,23 @@ test('the next generation of a launch remembers which preparation was already ch
   assert.equal(ran, true, 'a request already refused is not refused again after a query restart');
   assert.equal(f.ledger().compact.id, null);
 });
+
+test('a refusal of a cancelled request names the preparation it was checked against', async () => {
+  const f = fixture(); await f.start(); await f.ordinary();
+  f.files.set('/request', JSON.stringify({ id: 'operation-1', preparation: 'p', status: 'cancelled' }));
+  assert.match((await f.compact()).text, /cancelled/i);
+  assert.equal(f.ledger().compact.preparation, 'p');
+  assert.equal(JSON.parse(f.files.get('/receipts/operation-1.json')).preparation, 'p');
+});
+
+test('a request an earlier server prepared, without a preparation, is checked once across its retirement', async () => {
+  const f = fixture(); await f.start(); await f.ordinary();
+  // No preparation identity: the operation ID stands in for one.
+  f.request({ expiresAt: 0 });
+  assert.match((await f.compact()).text, /expired/i);
+  // Retired as an earlier server writes it: the ID and status only.
+  f.files.set('/request', JSON.stringify({ id: 'operation-1', status: 'cancelled' }));
+  let ran = false;
+  await f.compact(async () => { ran = true; });
+  assert.equal(ran, true, 'the same request is not refused again once it is cancelled');
+});
