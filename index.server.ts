@@ -1,10 +1,9 @@
-import type { PluginServerContext } from "@getpaseo/plugin/server";
+import type { PluginHookContext, PluginServerContext } from "@getpaseo/plugin/server";
 import { createGateway } from "./server/gateway";
 import { createScheduler, TICK_INTERVAL_MS } from "./server/scheduler";
 import { createCachedStore, createStore } from "./server/store";
 import { createObserver } from "./server/observer";
 import { createReporter } from "./server/report";
-import { createLifecycleHooks } from "./server/lifecycle";
 import { claudeProvider } from "./shared/providers";
 import {
   compactRpc,
@@ -18,7 +17,6 @@ import {
 import { compactSettings } from "./shared/settings";
 
 export default function contribute(server: PluginServerContext) {
-  const lifecycle = createLifecycleHooks(server);
   const settings = server.registerSettings(compactSettings);
   const observer = createObserver();
   const host = createGateway({ observer });
@@ -42,21 +40,21 @@ export default function contribute(server: PluginServerContext) {
   // observe one agent, the tick watches reservations and pending operations,
   // and a full safety scan catches anything a missed event left unnoticed.
   const stops = [
-    lifecycle.on("agent.turn.before", (event, { paseo }) => {
+    server.addHook("agent.turn.before", async (event, { paseo }) => {
       host.attach(paseo);
       host.started(event);
       if (!host.ownTurn(event.agent.id, event.turnId))
         void scheduler.invalidate(event.agent.id).catch(report);
     }),
-    lifecycle.on("agent.turn.after", (event, { paseo }) => {
+    server.addHook("agent.turn.after", async (event, { paseo }) => {
       host.attach(paseo);
       if (host.ownTurn(event.agent.id, event.turnId)) {
         host.ended(event);
         return;
       }
-      // Paseo 0.13 no longer includes history in this event. Observe native
-      // activity instead; the scheduler deduplicates the unchanged activity
-      // identity produced by a manual compact on both Paseo 0.12 and 0.13.
+      // The event carries no history; observe native activity instead. The
+      // scheduler deduplicates the unchanged activity identity a manual compact
+      // produces.
       void scheduler.observe({ kind: "agent", agentId: event.agent.id }).catch(report);
     }),
     ...(
@@ -67,13 +65,13 @@ export default function contribute(server: PluginServerContext) {
         "agent.close.after",
       ] as const
     ).map((name) =>
-      lifecycle.on(name, (event, { paseo }) => {
+      server.addHook(name, async (event: { agent: { id: string } }, { paseo }: PluginHookContext) => {
         host.attach(paseo);
         void scheduler.invalidate(event.agent.id).catch(report);
       })
     ),
-    lifecycle.on("agent.create.after", (_event, { paseo }) => host.attach(paseo)),
-    lifecycle.beforeSessionOpen(async ({ request }, { paseo }) => {
+    server.addHook("agent.create.after", async (_event, { paseo }) => host.attach(paseo)),
+    server.addHook("agent.open.before", async ({ request }, { paseo }) => {
       host.attach(paseo);
       // Plugin failures must not keep a conversation from opening; without an
       // observer the controls ask the user to reopen the session.

@@ -97,7 +97,7 @@ try {
   report.claude = (await promisify(execFile)(binary, ['--version'], { timeout: 30_000, windowsHide: true })).stdout.trim();
   console.log(`Native ${process.platform}/${process.arch}; Node ${process.version}; Paseo ${report.paseo}; Claude ${report.claude}`);
   for (const path of ['index.server.ts', 'server/cache.ts', 'server/observer.ts', 'server/observer-source.mjs',
-    'server/observer-assets.generated.ts', 'server/lifecycle.ts', 'server/gateway.ts', 'server/scheduler.ts', 'shared/settings.ts',
+    'server/observer-assets.generated.ts', 'server/gateway.ts', 'server/scheduler.ts', 'shared/settings.ts',
     'server/model.ts', 'server/store.ts', 'server/operations.ts', 'server/retention.ts', 'server/deadline.ts', 'shared/rpc.ts', 'shared/providers.ts', 'paseo-plugin.json', 'package.json'])
     report.sourceFiles[path] = sha(await readFile(join(plugin, path)));
   report.simulationFiles = {};

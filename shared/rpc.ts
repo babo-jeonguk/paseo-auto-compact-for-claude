@@ -57,7 +57,7 @@ export function operationRowStatus(operation: Pick<CompactOperation, "state">) {
 export const finishedState = (status: "completed" | "failed" | "unknown" | "expired") =>
   status === "completed" ? "succeeded" as const : status;
 
-// Why nothing is compacted in a session the host must reopen first (Paseo 0.14).
+// Why nothing is compacted in a session the host must reopen first.
 export const SESSION_RESUME_REQUIRED = "Session must resume after plugin reload; send a message before compacting";
 
 // Why a row is blocked. The controls choose their explanation from this code

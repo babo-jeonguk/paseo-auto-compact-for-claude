@@ -809,7 +809,7 @@ test('native activity identity survives compaction without restoring its schedul
 
 // A host directory of many agents, paged like Paseo's agent list, with an
 // observer that records which agents' native ledgers were read. A `slow`
-// agent's ledger read does not end; a `broken` agent's host reference throws.
+// agent's ledger read does not end; reading a `broken` agent's observer throws.
 // `holdRead` and `holdPage` may delay or fail one ledger read or listing page.
 function directory(scope: CleanupScope, pageSize = 2, { slow = [] as string[], broken = [] as string[],
   holdRead = (_id: string): Promise<void> | void => {},
@@ -837,6 +837,11 @@ function directory(scope: CleanupScope, pageSize = 2, { slow = [] as string[], b
   let listCalls = 0;
   const native = observer(null)!;
   const read = native.read;
+  // A defect, not an unreadable file: the observation itself fails.
+  native.startedHere = (id: string) => {
+    if (broken.includes(id)) throw new Error(`observer failed for ${id}`);
+    return true;
+  };
   native.read = async (id: string) => {
     reads.push(id);
     if (slow.includes(id)) await new Promise(() => {});
@@ -862,7 +867,6 @@ function directory(scope: CleanupScope, pageSize = 2, { slow = [] as string[], b
       },
       ref: (id: string) => {
         calls.push(`host ${id}`);
-        if (broken.includes(id)) throw new Error(`host failed for ${id}`);
         return { refresh: async () => {
           const agent = agents.find(entry => entry.id === id);
           return agent ? { agent } : null;
@@ -908,7 +912,7 @@ test("each listed agent's observation settles on its own, so a slow or failing o
   const fulfilled = results.flatMap(result => result.status === "fulfilled" ? [result.value.agentId] : []);
   assert.deepEqual(fulfilled, ["a", ...INELIGIBLE], "every other observation is returned");
   const failures = results.flatMap(result => result.status === "rejected" ? [String(result.reason)] : []);
-  assert.deepEqual(failures, ["Error: host failed for c"], "c's failure is returned with them");
+  assert.deepEqual(failures, ["Error: observer failed for c"], "c's failure is returned with them");
   host.stop();
 });
 

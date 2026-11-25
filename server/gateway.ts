@@ -1,5 +1,4 @@
-import type { PluginHandlerContext } from "@getpaseo/plugin/server";
-import type { LifecycleEvents } from "./lifecycle";
+import type { PluginHandlerContext, PluginHookEvents } from "@getpaseo/plugin/server";
 import { randomUUID } from "node:crypto";
 import { Refusal, readable, targetOf, unchanged, type Gateway, type Observation, type DispatchGuard, type ExecutionContext,
   type OperationEvidence, type StoredOperation } from "./model";
@@ -12,7 +11,7 @@ export { claudeProvider } from "../shared/providers";
 
 type Api = PluginHandlerContext["paseo"];
 type Agent = NonNullable<Awaited<ReturnType<ReturnType<Api["agents"]["ref"]>["refresh"]>>>["agent"];
-type End = LifecycleEvents["agent.turn.after"];
+type End = PluginHookEvents["agent.turn.after"];
 type Observer = ReturnType<typeof createObserver>;
 type TimelineItem = { type: string; status?: string; trigger?: string; clientMessageId?: string };
 // The completed manual compaction of the /compact command's own turn.
@@ -77,19 +76,17 @@ export function createGateway(options: {
     if (!api) throw new Error("Waiting for a conversation lifecycle event or plugin request");
     return api;
   };
-  // Paseo 0.14 reopens a stale plugin session immediately before its next
-  // prompt. A /compact prepared against the previous Mod launch would run in
-  // the new launch without its request ID, splitting native completion from
-  // the durable operation. Hosts without ref.reload keep the 0.12/0.13 behavior.
-  const reopensStaleSessions = (agentId: string) =>
-    typeof Reflect.get(requireApi().agents.ref(agentId), "reload") === "function";
-  const staleLaunch = (agentId: string, launchId: string, reopens = reopensStaleSessions(agentId)) =>
-    !!observer && reopens && !observer.startedHere(agentId, launchId);
+  // Paseo reopens a stale plugin session immediately before its next prompt. A
+  // /compact prepared against the previous Mod launch would run in the new
+  // launch without its request ID, splitting native completion from the durable
+  // operation.
+  const staleLaunch = (agentId: string, launchId: string) =>
+    !!observer && !observer.startedHere(agentId, launchId);
   async function observation(agent: Agent, providers?: Record<string, unknown>): Promise<Observation> {
     providers ??= (await requireApi().config.get()).config.providers;
     const tokens = agent.lastUsage?.contextWindowUsedTokens;
     const eligible = claudeProvider(providers, agent.provider) && !agent.archivedAt && !agent.internal &&
-      (agent as { readonly background?: boolean }).background !== true &&
+      agent.background !== true &&
       !agent.providerUnavailable && !agent.labels["paseo.parent-agent-id"] && agent.status !== "closed";
     let observerUnreadable = false;
     const native = (eligible
@@ -233,7 +230,6 @@ export function createGateway(options: {
       // Both bound only when sending may start. Claude admits the compaction
       // for as long as it can still be observed.
       const startBy = Math.min(guard?.expiresAt ?? Infinity, sendBy);
-      const reopens = reopensStaleSessions(agentId);
       if (observer) {
         preparing = observer.prepare(before, automatic, observationEndBy(sendBy), id);
         operation = await read(preparing);
@@ -267,12 +263,12 @@ export function createGateway(options: {
       if (!currentWorker())
         return { status: "unknown", detail: "Worker stopped at dispatch boundary; no automatic retry" };
       // The host may have reopened the session while the marker was written.
-      // With `reopens` read above this check is in memory and cannot fail, and
-      // nothing is awaited after it before the send. Nothing was sent, but the
-      // marker exists, and a marker means "may have sent" to everything that
-      // reads it later, so the outcome is the conservative unknown.
+      // This check is in memory and cannot fail, and nothing is awaited after
+      // it before the send. Nothing was sent, but the marker exists, and a
+      // marker means "may have sent" to everything that reads it later, so the
+      // outcome is the conservative unknown.
       // Invalidating the evidence ends it at once instead of after observation.
-      if (operation && staleLaunch(agentId, operation.launchId, reopens)) {
+      if (operation && staleLaunch(agentId, operation.launchId)) {
         ownershipLost = true;
         await checkpoint(true).catch(() => {});
         return { status: "unknown", detail: "Observer changed at dispatch boundary; no automatic retry" };
@@ -362,7 +358,7 @@ export function createGateway(options: {
     ownTurn(agentId: string, turnId: string | null) {
       return turnId !== null && pending.get(agentId)?.turnId === turnId;
     },
-    started(_event: LifecycleEvents["agent.turn.before"]) {},
+    started(_event: PluginHookEvents["agent.turn.before"]) {},
     ended(event: End) { completions.get(event.agent.id)?.(event); },
     stop() {
       stopped = true;
