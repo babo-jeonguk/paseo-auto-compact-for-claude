@@ -811,6 +811,8 @@ test("a request an earlier instance left prepared is kept only while its operati
   assert.equal(leftoverRetirement(request("p"), marked({ state: "observing" }, "p")), null);
   assert.equal(leftoverRetirement(request(), marked({ state: "observing" })), null,
     "evidence from an earlier release names no preparation, so the request is kept");
+  assert.equal(leftoverRetirement(request(), marked({ state: "observing" }, "p")), null,
+    "a request from an earlier release names no preparation, so it is matched by its operation");
   // Another preparation of a possibly sent operation is not what it sent against.
   assert.deepEqual(leftoverRetirement(request("q"), marked({ state: "observing" }, "p")), { sent: true });
   // Pending without the marker: the earlier instance never sent it, and a retry prepares anew.

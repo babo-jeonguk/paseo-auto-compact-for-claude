@@ -715,33 +715,63 @@ test('a conversation whose retirement is held does not hold another conversation
   assert.deepEqual(reported, []);
 });
 
-test('across a reload, what the stopped instance had issued lands before the next instance writes the same files', async (t) => {
+test('across a reload, a retirement the stopped instance had issued lands before the next instance prepares the same request', async (t) => {
   const { files, holdRename } = heldFiles();
   const f = await fixture(cleanupScope(t), files);
   const drained = drainer();
   const first = await f.observer.prepare(f.agent, false, 1_030_000, 'operation');
-  // A late retirement and a launch publication, both issued and held at the file system.
-  const heldRequest = holdRename(join(f.directory, 'request.json'));
-  const heldManifest = holdRename(join(f.parent, 'current.json'));
-  const retiring = f.observer.cancel(first, true);
-  const opening = f.observer.prepareSession(f.request, true);
-  await Promise.all([heldRequest.reached, heldManifest.reached]);
-  // The host stops the plugin: its writes close, then drain.
+  // A late retirement, issued and held at the file system.
+  const held = holdRename(join(f.directory, 'request.json'));
+  void f.observer.cancel(first, true).catch(() => {});
+  await held.reached;
+  // The host stops the plugin (its writes close, then drain) and starts the
+  // next instance only once that stop has ended.
   f.writes.close();
   let stopped = false;
   const stopping = f.writes.drain().then(() => { stopped = true; });
   await drained();
-  assert.equal(stopped, false, 'the stop waits for the issued renames');
-  heldRequest.release();
-  heldManifest.release();
-  await Promise.all([retiring, opening, stopping]);
-  // Only then does the next instance start, on the same files.
+  assert.equal(stopped, false, 'the stop waits for the issued retirement');
+  held.release();
+  await stopping;
+  const next = createObserver({ home: f.home, now: f.now, writes: createDurableWrites() });
+  await next.recoverPrepared(() => assert.fail('the stopped instance already retired its request'),
+    () => assert.fail('nothing fails'));
+  const second = await next.prepare(f.agent, false, 1_030_000, 'operation');
+  const request = await requestFile(f.directory);
+  assert.equal(request.status, 'prepared', 'the next instance\'s preparation of the same request is intact');
+  assert.equal(request.preparation, second.preparation);
+});
+
+test('across a reload, a launch publication the stopped instance had issued lands before the next instance opens one', async (t) => {
+  const { files, holdRename } = heldFiles();
+  const f = await fixture(cleanupScope(t), files);
+  const drained = drainer();
+  const manifestPath = join(f.parent, 'current.json');
+  const held = holdRename(manifestPath);
+  void f.observer.prepareSession(f.request, true).catch(() => {});
+  await held.reached;
+  f.writes.close();
+  let stopped = false;
+  const stopping = f.writes.drain().then(() => { stopped = true; });
+  await drained();
+  assert.equal(stopped, false, 'the stop waits for the issued publication');
+  held.release();
+  await stopping;
   const next = createObserver({ home: f.home, now: f.now, writes: createDurableWrites() });
   const reopened = await next.prepareSession(f.request, true);
   const launchId = reopened.env.CLAUDE_CODE_PLUGIN_DIRS.split(delimiter).at(-1)!.split(/[\\/]/).at(-2)!;
-  assert.equal(JSON.parse(await readFile(join(f.parent, 'current.json'), 'utf8')).launchId, launchId,
+  assert.equal(JSON.parse(await readFile(manifestPath, 'utf8')).launchId, launchId,
     'the earlier publication cannot replace the next instance\'s launch');
-  await writeFile(join(f.parent, launchId, 'ledger.json'), JSON.stringify({ ...f.ledger, launchId }));
-  const prepared = await next.prepare({ ...f.agent }, false, 1_030_000, 'operation');
-  assert.equal((await requestFile(join(f.parent, launchId))).preparation, prepared.preparation);
+});
+
+test('a retirement leaves a request that is no longer prepared, or in a state it does not know, as it is', async (t) => {
+  const f = await fixture(cleanupScope(t));
+  const operation = await f.observer.prepare(f.agent, false, 1_030_000, 'operation');
+  for (const status of ['settled', 'future-state', undefined]) {
+    const record = JSON.stringify({ id: 'operation', preparation: operation.preparation, ...(status ? { status } : {}) });
+    await writeFile(join(f.directory, 'request.json'), record);
+    await f.observer.cancel(operation, true);
+    await f.observer.release('a', operation, true);
+    assert.equal(await readFile(join(f.directory, 'request.json'), 'utf8'), record, `${status}`);
+  }
 });

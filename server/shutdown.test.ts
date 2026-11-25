@@ -7,6 +7,7 @@ import { createScheduler } from "./scheduler";
 import { createCachedStore, createStore } from "./store";
 import type { Gateway, Observation, State } from "./model";
 import { DEFAULT_SETTINGS } from "../shared/settings";
+import { HISTORY_RETENTION_MS } from "./retention";
 import { cleanupScope, type CleanupScope } from "../tests/support/scope";
 import { drainer } from "../tests/support/drained";
 import { fakeTimers } from "../tests/support/timers";
@@ -25,7 +26,7 @@ const agent: Observation = { agentId: "a", title: null, workspace: "/work", prov
 const native = { id: "op", launchId: "launch", generation: "generation", sessionId: "native-a", revision: 1 };
 
 function instance(scope: CleanupScope, path: string, files?: DurableFiles, gateway: Partial<Gateway> = {},
-  onError?: (error: unknown) => void) {
+  onError?: (error: unknown) => void, options: Partial<Parameters<typeof createScheduler>[0]> = {}) {
   const writes = createDurableWrites(files);
   const scheduler = createScheduler({
     store: createCachedStore(createStore(path, writes)),
@@ -35,6 +36,7 @@ function instance(scope: CleanupScope, path: string, files?: DurableFiles, gatew
     now: () => 1_000_000,
     timers: fakeTimers(),
     onError,
+    ...options,
   });
   scope.defer(() => scheduler.stop());
   // What the plugin's cleanup does: close the writes, stop, then drain.
@@ -143,6 +145,24 @@ test("at startup, requests an earlier instance left prepared are retired against
   assert.deepEqual(Object.fromEntries(decisions), {
     observed: null, unsent: { sent: false }, finished: { sent: true }, missing: { sent: false },
   });
+});
+
+test("startup recovery decides against the operations left after history cleanup", async (t) => {
+  const scope = cleanupScope(t);
+  const path = join(await scope.folder("compact-shutdown-"), "state.json");
+  const now = 1_000_000 + HISTORY_RETENTION_MS + 1;
+  // Finished and sent long enough ago that startup's history cleanup removes it.
+  await writeFile(path, JSON.stringify({ version: 1, disabled: [], jobs: [], operations: [{
+    id: "old", agentId: "a", revision: agent.revision!, target: { sessionId: "native-a", activityKey: null },
+    kind: "manual", state: "unknown", createdAt: 1, updatedAt: 1, inputFingerprint: null, sendBy: 2,
+    result: { code: "unknown", message: "ended" },
+    evidence: { native: { ...native, id: "old", preparation: "p" }, dispatchStartedAt: 1 } }] }));
+  let decided!: (decision: unknown) => void;
+  const decision = new Promise(resolve => { decided = resolve; });
+  instance(scope, path, undefined, { recover: async decide => { decided(decide({ id: "old", preparation: "p" })); } },
+    undefined, { now: () => now, receipts: { remove: async () => {}, sweep: async () => {} } });
+  assert.deepEqual(await decision, { sent: false }, "an operation no longer retained is retired as unsent");
+  assert.deepEqual((await stored(path)).operations, []);
 });
 
 test("a startup recovery held at the file system holds no state change, and its failures are reported", async (t) => {
