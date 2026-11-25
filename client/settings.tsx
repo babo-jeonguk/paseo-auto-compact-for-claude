@@ -22,6 +22,7 @@ import { useQuery } from "@tanstack/react-query";
 import { compactSettings } from "../shared/settings";
 import { listRpc } from "../shared/rpc";
 import { formatTokenThreshold, listKey, parseTokenThreshold } from "./format";
+import { useStateChanges } from "./state-events";
 
 function NumberSetting({
   label,
@@ -213,6 +214,7 @@ export function CompactSettingsScreen({ theme, host }: PluginSurfaceProps) {
     queryKey: listKey(host.id),
     queryFn: () => list({}),
   });
+  useStateChanges({ hostId: host.id });
   const providers = [...(query.data?.providers ?? [])].sort(
     (a, b) =>
       Number(b.id === "claude") - Number(a.id === "claude") ||

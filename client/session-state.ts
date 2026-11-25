@@ -6,6 +6,11 @@ import { formatTokenThreshold } from "./format";
 export const sessionKey = (hostId: string, agentId: string) =>
   ["auto-compact", hostId, "session", agentId] as const;
 
+// Under the session key, so reading a conversation's status again also reads
+// the operation its controls track.
+export const operationKey = (hostId: string, agentId: string, operationId: string | null) =>
+  [...sessionKey(hostId, agentId), "operation", operationId] as const;
+
 export interface Presentation {
   label: "Compact off" | "Compact on" | "Compacting…" | "Check compact" | `Compact in ${number}${"m" | "s"}`;
   description: string;

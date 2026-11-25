@@ -16,12 +16,13 @@ import {
 import { operationRowStatus, operationPending, compactRpc, operationRpc, sessionRpc, skipRpc, toggleRpc, undoSkipRpc } from "../shared/rpc";
 import { compactSettings } from "../shared/settings";
 import { canSkip, errorLabel, tokenLabel } from "./format";
-import { canUndoSkip, compactCompletionNotice, compactOutcomeNotice, INPUT_IDLE_GRACE_MS, pendingPresentation,
+import { canUndoSkip, compactCompletionNotice, compactOutcomeNotice, INPUT_IDLE_GRACE_MS, operationKey, pendingPresentation,
   sessionKey, sessionPresentation, type Presentation } from "./session-state";
 import { compactSubmissions } from "./compact-submission";
 import { OPERATION_LOOKUP_MS, nextRenderAt, onHostReconnected, operationPollDelay,
   sessionFailures, sessionPollDelay, STATUS_FRESH_MS } from "./cadence";
 import { sharedClock } from "./clock";
+import { useStateChanges } from "./state-events";
 import { useClockRender, useSurfaceActive } from "./surface";
 import { Toggle } from "./toggle";
 
@@ -33,6 +34,7 @@ export function useConversation(hostId: string, agentId: string) {
   const key = sessionKey(hostId, agentId);
   const active = useSurfaceActive();
   const failures = sessionFailures(key.join(":"));
+  useStateChanges({ hostId, agentId });
   const query = useQuery({
     queryKey: key,
     queryFn: async () => {
@@ -135,11 +137,12 @@ export function ConversationControls({
   const trackedSince = useRef<{ id: string | null; at: number }>({ id: trackedId, at: Date.now() });
   if (trackedSince.current.id !== trackedId) trackedSince.current = { id: trackedId, at: Date.now() };
   const operationQuery = useQuery({
-    queryKey: ["auto-compact", host.id, "operation", trackedId],
+    queryKey: operationKey(host.id, agentId, trackedId),
     queryFn: () => readOperation({ operationId: trackedId! }),
     enabled: !!trackedId,
     refetchInterval: query => operationPollDelay({
       active: state.active,
+      failures: sessionFailures(key.join(":")).count(),
       found: !!query.state.data?.operation,
       pending: query.state.data?.operation ? operationPending(query.state.data.operation) : true,
       elapsed: Date.now() - trackedSince.current.at,
