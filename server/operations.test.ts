@@ -2,9 +2,11 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createOperationWorker, recoverOperations } from "./operations";
 import { TICK_INTERVAL_MS } from "./scheduler";
+import { dueAt } from "./policy";
 import { changes } from "../tests/support/changes";
 import { fakeTimers } from "../tests/support/timers";
 import { cleanupScope } from "../tests/support/scope";
+import { drainer } from "../tests/support/drained";
 import { DEFAULT_SETTINGS, type Settings } from "../shared/settings";
 import { Refusal, type CompactOutcome, type ExecutionContext, type Gateway, type Observation,
   type State, type StoredOperation } from "./model";
@@ -58,25 +60,37 @@ function fixture(options: { agents?: string[] } = {}) {
     inspect: async operation => typeof evidence === "function" ? evidence(operation) : evidence,
   };
   let tail: Promise<unknown> = Promise.resolve();
-  // A held transaction is applied, then held before it returns to the worker.
-  let holdApplied: { reached: () => void; release: Promise<void> } | null = null;
+  // A held transaction is held before it is applied (`queued`), or applied and
+  // then held before it returns to the worker; `skip` transactions pass before it.
+  let holdUpdate: { skip: number; queued: boolean; reached: () => void; release: Promise<void> } | null = null;
+  const holding = async (queued: boolean) => {
+    const hold = holdUpdate;
+    if (!hold || hold.queued !== queued || hold.skip-- !== 0) return;
+    holdUpdate = null;
+    hold.reached();
+    await hold.release;
+  };
   const update = <T>(change: (state: State) => T): Promise<T> => {
     const result = tail.then(async () => {
+      await holding(true);
       const next = structuredClone(state);
       const value = change(next);
       if (writesFail && next.operations[0].state === "succeeded") throw new Error("disk full");
       state = next;
       signal.changed();
-      const hold = holdApplied;
-      holdApplied = null;
-      if (hold) { hold.reached(); await hold.release; }
+      await holding(false);
       return value;
     });
     tail = result.catch(() => {});
     return result;
   };
+  // The next state read waits for its release before it reads.
+  let readHold: ReturnType<typeof gate> | null = null;
   const make = (settings = async (): Promise<Settings | null> => ({ ...DEFAULT_SETTINGS })) => createOperationWorker({ gateway,
     store: { read: async () => {
+        const hold = readHold;
+        readHold = null;
+        if (hold) await hold.pass();
         if (readsFail > 0) { readsFail--; throw new Error("EBUSY"); }
         if (stale) { const value = stale; stale = null; return structuredClone(value); }
         return structuredClone(state);
@@ -102,13 +116,16 @@ function fixture(options: { agents?: string[] } = {}) {
     set failTerminal(value: boolean) { writesFail = value; },
     set failReads(count: number) { readsFail = count; },
     get time() { return time; },
-    // Holds the next transaction after it is applied; `reached` resolves then.
-    holdNextUpdate() {
+    // Holds the next transaction, or the one `skip` transactions later, after
+    // it is applied, or before when `queued`; `reached` resolves then.
+    holdNextUpdate(skip = 0, queued = false): Held {
       let reached!: () => void, release!: () => void;
       const arrived = new Promise<void>(resolve => { reached = resolve; });
-      holdApplied = { reached, release: new Promise<void>(resolve => { release = resolve; }) };
+      holdUpdate = { skip, queued, reached, release: new Promise<void>(resolve => { release = resolve; }) };
       return { reached: arrived, release };
     },
+    // Holds the next state read before it reads.
+    holdRead(): Held { readHold = gate(); return readHold; },
     advance(ms: number) { time += ms; },
     recover() { recoverOperations(state, time); },
   };
@@ -228,23 +245,166 @@ test("the worker wakes itself for a retry instead of waiting for the next tick",
   assert.equal(f.sends, 1);
 });
 
-test("a worker stopped while it saves a retry arms no wake-up", async (t) => {
-  const f = fixture(), worker = f.make();
-  cleanupScope(t).defer(() => worker.stop());
-  let held!: ReturnType<typeof f.holdNextUpdate>;
-  let sending!: () => void;
-  const sent = new Promise<void>(resolve => { sending = resolve; });
-  // The fault's retry is the next transaction after the claim.
-  f.gateway.compact = async () => { held = f.holdNextUpdate(); sending(); throw new Error("disconnected"); };
-  const run = worker.reconcile();
-  await sent;
-  await held.reached;
-  assert.equal(f.operation.state, "requested", "the retry is saved");
-  worker.stop();
-  held.release();
-  await run;
-  assert.equal(f.timers.pending, 0, "a stopped worker holds no timer");
-});
+type Held = { reached: Promise<void>; release(): void };
+// A step the worker waits on: `pass` resolves `reached`, then waits for `release`.
+function gate() {
+  let reach!: () => void, release!: () => void;
+  const reached = new Promise<void>(resolve => { reach = resolve; });
+  const released = new Promise<void>(resolve => { release = resolve; });
+  return { reached, release, pass: async () => { reach(); await released; } };
+}
+type Fixture = ReturnType<typeof fixture>;
+const NATIVE = { id: "operation-a", launchId: "launch", generation: "gen-1", sessionId: "native", revision: 1 };
+// Sends as the gateway does: an attempt whose worker is no longer current
+// throws before the dispatch marker and stops at it after, and "a:sent" is
+// recorded only when the send itself happens.
+async function send(f: Fixture, execution: ExecutionContext | undefined, native = false) {
+  if (!execution!.current()) throw new Error("Send deadline passed or worker stopped before send");
+  await execution!.checkpoint({ dispatchStartedAt: f.time, ...native ? { native: NATIVE } : {} });
+  if (!execution!.current()) return { status: "unknown" as const, detail: "Worker stopped at dispatch boundary" };
+  f.record("a:sent");
+  return { status: "completed" as const, detail: "matching evidence" };
+}
+// An automatic reservation the policy allows now: its idle delay has passed
+// and the conversation is over the threshold. The gateway asks the dispatch
+// guard again right before sending.
+const automatic = (f: Fixture) => {
+  f.operation.kind = "automatic";
+  f.operation.reservationEndedAt = f.time - dueAt(0, DEFAULT_SETTINGS);
+  f.agent.tokens = DEFAULT_SETTINGS.threshold;
+  f.gateway.automatic = async (agent, guard, execution) => {
+    if (guard && !await guard.allowed()) throw new Refusal("Reservation cancelled or session changed before send");
+    return f.gateway.compact(agent.agentId, agent, execution);
+  };
+};
+// A hold armed from inside an earlier step of the run, so it holds the first
+// such step after that one, however many came before.
+function later(hold: () => Held) {
+  let held: Held | undefined, arrive!: () => void;
+  const reached = new Promise<void>(resolve => { arrive = resolve; });
+  return { arm() { held = hold(); void held.reached.then(arrive); }, held: { reached, release: () => held?.release() } };
+}
+// Each await of a run, held: what the worker reaches while the test holds it.
+const stopPoints: Record<string, (f: Fixture) => { worker: ReturnType<Fixture["make"]>; held: Held }> = {
+  "the scan of pending work": f => ({ worker: f.make(), held: f.holdRead() }),
+  "the claim, queued behind another transaction": f => ({ worker: f.make(), held: f.holdNextUpdate(0, true) }),
+  "the claim": f => ({ worker: f.make(), held: f.holdNextUpdate() }),
+  "a read of the host before sending": f => {
+    const held = gate(), refresh = f.gateway.refresh;
+    f.gateway.refresh = async id => { await held.pass(); return refresh(id); };
+    return { worker: f.make(), held };
+  },
+  "a read of the settings before sending": f => {
+    const held = gate();
+    return { worker: f.make(async () => { await held.pass(); return { ...DEFAULT_SETTINGS }; }), held };
+  },
+  "the dispatch guard's settings read": f => {
+    automatic(f);
+    const held = gate();
+    let reads = 0;
+    return { worker: f.make(async () => { if (++reads === 2) await held.pass(); return { ...DEFAULT_SETTINGS }; }), held };
+  },
+  "the dispatch guard's state read": f => {
+    automatic(f);
+    const read = later(() => f.holdRead());
+    let reads = 0;
+    // The guard reads the settings, then the state.
+    return { worker: f.make(async () => { if (++reads === 2) read.arm(); return { ...DEFAULT_SETTINGS }; }), held: read.held };
+  },
+  "the gateway's dispatch guard": f => {
+    automatic(f);
+    const held = gate();
+    let reads = 0;
+    return { worker: f.make(async () => { if (++reads === 3) await held.pass(); return { ...DEFAULT_SETTINGS }; }), held };
+  },
+  "the send": f => {
+    const held = gate();
+    f.hook("a", async execution => { await held.pass(); return send(f, execution); });
+    return { worker: f.make(), held };
+  },
+  "the dispatch marker's write": f => {
+    const write = later(() => f.holdNextUpdate());
+    f.hook("a", execution => { write.arm(); return send(f, execution); });
+    return { worker: f.make(), held: write.held };
+  },
+  "the sent call's outcome": f => {
+    const held = gate();
+    f.hook("a", async execution => { const outcome = await send(f, execution); await held.pass(); return outcome; });
+    return { worker: f.make(), held };
+  },
+  "the state read after an unknown outcome": f => {
+    const read = later(() => f.holdRead());
+    f.hook("a", async execution => {
+      await execution!.checkpoint({ dispatchStartedAt: f.time });
+      read.arm();
+      return { status: "unknown", detail: "Compaction completion unconfirmed" };
+    });
+    return { worker: f.make(), held: read.held };
+  },
+  "the outcome's write": f => {
+    const write = later(() => f.holdNextUpdate());
+    f.hook("a", async execution => {
+      const outcome = await send(f, execution, true);
+      write.arm();
+      return outcome;
+    });
+    return { worker: f.make(), held: write.held };
+  },
+  "the native request's release": f => {
+    const held = gate();
+    f.hook("a", execution => send(f, execution, true));
+    f.gateway.release = async operation => { f.record(`${operation.id}:released`); await held.pass(); };
+    return { worker: f.make(), held };
+  },
+  "an inspection after the dispatch marker": f => {
+    f.operation.state = "observing";
+    f.operation.evidence = { dispatchStartedAt: f.time };
+    const held = gate();
+    f.gateway.inspect = async () => { await held.pass(); return { status: "completed", detail: "matching evidence" }; };
+    return { worker: f.make(), held };
+  },
+  "a fault's retry write": f => {
+    const write = later(() => f.holdNextUpdate());
+    f.hook("a", async () => { write.arm(); throw new Error("disconnected"); });
+    return { worker: f.make(), held: write.held };
+  },
+  "the expiry's write after a fault": f => {
+    // The classification finds the send deadline passed; the expiry is the transaction after it.
+    const write = later(() => f.holdNextUpdate(1));
+    f.hook("a", async () => { f.advance(180_000); write.arm(); throw new Error("disconnected"); });
+    return { worker: f.make(), held: write.held };
+  },
+};
+
+// One test each, so a run that outlives its stop fails at the runner's bound
+// on its own.
+for (const [at, stopAt] of Object.entries(stopPoints)) {
+  test(`a worker stopped at ${at} ends the run at once, and writes, sends, releases, arms and reports nothing`, async (t) => {
+    const scope = cleanupScope(t);
+    const f = fixture();
+    const drained = drainer();
+    f.gateway.release ??= async operation => { f.record(`${operation.id}:released`); };
+    const { worker, held } = stopAt(f);
+    scope.defer(() => worker.stop());
+    const run = worker.reconcile();
+    await held.reached;
+    // Taken before stop(), so what stop() itself did counts too.
+    const state = JSON.stringify(f.snapshot), events = f.events.length, errors = f.errors.length;
+    worker.stop();
+    assert.equal(f.timers.pending, 0, `${at}: stopping ends every wait and clears its timer`);
+    // The run ends while its step is still held; one still waiting fails here,
+    // at the runner's bound.
+    await run;
+    await worker.idle();
+    held.release();
+    // What the released step does next has run once the queued callbacks have.
+    await drained();
+    assert.equal(JSON.stringify(f.snapshot), state, `${at}: nothing is written`);
+    assert.deepEqual(f.events.slice(events), [], `${at}: nothing is sent or released`);
+    assert.deepEqual(f.errors.slice(errors), [], `${at}: nothing is reported`);
+    assert.equal(f.timers.pending, 0, `${at}: no wait or wake-up is armed`);
+  });
+}
 
 test("a gateway fault before the dispatch marker is retried; nothing is sent until it passes", async () => {
   const f = fixture(), worker = f.make();

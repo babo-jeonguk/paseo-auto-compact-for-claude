@@ -11,6 +11,7 @@ import { DELIVERY_WINDOW_MS } from "./policy";
 import { changes } from "../tests/support/changes";
 import { fakeTimers } from "../tests/support/timers";
 import { drainer } from "../tests/support/drained";
+import { cleanupScope } from "../tests/support/scope";
 import type { Blocked } from "../shared/rpc";
 import { Refusal, type Gateway, type Observation, type State, type StateStore } from "./model";
 
@@ -23,6 +24,8 @@ function fixture(automatic = true) {
   const compactHolds = new Map<string, () => Promise<void>>();
   const refreshHolds = new Map<string, () => Promise<void>>();
   const listedHolds = new Map<string, () => Promise<void>>();
+  // A held settings read, `skip` reads from when it was set.
+  let settingsHold: { skip: number; hold: () => Promise<void> } | null = null;
   // Resource use the optimization promises to bound.
   const counts = {
     reads: 0, writes: 0, lists: 0, refreshes: [] as string[],
@@ -118,7 +121,11 @@ function fixture(automatic = true) {
     createScheduler({
       store,
       gateway,
-      settings: async () => config,
+      settings: async () => {
+        const held = settingsHold;
+        if (held && held.skip-- === 0) { settingsHold = null; await held.hold(); }
+        return config;
+      },
       now: () => time,
       timers,
     });
@@ -138,6 +145,9 @@ function fixture(automatic = true) {
     },
     holdRefresh(agentId: string, hold: () => Promise<void>) {
       refreshHolds.set(agentId, hold);
+    },
+    holdSettings(skip: number, hold: () => Promise<void>) {
+      settingsHold = { skip, hold };
     },
     // Hold one listed conversation's observation, not the listing itself.
     holdListed(agentId: string, hold: () => Promise<void>) {
@@ -888,6 +898,26 @@ test("unreadable settings and stopped plugin never send", async () => {
   assert.equal(f.calls, 0);
 });
 
+test("stopping the plugin while its worker reads the settings before sending leaves no wait armed", async (t) => {
+  const f = fixture();
+  const s = f.make();
+  cleanupScope(t).defer(() => s.stop());
+  await s.ready;
+  let reached!: () => void, release!: () => void;
+  const reading = new Promise<void>(resolve => { reached = resolve; });
+  const released = new Promise<void>(resolve => { release = resolve; });
+  // Compact now reads the settings once before it saves the request; the worker's read is the next.
+  f.holdSettings(1, async () => { reached(); await released; });
+  assert.equal((await s.compactNow("a", f.agents[0].revision!, "request-a")).code, "accepted");
+  await reading;
+  s.stop();
+  assert.equal(f.timers.pending, 0, "the worker's read and any bound around it end with the plugin");
+  release();
+  await s.idle();
+  assert.equal(f.calls, 0);
+  assert.equal(f.timers.pending, 0);
+});
+
 test("a known short TTL or expired cache prevents automatic dispatch", async () => {
   const f = fixture();
   let blocked: Blocked | null = { reason: "idle_delay_exceeds_cache",
@@ -1529,8 +1559,10 @@ test("an attention pass applies one conversation's newer reply although another'
   try {
     const pass = s.observe({ kind: "periodic" });
     await readBound(f, () => f.counts.refreshes.at(-1) === "a");
+    // Handled before the tick: the timeout rejects the pass while later due timers still run.
+    const timedOut = assert.rejects(pass, "a's timeout is still reported");
     await f.timers.tick(INSPECT_TIMEOUT_MS);
-    await assert.rejects(pass, "a's timeout is still reported");
+    await timedOut;
     assert.equal(f.state.jobs.find(job => job.agentId === "b")?.activityKey, "launch:b:2",
       "b's newer reply is applied in the same pass");
     assert.equal(f.counts.lists, 1, "the attention pass lists nothing");
@@ -2204,8 +2236,10 @@ test("a refresh that hangs past the deadline does not drop another conversation'
     release();
     await full;
     await readBound(f, () => f.counts.refreshes.includes("a"));
+    // Handled before the tick: the timeout rejects the read while later due timers still run.
+    const timedOut = assert.rejects(merged[1], "the timeout is still reported");
     await f.timers.tick(INSPECT_TIMEOUT_MS);
-    await assert.rejects(merged[1], "the timeout is still reported");
+    await timedOut;
     assert.deepEqual(reserved(f), ["b"], "b's finished reply is reserved although a's read is still running");
     const from = f.hostCalls.length;
     const again = s.observe({ kind: "agent", agentId: "b" });

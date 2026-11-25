@@ -34,9 +34,36 @@ test("a bounded wait ends when its attempt stops, and leaves no timer armed", as
   attempt.abort();
   await assert.rejects(waiting, Stopped);
   assert.equal(timers.pending, 0, "stopping the attempt clears its deadline");
-  await assert.rejects(bounded(new Promise<never>(() => {}), 5_000, timers, attempt.signal), Stopped,
+  let armed = 0;
+  const counted = { ...timers, setTimeout: (callback: () => void, ms: number) => { armed++; return timers.setTimeout(callback, ms); } };
+  await assert.rejects(bounded(new Promise<never>(() => {}), 5_000, counted, attempt.signal), Stopped,
     "a wait started after its attempt stopped ends at once");
+  assert.equal(armed, 0, "a wait started after its attempt stopped arms no deadline");
+});
+
+test("a wait with no deadline of its own arms no timer and ends only when its attempt stops", async () => {
+  const timers = fakeTimers();
+  const attempt = new AbortController();
+  let finish!: (value: string) => void;
+  const finishing = bounded(new Promise<string>(resolve => { finish = resolve; }), Infinity, timers, attempt.signal);
+  assert.equal(timers.pending, 0, "no deadline is armed");
+  finish("done");
+  assert.equal(await finishing, "done");
+  const stopped = bounded(new Promise<never>(() => {}), Infinity, timers, attempt.signal);
   assert.equal(timers.pending, 0);
+  attempt.abort();
+  await assert.rejects(stopped, Stopped);
+});
+
+test("a stopped wait clears its timer whatever handle the timers returned", async () => {
+  // Timers is opaque about handles, so one may be undefined.
+  const cleared: unknown[] = [];
+  const timers = { setTimeout: () => undefined, clearTimeout: (handle: unknown) => { cleared.push(handle); } };
+  const attempt = new AbortController();
+  const waiting = bounded(new Promise<never>(() => {}), 5_000, timers, attempt.signal);
+  attempt.abort();
+  await assert.rejects(waiting, Stopped);
+  assert.deepEqual(cleared, [undefined], "the armed deadline is cleared");
 });
 
 test("a bounded wait clears only its own timer, even on timers that reuse a retired handle", async () => {

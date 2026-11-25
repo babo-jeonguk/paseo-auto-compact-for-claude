@@ -299,7 +299,9 @@ export function createScheduler(options: {
       nextCleanupAt = result.backlog ? -Infinity : at + HISTORY_SWEEP_INTERVAL_MS;
     } catch (error) { onError(error); }
   }
-  const worker = createOperationWorker({ store, gateway, settings, now, onError, timers,
+  // The worker bounds its own reads on its lifetime, so it reads the settings
+  // directly: a bound of the scheduler's around them would outlive its stop.
+  const worker = createOperationWorker({ store, gateway, settings: options.settings, now, onError, timers,
     // A transaction that changes nothing writes nothing.
     update: change => serialize(async () => {
       const state = await store.read(), before = JSON.stringify(state);

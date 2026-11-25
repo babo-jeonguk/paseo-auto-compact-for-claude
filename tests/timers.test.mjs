@@ -53,3 +53,19 @@ test('a timer cleared after its tick started but before it ran does not run', as
   await ticking;
   assert.deepEqual(ran, ['second']);
 });
+
+// Real timers run the microtasks a callback queued before the next callback
+// due at the same time, so work it started can still cancel that one.
+test('microtasks a due callback queued run before the next due callback', async () => {
+  const timers = fakeTimers();
+  const ran = [];
+  let second;
+  timers.setTimeout(() => {
+    ran.push('first');
+    void (async () => { await null; await null; timers.clearTimeout(second); })();
+  }, 10);
+  second = timers.setTimeout(() => ran.push('second'), 10);
+  await timers.tick(10);
+  assert.deepEqual(ran, ['first']);
+  assert.equal(timers.pending, 0);
+});

@@ -1007,7 +1007,10 @@ test("a listed conversation's read is bounded from when it starts, not from when
     await timers.tick(4_000);
     releasePage();
     await listing();
-    assert.equal(outcome(), "pending", "a's read is not timed out when paging ends");
+    // The deadline itself, not the scan's outcome: a rejection the 4 s tick
+    // fired might not have reached the scan yet.
+    assert.deepEqual([timers.pendingWithin(999), timers.pendingWithin(1_000)], [0, 1],
+      "a's read is not timed out when paging ends, and times out one second later");
     await timers.tick(1_000);
     await ended;
     assert.ok(outcome() instanceof Error, "a's read timed out five seconds after it started");
