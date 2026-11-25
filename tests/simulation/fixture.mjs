@@ -7,7 +7,7 @@ import { createServer } from 'node:net';
 import { createRequire } from 'node:module';
 import { join, dirname, delimiter } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 export async function waitFor(fn, label, timeout = 45_000) {
   const until = Date.now() + timeout;
@@ -123,6 +123,29 @@ export async function startFixture({ root, plugin, cliPackage, appVersion, binar
   const fixture = {
     root, home, claude, binary, target, get client() { return client; },
     rpc: (name, input = {}) => client.invokePluginRpc('auto-compact-for-claude', `auto-compact.${name}`, input),
+    // Another client of this daemon that reconnects on its own after its
+    // connection drops, as an app does. `via` routes it through a forwarding
+    // proxy (proxy.mjs) at that URL. The caller closes it.
+    async connect({ via } = {}) {
+      const other = new DaemonClient({ url: via ? `${via.replace(/^http/, 'ws')}/ws` : `ws://${target}/ws`,
+        clientId: `auto-compact-simulation-${randomUUID()}`, clientType: 'cli', appVersion, connectTimeoutMs: 1000,
+        reconnect: { enabled: true, baseDelayMs: 200, maxDelayMs: 1000 },
+        localCredential: async () => readLocalCredentialForTarget(home, target) ?? undefined,
+        webSocketFactory: (url, options) => new WebSocket(url, options?.protocols, { headers: options?.headers }) });
+      await other.connect();
+      return other;
+    },
+    // The plugin's state-changed subscription on `on` (this fixture's client by
+    // default), as a screen subscribes: every event it receives, in order.
+    async subscribe(input = {}, on = client) {
+      const events = [];
+      const subscription = on.observePluginRpc('auto-compact-for-claude', 'auto-compact.state-changed', input);
+      const unsubscribe = subscription.subscribe({ snapshot() {}, update(message) {
+        if (message.type === 'plugin.rpc.event') events.push(message.payload.event);
+      } });
+      await subscription.ready;
+      return { events, async close() { unsubscribe(); await subscription.release(); } };
+    },
     // The real `paseo` CLI against this isolated daemon home.
     async paseo(...args) {
       const { stdout } = await promisify(execFile)(process.execPath, [join(cliRoot, 'bin/paseo'), ...args, '--home', home],

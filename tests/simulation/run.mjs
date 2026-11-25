@@ -101,7 +101,7 @@ try {
     'server/model.ts', 'server/store.ts', 'server/state-changes.ts', 'server/operations.ts', 'server/retention.ts', 'server/deadline.ts', 'shared/rpc.ts', 'shared/providers.ts', 'paseo-plugin.json', 'package.json'])
     report.sourceFiles[path] = sha(await readFile(join(plugin, path)));
   report.simulationFiles = {};
-  for (const path of ['matrix.mjs', 'run.mjs', 'execution.mjs', 'fixture.mjs', 'model.mjs', 'scenarios.mjs', 'paseo-versions.mjs', 'package.json', 'package-lock.json'])
+  for (const path of ['matrix.mjs', 'run.mjs', 'execution.mjs', 'fixture.mjs', 'model.mjs', 'proxy.mjs', 'scenarios.mjs', 'paseo-versions.mjs', 'package.json', 'package-lock.json'])
     report.simulationFiles[path] = sha(await readFile(join(here, path)));
   model = await startModel();
   fixture = await startFixture({ root, plugin, cliPackage, appVersion: report.appVersion,
