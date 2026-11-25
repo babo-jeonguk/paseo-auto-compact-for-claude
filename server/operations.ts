@@ -38,8 +38,20 @@ export const mayHaveSent = (operation: StoredOperation) => operation.kind === "l
   !(operation.state === "expired" || (operation.state === "failed" && operation.evidence?.dispatchStartedAt === undefined));
 
 export function leftoverRetirement(request: LeftoverRequest, operation: StoredOperation | undefined): { sent: boolean } | null {
-  void request; void operation;
-  throw new Error("Not implemented");
+  // An operation no longer retained ended at least the retention period ago.
+  if (!operation) return { sent: false };
+  if (operationPending(operation)) {
+    // Pending without the dispatch marker: the earlier instance never sent it,
+    // and a retry prepares a fresh request.
+    if (operation.evidence?.dispatchStartedAt === undefined) return { sent: false };
+    // Possibly sent and still observed with the same preparation: the observer
+    // needs the request to attribute its outcome. Evidence from an earlier
+    // release names no preparation, so the request is kept.
+    const native = operation.evidence.native?.preparation;
+    return native === undefined || native === request.preparation ? null : { sent: true };
+  }
+  // Finished: retired as the worker's release would, sent once the marker exists.
+  return { sent: operation.evidence?.dispatchStartedAt !== undefined };
 }
 
 // Jobs keep the fields v1.0.2 reads, so a rollback neither replays an attempted

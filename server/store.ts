@@ -1,5 +1,5 @@
-import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, writeFile, rm } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { z } from "zod";
@@ -98,7 +98,6 @@ export function createStore(
   ),
   writes: DurableWrites = createDurableWrites()
 ): StateStore {
-  void writes;
   return {
     async read() {
       try {
@@ -122,16 +121,10 @@ export function createStore(
     },
     async write(state: State) {
       StateSchema.parse(state);
-      await mkdir(dirname(path), { recursive: true });
-      const temp = `${path}.${randomUUID()}.tmp`;
-      try {
-        await writeFile(temp, JSON.stringify(state, null, 2) + "\n", {
-          mode: 0o600,
-        });
-        await rename(temp, path);
-      } finally {
-        await rm(temp, { force: true });
-      }
+      await writes.run(async () => {
+        await mkdir(dirname(path), { recursive: true });
+        await writes.replace(path, JSON.stringify(state, null, 2) + "\n");
+      });
     },
   };
 }

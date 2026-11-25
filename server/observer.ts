@@ -1,6 +1,6 @@
 import type { PluginSessionOpenRequest } from '@getpaseo/plugin/server';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, readFile, readdir, writeFile, rename, lstat, rm } from 'node:fs/promises';
+import { mkdir, readFile, readdir, writeFile, lstat, rm } from 'node:fs/promises';
 import { join, delimiter, sep } from 'node:path';
 import { homedir } from 'node:os';
 import { z } from 'zod';
@@ -9,7 +9,7 @@ import { Refusal, type NativeOperation, type Observation, type StoredOperation }
 import type { Blocked } from '../shared/rpc';
 import { createCacheReader } from './cache';
 import { CLOCK_STEP_TOLERANCE_MS } from './deadline';
-import type { DurableWrites } from './durable';
+import { createDurableWrites, type DurableWrites } from './durable';
 import type { LeftoverDecision } from './model';
 
 // Must equal QUERY_RESTARTED_REFUSAL in server/observer-source.mjs.
@@ -33,6 +33,9 @@ const LedgerSchema = z.object({
   compact: z.object({ id: z.string().nullable(), status: z.enum(['running', 'completed', 'failed', 'unknown']),
     revision: z.number().int(), reason: z.string().nullable().optional(),
     refusal: z.string().nullable().optional(),
+    // Which preparation of the native request the record belongs to; absent
+    // from observers built by earlier releases.
+    preparation: z.string().optional(),
     prepared: PreparedIdentitySchema.nullable().optional() }).nullable(),
 });
 type Ledger = z.infer<typeof LedgerSchema> & { cache: Awaited<ReturnType<ReturnType<typeof createCacheReader>>>;
@@ -42,20 +45,25 @@ const ReceiptSchema = z.object({
   revision: z.number().int(), status: z.enum(['completed', 'failed', 'unknown']),
   reason: z.string().nullable(), observedAt: z.number().finite(),
   refusal: z.string().nullable().optional(),
+  preparation: z.string().optional(),
   prepared: PreparedIdentitySchema.nullable().optional(),
 });
 type NativeRecord = {
   id: string | null; launchId: string; generation: string; sessionId: string | null;
   revision: number; status: 'running' | 'completed' | 'failed' | 'unknown'; reason?: string | null;
-  refusal?: string | null; prepared?: z.infer<typeof PreparedIdentitySchema> | null;
+  refusal?: string | null; preparation?: string;
+  prepared?: z.infer<typeof PreparedIdentitySchema> | null;
 };
 // One rule for both durable receipts and live ledger polls: a record settles
 // `operation` when it comes from the exact prepared observer identity and
 // revision, or when a newer generation in the same launch and Claude session
 // explicitly refused that exact prepared request because the query restarted.
-// Completion always requires the exact prepared identity.
+// Completion always requires the exact prepared identity. A record that names
+// another preparation of the operation settles nothing: that was a different
+// request, however it ended.
 function matchNativeRecord(record: NativeRecord, operation: NativeOperation) {
   if (record.id !== operation.id || record.status === 'running') return null;
+  if (typeof record.preparation === 'string' && record.preparation !== operation.preparation) return null;
   if (record.launchId === operation.launchId && record.generation === operation.generation &&
       record.sessionId === operation.sessionId && record.revision === operation.revision) {
     return { status: record.status, detail: record.reason ??
@@ -114,8 +122,30 @@ export function createObserver(options: { home?: string; now?: () => number; wri
   const base = join(options.home ?? process.env.PASEO_HOME ?? join(homedir(), '.paseo'),
     'plugin-data', 'auto-compact-for-claude', 'observers');
   const now = options.now ?? Date.now;
+  const writes = options.writes ?? createDurableWrites();
   // The observer launch this plugin instance last started for each agent.
   const launchesStartedHere = new Map<string, string>();
+  // Every preparation of a native request this instance made. Its own request
+  // is its attempt's to retire, never a leftover from an earlier instance.
+  const preparations = new Set<string>();
+  // One writer of a file at a time in this instance, in call order. The next
+  // waits for the previous one's actual file work to settle, not for a bounded
+  // wait on it, so a delayed write lands where it was asked to; the entry goes
+  // once that chain has ended.
+  function serialize<K>(chains: Map<K, Promise<unknown>>) {
+    return <T>(key: K, work: () => Promise<T>): Promise<T> => {
+      const earlier = chains.get(key) ?? Promise.resolve();
+      const result = earlier.then(work, work);
+      const done = result.then(() => {}, () => {});
+      chains.set(key, done);
+      void done.then(() => { if (chains.get(key) === done) chains.delete(key); });
+      return result;
+    };
+  }
+  // One writer of a conversation's request.json, and one preparation of a
+  // conversation's next launch (its current.json), at a time.
+  const requestLock = serialize(new Map<string, Promise<unknown>>());
+  const sessionLock = serialize(new Map<string, Promise<unknown>>());
   const cacheWindow = createCacheReader();
   const agentDirectory = (id: string) => join(base, createHash('sha256').update(id).digest('hex'));
   const receiptName = (id: string) => encodeURIComponent(id) + '.json';
@@ -133,11 +163,28 @@ export function createObserver(options: { home?: string; now?: () => number; wri
     }
     return join(parent, 'receipts');
   }
-  const atomic = async (path: string, value: unknown) => {
-    const temporary = path + '.' + randomUUID() + '.tmp';
-    await writeFile(temporary, JSON.stringify(value), { mode: 0o600, flag: 'wx' });
-    await rename(temporary, path);
-  };
+  // The record a retired request leaves: the identity it retired and its
+  // outcome. A preparation is named only when the request had one.
+  const retiredRecord = (id: string, preparation: unknown, status: 'settled' | 'cancelled') =>
+    ({ id, ...(typeof preparation === 'string' ? { preparation } : {}), status });
+  // Settled requests must not intercept later ordinary/manual compaction. An
+  // unobserved send remains cancelled so a late PreCompact cannot run it.
+  async function retiredStatus(directory: string, id: string, sent: boolean) {
+    // The ledger can be caught mid-write; then only a durable receipt can prove consumption.
+    const ledger = await readFile(join(directory, 'ledger.json'), 'utf8')
+      .then(text => LedgerSchema.safeParse(JSON.parse(text)))
+      .catch(() => null);
+    // A durable receipt also proves Claude already consumed this request, even
+    // if later activity overwrote ledger.compact before release ran.
+    const recorded = await readFile(join(directory, '..', 'receipts', receiptName(id)), 'utf8')
+      .then(text => {
+        const parsed = ReceiptSchema.safeParse(JSON.parse(text));
+        return parsed.success && parsed.data.id === id;
+      })
+      .catch(() => false);
+    const consumed = (ledger?.success && ledger.data.compact?.id === id) || recorded;
+    return !sent || consumed ? 'settled' as const : 'cancelled' as const;
+  }
   // null means there is no usable observer: none launched, an incompatible,
   // closed or unsafe launch, or a heartbeat older than a minute. Failing to read
   // one is different and is thrown, so nothing treats a busy or half-written
@@ -207,24 +254,17 @@ export function createObserver(options: { home?: string; now?: () => number; wri
   }
   async function cancel(operation: { directory: string; id: string; preparation?: string }, sent = true) {
     const path = join(operation.directory, 'request.json');
-    const request = JSON.parse(await readFile(path, 'utf8'));
-    if (request.id !== operation.id) return;
-    // The ledger can be caught mid-write; then only a durable receipt can prove consumption.
-    const ledger = await readFile(join(operation.directory, 'ledger.json'), 'utf8')
-      .then(text => LedgerSchema.safeParse(JSON.parse(text)))
-      .catch(() => null);
-    // A durable receipt also proves Claude already consumed this request, even
-    // if later activity overwrote ledger.compact before release ran.
-    const recorded = await readFile(join(operation.directory, '..', 'receipts', receiptName(operation.id)), 'utf8')
-      .then(text => {
-        const parsed = ReceiptSchema.safeParse(JSON.parse(text));
-        return parsed.success && parsed.data.id === operation.id;
-      })
-      .catch(() => false);
-    const consumed = (ledger?.success && ledger.data.compact?.id === operation.id) || recorded;
-    // Settled requests must not intercept later ordinary/manual compaction.
-    // An unobserved send remains cancelled so a late PreCompact cannot run it.
-    await atomic(path, { id: operation.id, status: !sent || consumed ? 'settled' : 'cancelled' });
+    // The read, the check and the write are one writer of this file, so they
+    // cannot be split by a newer preparation landing in between.
+    await writes.run(() => requestLock(path, async () => {
+      const request = JSON.parse(await readFile(path, 'utf8'));
+      if (!request || typeof request !== 'object' || request.id !== operation.id) return;
+      // Retire only the preparation this call is about; a retry's newer
+      // preparation of the same operation is left alone.
+      if (operation.preparation !== undefined && request.preparation !== operation.preparation) return;
+      await writes.replace(path, JSON.stringify(retiredRecord(operation.id, request.preparation,
+        await retiredStatus(operation.directory, operation.id, sent))));
+    }));
   }
   return {
     read,
@@ -268,33 +308,39 @@ export function createObserver(options: { home?: string; now?: () => number; wri
         }
       }
     },
-    async prepareSession(request: PluginSessionOpenRequest, eligible: boolean) {
+    async prepareSession(request: PluginSessionOpenRequest, eligible: boolean): Promise<PluginSessionOpenRequest> {
       if (!eligible || request.purpose !== 'interactive') return request;
-      const parent = agentDirectory(request.agentId), launchId = randomUUID();
-      const directory = join(parent, launchId), mod = join(directory, 'mod');
-      await mkdir(join(mod, '.claude-plugin'), { recursive: true, mode: 0o700 });
-      await mkdir(join(mod, 'hooks'), { recursive: true, mode: 0o700 });
-      const receipts = join(parent, 'receipts');
-      await mkdir(receipts, { recursive: true, mode: 0o700 });
-      const configuration = { launchId, ledger: join(directory, 'ledger.json'), request: join(directory, 'request.json'), receipts };
-      await writeFile(configuration.ledger, '{}', { mode: 0o600, flag: 'wx' });
-      await writeFile(configuration.request, '{}', { mode: 0o600, flag: 'wx' });
-      await writeFile(join(mod, '.claude-plugin', 'plugin.json'), JSON.stringify({ name: 'paseo-auto-compact-observer', version: '1.0.0',
-        description: 'Observe conversation activity and compaction for Paseo Auto Compact' }), { mode: 0o600 });
-      await writeFile(join(mod, 'hooks', 'hooks.json'), JSON.stringify({ modules: ['./register.mjs'] }), { mode: 0o600 });
-      await writeFile(join(mod, 'hooks', 'register.mjs'), observerAsset.source + '\nexport function register(on) { registerObserver(on, ' +
-        JSON.stringify(configuration) + '); }\n', { mode: 0o600 });
-      // The preparation time is durable so a restarted plugin reads a
-      // placeholder ledger the same way (see placeholderReason).
-      await atomic(join(parent, 'current.json'), { launchId, build: observerAsset.version, preparedAt: now() });
-      launchesStartedHere.set(request.agentId, launchId);
-      // Best effort: a failed prune only leaves stale launch directories on disk,
-      // and the launch must proceed.
-      await prune(parent, launchId).catch(() => {});
-      const existing = request.env.CLAUDE_CODE_PLUGIN_DIRS?.split(delimiter)
-        .filter(path => path && !path.startsWith(parent + sep));
-      return { ...request, env: { ...request.env,
-        CLAUDE_CODE_PLUGIN_DIRS: [...(existing ?? []), mod].join(delimiter) } };
+      const parent = agentDirectory(request.agentId);
+      // One preparation of a conversation at a time, so its launches, and the
+      // current.json publication of each, land in call order: a delayed earlier
+      // publication cannot replace a newer active launch.
+      return sessionLock(parent, () => writes.run(async () => {
+        const launchId = randomUUID();
+        const directory = join(parent, launchId), mod = join(directory, 'mod');
+        await mkdir(join(mod, '.claude-plugin'), { recursive: true, mode: 0o700 });
+        await mkdir(join(mod, 'hooks'), { recursive: true, mode: 0o700 });
+        const receipts = join(parent, 'receipts');
+        await mkdir(receipts, { recursive: true, mode: 0o700 });
+        const configuration = { launchId, ledger: join(directory, 'ledger.json'), request: join(directory, 'request.json'), receipts };
+        await writeFile(configuration.ledger, '{}', { mode: 0o600, flag: 'wx' });
+        await writeFile(configuration.request, '{}', { mode: 0o600, flag: 'wx' });
+        await writeFile(join(mod, '.claude-plugin', 'plugin.json'), JSON.stringify({ name: 'paseo-auto-compact-observer', version: '1.0.0',
+          description: 'Observe conversation activity and compaction for Paseo Auto Compact' }), { mode: 0o600 });
+        await writeFile(join(mod, 'hooks', 'hooks.json'), JSON.stringify({ modules: ['./register.mjs'] }), { mode: 0o600 });
+        await writeFile(join(mod, 'hooks', 'register.mjs'), observerAsset.source + '\nexport function register(on) { registerObserver(on, ' +
+          JSON.stringify(configuration) + '); }\n', { mode: 0o600 });
+        // The preparation time is durable so a restarted plugin reads a
+        // placeholder ledger the same way (see placeholderReason).
+        await writes.replace(join(parent, 'current.json'), JSON.stringify({ launchId, build: observerAsset.version, preparedAt: now() }));
+        launchesStartedHere.set(request.agentId, launchId);
+        // Best effort: a failed prune only leaves stale launch directories on disk,
+        // and the launch must proceed.
+        await prune(parent, launchId).catch(() => {});
+        const existing = request.env.CLAUDE_CODE_PLUGIN_DIRS?.split(delimiter)
+          .filter(path => path && !path.startsWith(parent + sep));
+        return { ...request, env: { ...request.env,
+          CLAUDE_CODE_PLUGIN_DIRS: [...(existing ?? []), mod].join(delimiter) } };
+      }));
     },
     // In memory, so it never fails: whether this instance started that launch.
     startedHere: (agentId: string, launchId: string) => launchesStartedHere.get(agentId) === launchId,
@@ -319,16 +365,25 @@ export function createObserver(options: { home?: string; now?: () => number; wri
       if (ledger.activeTurns.length || ledger.pendingInputs || ledger.compact?.status === 'running')
         throw new Refusal('Claude is still working');
       if (requireCache) { const blocked = reason(ledger, agent); if (blocked) throw new Refusal(blocked.detail); }
-      const request = { id, preparation: randomUUID() as string, launchId: ledger.launchId, generation: ledger.generation,
+      const preparation: string = randomUUID();
+      const request = { id, preparation, launchId: ledger.launchId, generation: ledger.generation,
         sessionId: ledger.sessionId, revision: ledger.revision, preparedAt: now(), expiresAt,
         requireCache, cacheDeadline: ledger.cacheDeadline, clockEpoch: ledger.clockEpoch, status: 'prepared' };
+      // Remembered before the write, so a recovery scan running meanwhile can
+      // tell this instance's preparation from a leftover even before it lands.
+      preparations.add(preparation);
       const receipts = join(agentDirectory(agent.agentId), 'receipts');
-      await mkdir(receipts, { recursive: true, mode: 0o700 });
-      // Pre-create the file for the Mod filesystem capability. Never erase a receipt.
-      await writeFile(receiptPath(agent.agentId, id), '{}', { mode: 0o600, flag: 'wx' })
-        .catch(error => { if (error.code !== 'EEXIST') throw error; });
-      await atomic(join(directory, 'request.json'), request);
-      return { ...request, directory };
+      const path = join(directory, 'request.json');
+      return writes.run(async () => {
+        await mkdir(receipts, { recursive: true, mode: 0o700 });
+        // Pre-create the file for the Mod filesystem capability. Never erase a receipt.
+        await writeFile(receiptPath(agent.agentId, id), '{}', { mode: 0o600, flag: 'wx' })
+          .catch(error => { if (error.code !== 'EEXIST') throw error; });
+        // Serialized with this request's other writers, so a delayed retirement
+        // cannot replace this newer preparation.
+        await requestLock(path, () => writes.replace(path, JSON.stringify(request)));
+        return { ...request, directory };
+      });
     },
     async receipt(agentId: string, operation: NativeOperation) {
       try {
@@ -364,15 +419,56 @@ export function createObserver(options: { home?: string; now?: () => number; wri
     cancel,
     // A finished operation whose call did not end normally, such as one
     // recovered after a restart, may leave its native request prepared. Retire
-    // it so that it can no longer claim a later /compact.
+    // it so that it can no longer claim a later /compact. A request this
+    // instance prepared belongs to its own attempt and is left alone.
     async recoverPrepared(decide: LeftoverDecision) {
-      void decide;
-      throw new Error('Not implemented');
+      const failures: unknown[] = [];
+      const parents = await readdir(base, { withFileTypes: true }).catch(error => {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+        throw error;
+      });
+      for (const entry of parents) {
+        if (!/^[a-f0-9]{64}$/.test(entry.name)) continue;
+        const parent = join(base, entry.name);
+        try {
+          // Never traverse a linked agent directory.
+          const info = await lstat(parent);
+          if (!info.isDirectory() || info.isSymbolicLink()) continue;
+          const manifest = ManifestSchema.parse(JSON.parse(await readFile(join(parent, 'current.json'), 'utf8')));
+          const directory = join(parent, manifest.launchId), path = join(directory, 'request.json');
+          await writes.run(() => requestLock(path, async () => {
+            let request: { id?: unknown; preparation?: unknown; status?: unknown } | null;
+            try {
+              request = JSON.parse(await readFile(path, 'utf8'));
+            } catch (error) {
+              if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+              throw error;
+            }
+            if (!request || typeof request !== 'object') return;
+            if (request.status !== 'prepared' || typeof request.id !== 'string') return;
+            if (typeof request.preparation === 'string' && preparations.has(request.preparation)) return;
+            const decision = decide({ id: request.id,
+              ...(typeof request.preparation === 'string' ? { preparation: request.preparation } : {}) });
+            if (decision === null) return;
+            await writes.replace(path, JSON.stringify(retiredRecord(request.id, request.preparation,
+              await retiredStatus(directory, request.id, decision.sent))));
+          }));
+        } catch (error) {
+          // A missing manifest or launch is a conversation with nothing prepared.
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+          failures.push(error);
+        }
+      }
+      // One conversation's failure does not keep the others' requests
+      // prepared; it is reported once the scan has ended.
+      if (failures.length === 1) throw failures[0];
+      if (failures.length > 1) throw new AggregateError(failures);
     },
     async release(agentId: string, operation: Pick<NativeOperation, 'id' | 'launchId' | 'preparation'>, sent: boolean) {
       const directory = join(agentDirectory(agentId), operation.launchId);
       const request = JSON.parse(await readFile(join(directory, 'request.json'), 'utf8'));
-      if (request.id === operation.id && request.status === 'prepared') await cancel({ directory, id: operation.id }, sent);
+      if (request.id === operation.id && request.status === 'prepared')
+        await cancel({ directory, id: operation.id, preparation: operation.preparation }, sent);
     },
   };
 }

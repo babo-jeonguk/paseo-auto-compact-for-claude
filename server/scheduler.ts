@@ -5,7 +5,7 @@ import { knownBlockedReason, operationPending, operationRowStatus, SESSION_RESUM
   type CompactTarget, type Row } from "../shared/rpc";
 import { targetOf, unchanged, type Gateway, type Job, type Observation, type State, type StateStore,
   type StoredOperation } from "./model";
-import { createOperationWorker, recoverOperations, inputFingerprint, mayHaveSent,
+import { createOperationWorker, leftoverRetirement, recoverOperations, inputFingerprint, mayHaveSent,
   publicOperation, sameActivity, syncJobs } from "./operations";
 import { automaticBlock, dueAt, DELIVERY_WINDOW_MS } from "./policy";
 import { HISTORY_RETENTION_MS, HISTORY_SWEEP_INTERVAL_MS, pruneOperationHistory, type OperationReceipts } from "./retention";
@@ -308,6 +308,14 @@ export function createScheduler(options: {
     }
     await store.write(state);
     await cleanup();
+    // Retire requests an earlier instance left prepared, before the worker's
+    // first pass; a stopped scheduler starts none.
+    if (gateway.recover) {
+      try {
+        await wait(begin(() => gateway.recover!(request =>
+          leftoverRetirement(request, state.operations.find(operation => operation.id === request.id)))));
+      } catch (error) { onError(error); }
+    }
   }
   async function cleanup() {
     if (!receipts) return;
