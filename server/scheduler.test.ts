@@ -6,8 +6,9 @@ import {
   type Settings,
 } from "../shared/settings";
 import { createScheduler, FULL_SCAN_INTERVAL_MS, TICK_INTERVAL_MS } from "./scheduler";
-import { INSPECT_TIMEOUT_MS } from "./deadline";
+import { INSPECT_TIMEOUT_MS, Stopped } from "./deadline";
 import { DELIVERY_WINDOW_MS } from "./policy";
+import { HISTORY_RETENTION_MS, HISTORY_SWEEP_INTERVAL_MS, type OperationReceipts } from "./retention";
 import { changes } from "../tests/support/changes";
 import { fakeTimers } from "../tests/support/timers";
 import { drainer } from "../tests/support/drained";
@@ -26,6 +27,12 @@ function fixture(automatic = true) {
   const listedHolds = new Map<string, () => Promise<void>>();
   // A held settings read, `skip` reads from when it was set.
   let settingsHold: { skip: number; hold: () => Promise<void> } | null = null;
+  // A held state read, `skip` reads from when it was set; it reads once released.
+  let readHold: { skip: number; held: Gate } | null = null;
+  const errors: unknown[] = [];
+  // Receipt removals and sweeps as they start, and the one held until released.
+  const receiptCalls: string[] = [];
+  const receiptHolds = new Map<string, Gate>();
   // Resource use the optimization promises to bound.
   const counts = {
     reads: 0, writes: 0, lists: 0, refreshes: [] as string[],
@@ -60,6 +67,8 @@ function fixture(automatic = true) {
   const store: StateStore = {
     read: async () => {
       counts.reads++;
+      const hold = readHold;
+      if (hold && hold.skip-- === 0) { readHold = null; await hold.held.pass(); }
       return structuredClone(state);
     },
     write: async (next) => {
@@ -117,9 +126,24 @@ function fixture(automatic = true) {
     compact,
     ...(automatic ? { automatic: async (expected: Observation) => compact(expected.agentId) } : {}),
   };
-  const make = () =>
+  // Passed to the scheduler only by a test that asks for history cleanup.
+  const receipts: OperationReceipts = {
+    remove: async (_agentId, operationId) => {
+      receiptCalls.push(`remove ${operationId}`);
+      signal.changed();
+      await receiptHolds.get("remove")?.pass();
+    },
+    sweep: async () => {
+      receiptCalls.push("sweep");
+      signal.changed();
+      await receiptHolds.get("sweep")?.pass();
+    },
+  };
+  const make = (options: { receipts?: boolean } = {}) =>
     createScheduler({
       store,
+      onError: error => errors.push(error),
+      ...options.receipts ? { receipts } : {},
       gateway,
       settings: async () => {
         const held = settingsHold;
@@ -149,6 +173,20 @@ function fixture(automatic = true) {
     holdSettings(skip: number, hold: () => Promise<void>) {
       settingsHold = { skip, hold };
     },
+    // Holds the state read `skip` reads from now before it reads.
+    holdRead(skip = 0): Gate {
+      const held = gate();
+      readHold = { skip, held };
+      return held;
+    },
+    // Holds the next receipt removal or sweep once it has started.
+    holdReceipts(kind: "remove" | "sweep"): Gate {
+      const held = gate();
+      receiptHolds.set(kind, held);
+      return held;
+    },
+    receiptCalls,
+    errors,
     // Hold one listed conversation's observation, not the listing itself.
     holdListed(agentId: string, hold: () => Promise<void>) {
       listedHolds.set(agentId, hold);
@@ -191,6 +229,15 @@ function fixture(automatic = true) {
       time += ms;
     },
   };
+}
+
+type Gate = ReturnType<typeof gate>;
+// A step the code under test waits on: `pass` resolves `reached`, then waits for `release`.
+function gate() {
+  let reach!: () => void, release!: () => void;
+  const reached = new Promise<void>(resolve => { reach = resolve; });
+  const released = new Promise<void>(resolve => { release = resolve; });
+  return { reached, release, pass: async () => { reach(); await released; } };
 }
 
 async function waitForStatus(f: ReturnType<typeof fixture>, status: State["jobs"][number]["status"]) {
@@ -2366,3 +2413,208 @@ test("a blocked reservation stores its reason code with its detail and shows it 
     assert.equal((await s.session("a"))!.blockedReason, undefined);
   }
 });
+
+type Scheduler = ReturnType<ReturnType<typeof fixture>["make"]>;
+type Stopping = { s: Scheduler; run: Promise<unknown>; held: { reached: Promise<void>; release(): void } };
+// A scheduler holding a reservation for "a", not yet due.
+async function scheduled(f: ReturnType<typeof fixture>) {
+  const s = f.make();
+  await s.ready;
+  await s.observedTurn(f.agents[0]);
+  return s;
+}
+// A scheduler whose reservation for "a" is due.
+async function due(f: ReturnType<typeof fixture>) {
+  const s = await scheduled(f);
+  f.advance(55 * 60_000);
+  return s;
+}
+// A scheduler with an operation past its retention, which the next tick's
+// history cleanup removes.
+async function retired(f: ReturnType<typeof fixture>) {
+  const s = f.make({ receipts: true });
+  await s.ready;
+  f.state.operations.push({ id: "retired", agentId: "a", revision: f.agents[0].revision!,
+    target: { sessionId: "native-a", activityKey: null }, kind: "manual", state: "succeeded",
+    createdAt: f.time - HISTORY_RETENTION_MS, updatedAt: f.time - HISTORY_RETENTION_MS, inputFingerprint: null,
+    result: { code: "completed", message: "done" } });
+  f.advance(HISTORY_SWEEP_INTERVAL_MS);
+  return s;
+}
+// Each await of a pass, held: what the scheduler reaches while the test holds it.
+const schedulerStopPoints: Record<string, (f: ReturnType<typeof fixture>) => Promise<Stopping>> = {
+  "recovery's state read": async f => {
+    const held = f.holdRead();
+    const s = f.make();
+    return { s, run: s.ready, held };
+  },
+  "recovery's settings read": async f => {
+    const held = gate();
+    f.holdSettings(0, held.pass);
+    const s = f.make();
+    return { s, run: s.ready, held };
+  },
+  "a tick queued behind another transaction": async f => {
+    const s = await due(f);
+    const held = f.holdRead();
+    // Its own outcome is not this test's; it ends with the stop too.
+    void s.toggle("a", true).catch(() => {});
+    return { s, run: s.tick(), held };
+  },
+  "the history cleanup's state read": async f => {
+    const s = await retired(f);
+    return { s, held: f.holdRead(), run: s.tick() };
+  },
+  "a receipt's removal": async f => {
+    const s = await retired(f);
+    return { s, held: f.holdReceipts("remove"), run: s.tick() };
+  },
+  "the receipts' sweep": async f => {
+    const s = await retired(f);
+    return { s, held: f.holdReceipts("sweep"), run: s.tick() };
+  },
+  "the tick's settings read": async f => {
+    const s = await due(f);
+    const held = gate();
+    f.holdSettings(0, held.pass);
+    return { s, held, run: s.tick() };
+  },
+  "the reservation pass's state read": async f => {
+    const s = await due(f);
+    // The worker's scan of pending work reads first.
+    return { s, held: f.holdRead(1), run: s.tick() };
+  },
+  "a due conversation's host read": async f => {
+    const s = await due(f);
+    const held = gate();
+    f.holdRefresh("a", held.pass);
+    return { s, held, run: s.tick() };
+  },
+  "a due conversation's readiness check": async f => {
+    const s = await due(f);
+    const held = gate();
+    f.gateway.readiness = async () => { await held.pass(); return null; };
+    return { s, held, run: s.tick() };
+  },
+  "a due conversation's second settings read": async f => {
+    const s = await due(f);
+    const held = gate();
+    f.holdSettings(1, held.pass);
+    return { s, held, run: s.tick() };
+  },
+  "the reservation's state read": async f => {
+    const s = await due(f);
+    // After the worker's scan and the reservation pass's read.
+    return { s, held: f.holdRead(2), run: s.tick() };
+  },
+  "a full scan's listing": async f => {
+    f.agents.splice(0, 1, nativeAgent(f, "a"));
+    const s = f.make();
+    await s.ready;
+    const release = f.holdList();
+    return { s, held: { reached: f.listingHeld(), release }, run: s.observe({ kind: "full" }) };
+  },
+  "a listed conversation's observation": async f => {
+    f.agents.splice(0, 1, nativeAgent(f, "a"));
+    const s = f.make();
+    await s.ready;
+    const held = gate();
+    f.holdListed("a", held.pass);
+    return { s, held, run: s.observe({ kind: "full" }) };
+  },
+  "an attention pass's state read": async f => {
+    f.agents.splice(0, 1, nativeAgent(f, "a"));
+    const s = f.make();
+    await s.ready;
+    // The first periodic pass is a full scan; the next within a minute is not.
+    await s.observe({ kind: "periodic" });
+    f.advance(10_000);
+    return { s, held: f.holdRead(), run: s.observe({ kind: "periodic" }) };
+  },
+  "an attention pass's host read": async f => {
+    f.agents.splice(0, 1, nativeAgent(f, "a"));
+    const s = f.make();
+    await s.ready;
+    await s.observe({ kind: "periodic" });
+    f.advance(10_000);
+    const held = gate();
+    f.holdRefresh("a", held.pass);
+    return { s, held, run: s.observe({ kind: "periodic" }) };
+  },
+  "the observed turn's state read": async f => {
+    f.agents.splice(0, 1, nativeAgent(f, "a"));
+    const s = f.make();
+    await s.ready;
+    return { s, held: f.holdRead(), run: s.observe({ kind: "agent", agentId: "a" }) };
+  },
+  "a status read's host read": async f => {
+    const s = f.make();
+    await s.ready;
+    const held = gate();
+    f.holdRefresh("a", held.pass);
+    return { s, held, run: s.session("a") };
+  },
+  "a status row's readiness check": async f => {
+    const s = await scheduled(f);
+    const held = gate();
+    f.gateway.readiness = async () => { await held.pass(); return null; };
+    return { s, held, run: s.session("a") };
+  },
+  "the conversation list's listing": async f => {
+    const s = f.make();
+    await s.ready;
+    const release = f.holdList();
+    return { s, held: { reached: f.listingHeld(), release }, run: s.list() };
+  },
+  "Compact now's settings read": async f => {
+    const s = f.make();
+    await s.ready;
+    const held = gate();
+    f.holdSettings(0, held.pass);
+    return { s, held, run: s.compactNow("a", f.agents[0].revision!, "request-a") };
+  },
+  "Compact now's host read": async f => {
+    const s = f.make();
+    await s.ready;
+    const held = gate();
+    f.holdRefresh("a", held.pass);
+    return { s, held, run: s.compactNow("a", f.agents[0].revision!, "request-a") };
+  },
+  "a skip's host read": async f => {
+    const s = await scheduled(f);
+    const held = gate();
+    f.holdRefresh("a", held.pass);
+    return { s, held, run: s.skip("a", f.agents[0].revision!) };
+  },
+};
+
+// One test each, so a call that outlives its stop fails at the runner's bound
+// on its own.
+for (const [at, stopAt] of Object.entries(schedulerStopPoints)) {
+  test(`a scheduler stopped at ${at} ends the call at once, and reads, writes, submits, removes and reports nothing`, async (t) => {
+    const scope = cleanupScope(t);
+    const f = fixture();
+    const { s, run, held } = await stopAt(f);
+    scope.defer(() => s.stop());
+    // Its outcome is checked once it settles; a rejection is not left unhandled meanwhile.
+    const settled = run.then(() => null, (error: unknown) => error);
+    await held.reached;
+    // Taken before stop(), so what stop() itself did counts too.
+    const before = () => JSON.stringify({ state: f.state, reads: f.counts.reads, writes: f.counts.writes,
+      refreshes: f.counts.refreshes.length, lists: f.counts.lists, sent: f.calls, receipts: f.receiptCalls.length,
+      errors: f.errors.map(String) });
+    const snapshot = before();
+    s.stop();
+    assert.equal(f.timers.pending, 0, `${at}: stopping ends every wait and clears its timer`);
+    // The call ends while its step is still held; one still waiting fails
+    // here, at the runner's bound.
+    const outcome = await settled;
+    assert.ok(outcome === null || outcome instanceof Stopped, `${at}: the call ends by stopping, not ${String(outcome)}`);
+    await s.idle();
+    held.release();
+    // What the released step does next has run once the queued callbacks have.
+    await f.drained();
+    assert.equal(before(), snapshot, `${at}: nothing is read, written, submitted, removed or reported`);
+    assert.equal(f.timers.pending, 0, `${at}: no wait is armed`);
+  });
+}
