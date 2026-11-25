@@ -25,7 +25,7 @@ const report={version, platform:process.platform, arch:process.arch, node:proces
 try {
  for (const path of ['index.client.tsx','client/conversation.tsx','client/compact-submission.ts','client/conversations.tsx','client/format.ts','client/cadence.ts','client/clock.ts','client/surface.ts','client/session-state.ts','client/settings.tsx','client/toggle.tsx','index.server.ts',
    'server/cache.ts','server/observer.ts','server/observer-source.mjs','server/observer-assets.generated.ts',
-   'server/gateway.ts','server/scheduler.ts','server/model.ts','server/store.ts','server/operations.ts',
+   'server/gateway.ts','server/scheduler.ts','server/model.ts','server/store.ts','server/state-changes.ts','server/operations.ts',
    'server/retention.ts','server/deadline.ts','shared/rpc.ts','shared/providers.ts','shared/settings.ts',
    'paseo-plugin.json','package.json','tests/simulation/fixture.mjs','tests/simulation/model.mjs','tests/simulation/paseo-versions.mjs','tests/simulation/browser.mjs']) {
    report.sources[path]=createHash('sha256').update(await readFile(join(plugin,path))).digest('hex');

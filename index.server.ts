@@ -2,6 +2,7 @@ import type { PluginHookContext, PluginServerContext } from "@getpaseo/plugin/se
 import { createGateway } from "./server/gateway";
 import { createScheduler, TICK_INTERVAL_MS } from "./server/scheduler";
 import { createCachedStore, createStore } from "./server/store";
+import { createStateChanges } from "./server/state-changes";
 import { createObserver } from "./server/observer";
 import { createReporter } from "./server/report";
 import { claudeProvider } from "./shared/providers";
@@ -11,6 +12,7 @@ import {
   operationRpc,
   sessionRpc,
   skipRpc,
+  stateChangedSubscription,
   undoSkipRpc,
   toggleRpc,
 } from "./shared/rpc";
@@ -24,8 +26,11 @@ export default function contribute(server: PluginServerContext) {
   // server/report.ts for how its errors are told apart from real ones.
   const reporter = createReporter(message => console.error("[auto-compact-for-claude]", message));
   const report = reporter.report;
+  // The one path every state save takes also feeds this, so screens hear about
+  // changes no matter which part of the plugin saved them.
+  const changes = createStateChanges();
   const scheduler = createScheduler({
-    store: createCachedStore(createStore()),
+    store: createCachedStore(createStore(), changes.saved),
     gateway: host.gateway,
     receipts: { remove: observer.removeReceipt, sweep: observer.sweepReceipts },
     settings: async () => {
@@ -88,6 +93,8 @@ export default function contribute(server: PluginServerContext) {
       }
     }),
     settings.subscribe(() => {
+      // Settings move no saved state, so the store cannot report the change.
+      changes.settingsChanged();
       void scheduler.tick(host.connected()).catch(report);
     }),
   ];
@@ -123,6 +130,11 @@ export default function contribute(server: PluginServerContext) {
     host.attach(paseo);
     return { operation: await scheduler.operation(operationId) };
   });
+  // A block body returns undefined: a returned promise would close the
+  // subscription as soon as it settled.
+  server.handle(stateChangedSubscription, (input, { push, signal }) => {
+    changes.subscribe(input, { push, signal });
+  });
   const timer = setInterval(() => {
     // Overlapping ticks are safe: state changes are serialized, the worker never
     // runs one operation twice, and a reservation phase re-checks fresh state.
@@ -134,6 +146,7 @@ export default function contribute(server: PluginServerContext) {
     reporter.dispose();
     clearInterval(timer);
     scheduler.stop();
+    changes.stop();
     host.stop();
     // A settings subscription may end asynchronously, after the reporter is
     // disposed; a defect in it is still logged.
