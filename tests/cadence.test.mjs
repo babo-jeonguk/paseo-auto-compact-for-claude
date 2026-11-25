@@ -48,11 +48,14 @@ test("an operation that is never found stops being looked up after 30 seconds", 
   assert.equal(lookup(30_000), false);
 });
 
-test("the conversation list reads again at the safety interval only while its subscription is not live", () => {
+test("the conversation list reads again at the safety interval only while its subscription is not live or its last read failed", () => {
   // A live subscription refreshes the list on every change; without one it has nothing else.
-  assert.equal(listPollDelay({ live: true, active: true }), false);
-  assert.equal(listPollDelay({ live: false, active: true }), SESSION_POLL_MS);
-  assert.equal(listPollDelay({ live: false, active: false }), false);
+  assert.equal(listPollDelay({ live: true, active: true, failed: false }), false);
+  assert.equal(listPollDelay({ live: false, active: true, failed: false }), SESSION_POLL_MS);
+  assert.equal(listPollDelay({ live: false, active: false, failed: false }), false);
+  // A read that failed after the change that asked for it would otherwise stay failed until the next change.
+  assert.equal(listPollDelay({ live: true, active: true, failed: true }), SESSION_POLL_MS);
+  assert.equal(listPollDelay({ live: true, active: false, failed: true }), false);
 });
 
 test("a countdown above one minute next changes at its minute boundary", () => {

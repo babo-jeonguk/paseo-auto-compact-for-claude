@@ -54,3 +54,30 @@ test("a change heard while a screen's first read is in flight reads again after 
   assert.equal(reads, 2);
   assert.equal(client.getQueryData(listKey("h")), "after the change");
 });
+
+test("several changes heard during one read lead to one more read after it, not one each", async (t) => {
+  const scope = cleanupScope(t);
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  scope.defer(() => client.clear());
+  let reads = 0;
+  let secondStarted, releaseSecond;
+  const started = new Promise(resolve => { secondStarted = resolve; });
+  const queryFn = () => {
+    reads++;
+    if (reads !== 2) return Promise.resolve(`read ${reads}`);
+    secondStarted();
+    return new Promise(resolve => { releaseSecond = () => resolve("read 2"); });
+  };
+  const observer = new QueryObserver(client, { queryKey: listKey("h"), queryFn });
+  const first = new Promise(resolve => { scope.defer(observer.subscribe(result => { if (result.data) resolve(); })); });
+  await first;
+  const view = { hostId: "h" };
+  const refreshes = [refetchChanged(client, changedQueries(event("a"), view))];
+  await started;
+  // The plugin's request cannot be stopped once sent, so the reads must not overlap.
+  for (const agentId of ["a", "b", null]) refreshes.push(refetchChanged(client, changedQueries(event(agentId), view)));
+  releaseSecond();
+  await Promise.all(refreshes);
+  assert.equal(reads, 3);
+  assert.equal(client.getQueryData(listKey("h")), "read 3");
+});
