@@ -81,3 +81,38 @@ test("several changes heard during one read lead to one more read after it, not 
   assert.equal(reads, 3);
   assert.equal(client.getQueryData(listKey("h")), "read 3");
 });
+
+// Without its own wait, the operation's read would wait for the held status
+// read, which only the operation's read releases; the timeout ends that.
+test("a change reads each of a conversation's queries again when its own read ends, not when another's does", { timeout: 5_000 }, async (t) => {
+  const scope = cleanupScope(t);
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  scope.defer(() => client.clear());
+  const order = [];
+  let statusReads = 0, operationReads = 0, releaseStatus;
+  const statusFn = () => {
+    statusReads++;
+    order.push(`status ${statusReads}`);
+    if (statusReads !== 2) return Promise.resolve(`status ${statusReads}`);
+    return new Promise(resolve => { releaseStatus = () => resolve("status 2"); });
+  };
+  const operationFn = () => {
+    operationReads++;
+    order.push(`operation ${operationReads}`);
+    // The operation read after the change ends the slow status read.
+    if (operationReads === 2) releaseStatus();
+    return Promise.resolve(`operation ${operationReads}`);
+  };
+  const mounted = (queryKey, queryFn) => {
+    const observer = new QueryObserver(client, { queryKey, queryFn });
+    return new Promise(resolve => { scope.defer(observer.subscribe(result => { if (result.data) resolve(observer); })); });
+  };
+  const status = await mounted(sessionKey("h", "a"), statusFn);
+  await mounted(operationKey("h", "a", "op"), operationFn);
+  // A slow status read is in flight when the operation's result is saved.
+  const slow = status.refetch();
+  assert.equal(client.isFetching({ queryKey: sessionKey("h", "a"), exact: true }), 1);
+  await refetchChanged(client, changedQueries(event("a"), { hostId: "h", agentId: "a" }));
+  await slow;
+  assert.deepEqual(order, ["status 1", "operation 1", "status 2", "operation 2", "status 3"]);
+});
