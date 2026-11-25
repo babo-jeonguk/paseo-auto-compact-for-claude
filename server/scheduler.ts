@@ -128,10 +128,10 @@ export function createScheduler(options: {
   const now = options.now ?? Date.now;
   // What a stopped scheduler's pass meets is its stopping, not a fault.
   const onError = (error: unknown) => { if (live()) options.onError?.(error); };
-  const host = options.receipts;
-  const receipts: OperationReceipts | undefined = host && {
-    remove: (agentId, operationId) => wait(begin(() => host.remove(agentId, operationId))),
-    sweep: (retained, cutoff) => wait(begin(() => host.sweep(retained, cutoff))),
+  const receiptFiles = options.receipts;
+  const receipts: OperationReceipts | undefined = receiptFiles && {
+    remove: (agentId, operationId) => wait(begin(() => receiptFiles.remove(agentId, operationId))),
+    sweep: (retained, cutoff) => wait(begin(() => receiptFiles.sweep(retained, cutoff))),
   };
   let tail: Promise<unknown> = Promise.resolve();
   let nextCleanupAt = -Infinity;

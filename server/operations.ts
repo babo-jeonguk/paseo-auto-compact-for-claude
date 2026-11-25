@@ -91,11 +91,11 @@ export function createOperationWorker(options: {
   const owner = randomUUID();
   // The worker's one lifetime, which stop() ends. Every await of a run waits on
   // it — reads, state transactions, the dispatch call — as the gateway's waits
-  // take the gateway's signal. Every side effect (a state write, a report, a
+  // take the gateway's signal, and a read starts only while it lasts. Every side effect (a state write, a report, a
   // native request's release, a retry's wake-up, and a send, which the gateway
   // asks `current()` about) goes through an owner below.
   const lifetime = createLifetime(timers);
-  const { live, wait } = lifetime;
+  const { live, wait, begin } = lifetime;
   // State writes: a stopped worker's transaction changes nothing and fails,
   // checked when it runs, since the queue can hold it past stop(); the caller's
   // wait on it also ends at once.
@@ -170,7 +170,7 @@ export function createOperationWorker(options: {
   async function reconcile(connected = true) {
     lastConnected = connected;
     let state: State;
-    try { state = await wait(store.read()); }
+    try { state = await wait(begin(() => store.read())); }
     catch (error) { return onError(error); }
     const started: Promise<void>[] = [];
     for (const candidate of state.operations.filter(operationPending)) {
@@ -210,7 +210,7 @@ export function createOperationWorker(options: {
       if (operation.evidence?.dispatchStartedAt !== undefined) {
         let result: CompactOutcome | null = null;
         if (gateway.inspect && (connected || operation.evidence?.boundary)) {
-          try { result = await wait(gateway.inspect(operation), INSPECT_TIMEOUT_MS); }
+          try { result = await wait(begin(() => gateway.inspect!(operation)), INSPECT_TIMEOUT_MS); }
           catch (error) { onError(error); }
         }
         if (result) return await finish(operation.id, result);
@@ -221,14 +221,14 @@ export function createOperationWorker(options: {
       // Sending must start by this time; observation then has its own deadline.
       const sendBy = operation.sendBy!;
       if (expiredUnsent(operation)) return await finish(operation.id, "expired");
-      const read = <T>(work: Promise<T>) => readWithin(work, sendBy, now(), timers, lifetime.signal);
+      const read = <T>(work: () => Promise<T>) => readWithin(begin(work), sendBy, now(), timers, lifetime.signal);
       // Reading nothing is not evidence of change: an unreadable host, observer
       // or setting is thrown as a fault and retried; only a reading that shows a
       // change ends the attempt.
-      const [agent, config] = await Promise.all([read(gateway.refresh(operation.agentId)).then(readable), read(settings())]);
+      const [agent, config] = await Promise.all([read(() => gateway.refresh(operation.agentId)).then(readable), read(() => settings())]);
       if (!config) throw new Error("Compact settings could not be read");
       const allowed = async () => {
-        const [latest, state] = await Promise.all([read(settings()), read(store.read())]);
+        const [latest, state] = await Promise.all([read(() => settings()), read(() => store.read())]);
         if (!latest) throw new Error("Compact settings could not be read");
         return !!agent && operation.reservationEndedAt !== undefined &&
           now() <= (operation.deliveryExpiresAt ?? Infinity) &&
@@ -263,7 +263,7 @@ export function createOperationWorker(options: {
         ? gateway.automatic!(agent, { expiresAt: Math.min(operation.deliveryExpiresAt ?? Infinity, sendBy), allowed }, execution)
         : gateway.compact(agent.agentId, agent, execution));
       if (outcome.status === "unknown") {
-        const saved = (await wait(store.read())).operations.find(entry => entry.id === operation.id);
+        const saved = (await wait(begin(() => store.read()))).operations.find(entry => entry.id === operation.id);
         if (saved?.evidence?.dispatchStartedAt !== undefined && !saved.evidence.invalidated && now() < deadlineOf(saved))
           return; // Ambiguous delivery continues through evidence reconciliation.
       }
