@@ -163,7 +163,9 @@ export function createScheduler(options: {
   };
   let planStartedAt = 0;
   let hostWork: Promise<unknown> = Promise.resolve();
-  let hostTimer: unknown;
+  // The single-flight timer. Its handle is recorded even when the timers return
+  // none, so an armed timer is always cleared.
+  let hostTimer: { handle: unknown } | undefined;
   type Plan = { full: boolean; attention: boolean; agentIds: Set<string> };
   const newPlan = (): Plan => ({ full: false, attention: false, agentIds: new Set() });
   let pending: { plan: Plan; promise: Promise<void>; resolve(): void; reject(error: unknown): void } | null = null;
@@ -245,7 +247,7 @@ export function createScheduler(options: {
     if (failures.length) throw failures[0];
   }
   function release() {
-    if (hostTimer !== undefined) { timers.clearTimeout(hostTimer); hostTimer = undefined; }
+    if (hostTimer) { timers.clearTimeout(hostTimer.handle); hostTimer = undefined; }
     observing = false;
     const next = pending;
     pending = null;
@@ -260,8 +262,8 @@ export function createScheduler(options: {
     let released = false;
     const once = () => { if (released) return; released = true; release(); };
     hostWork.then(once, once);
-    hostTimer = timers.setTimeout(once,
-      Math.max(0, planStartedAt + FULL_SCAN_INTERVAL_MS - now()));
+    hostTimer = { handle: timers.setTimeout(once,
+      Math.max(0, planStartedAt + FULL_SCAN_INTERVAL_MS - now())) };
   }
   function start(plan: Plan) {
     observing = true;
@@ -608,7 +610,6 @@ export function createScheduler(options: {
     idle: worker.idle,
     stop() {
       lifetime.end();
-      if (hostTimer !== undefined) { timers.clearTimeout(hostTimer); hostTimer = undefined; }
       release();
       worker.stop();
     },
