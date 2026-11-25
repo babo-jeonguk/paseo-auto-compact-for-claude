@@ -718,23 +718,22 @@ test('a request left prepared causes at most one refusal, whatever commands and 
 });
 
 test('another preparation of the same operation is checked on its own', async () => {
-  for (const [first, second] of [[{ preparation: 'first' }, { preparation: 'second' }],
-    [{ preparedAt: 1_000_000 }, { preparedAt: 1_000_001 }]]) {
-    const f = fixture(); await f.start(); await f.ordinary();
-    f.request({ expiresAt: 0, ...first });
-    assert.match((await f.compact()).text, /expired/i);
-    f.request(second);
-    await f.compact(async () => {
-      await f.event('classic.PreCompact', { trigger: 'manual' });
-      await f.event('classic.PostCompact');
-    });
-    const compact = f.ledger().compact;
-    assert.equal(compact.id, 'operation-1', `${JSON.stringify(second)}: admitted as the plugin's request`);
-    assert.equal(compact.status, 'completed');
-    const receipt = JSON.parse(f.files.get('/receipts/operation-1.json'));
-    assert.equal(receipt.status, 'completed');
-    assert.equal(receipt.preparation, second.preparation, 'the receipt names the preparation it settles, if any');
-  }
+  // An earlier server's requests name no preparation and are told apart by
+  // their operation ID only, as the earlier observer did.
+  const f = fixture(); await f.start(); await f.ordinary();
+  f.request({ expiresAt: 0, preparation: 'first' });
+  assert.match((await f.compact()).text, /expired/i);
+  f.request({ preparation: 'second' });
+  await f.compact(async () => {
+    await f.event('classic.PreCompact', { trigger: 'manual' });
+    await f.event('classic.PostCompact');
+  });
+  const compact = f.ledger().compact;
+  assert.equal(compact.id, 'operation-1', "admitted as the plugin's request");
+  assert.equal(compact.status, 'completed');
+  const receipt = JSON.parse(f.files.get('/receipts/operation-1.json'));
+  assert.equal(receipt.status, 'completed');
+  assert.equal(receipt.preparation, 'second', 'the receipt names the preparation it settles');
 });
 
 test('the next generation of a launch remembers which preparation was already checked', async () => {

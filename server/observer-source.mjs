@@ -7,12 +7,11 @@ let lastReceiptValue = null;
 // Paseo can restart Claude's query inside the same launch, so a new observer
 // generation reads this once from the ledger to remember what the previous one
 // already checked; it is reset in registerObserver.
-let carriedOver;
-// One identity per preparation of a request. Requests from earlier releases
-// and cancelled records carry no preparation, so their id and prepared time
-// stand in for one.
+let checkedPreparationRestored;
+// One identity per preparation of a request. A request from an earlier server
+// names no preparation, and the earlier observer matched it by its operation ID.
 const preparationKey = request => typeof request?.preparation === 'string'
-  ? request.preparation : `${request.id}@${request.preparedAt}`;
+  ? request.preparation : request.id;
 // The /compact whose context reset is being read after the command returned.
 // Input submitted then does not refill the context; the next model request does.
 let confirming = null;
@@ -28,23 +27,23 @@ const HEARTBEAT_MS = 5_000;
 const QUERY_RESTARTED_REFUSAL = 'query_restarted';
 const QUERY_RESTARTED_REASON = 'Claude query restarted before compaction ran';
 // A new generation of the same launch (Paseo restarts Claude's query) must not
-// check a leftover preparation again, so it adopts the previous generation's
-// value. A missing, empty or unreadable ledger carries nothing over.
-async function carryOver($) {
-  carriedOver ??= (async () => {
+// check a leftover preparation again, so it restores the previous generation's
+// checked preparation. A missing, empty or unreadable ledger restores nothing.
+async function restoreCheckedPreparation($) {
+  checkedPreparationRestored ??= (async () => {
     try {
       const ledger = JSON.parse(await $.fs.read(configuration.ledger));
       if (ledger?.launchId === state.launchId && typeof ledger.checkedPreparation === 'string')
         state.checkedPreparation = ledger.checkedPreparation;
     } catch {
-      // Nothing to carry over.
+      // Nothing to restore.
     }
   })();
-  return carriedOver;
+  return checkedPreparationRestored;
 }
 async function save($) {
   // The first save of a generation must not erase what the previous one checked.
-  await carryOver($);
+  await restoreCheckedPreparation($);
   const now = await $.clock.now();
   if (state.updatedAt && now < state.updatedAt - CLOCK_STEP_TOLERANCE_MS) {
     state.cacheRequest = null;
@@ -94,8 +93,8 @@ async function cachePolicy($) {
 }
 
 async function admit($, trigger) {
-  // Adopt what the previous generation of this launch already checked before deciding.
-  await carryOver($);
+  // Restore what the previous generation of this launch already checked before deciding.
+  await restoreCheckedPreparation($);
   let request;
   try { request = JSON.parse(await $.fs.read(configuration.request)); } catch { /* a missing or half-written request is no request */ }
   const key = request ? preparationKey(request) : null;
@@ -106,7 +105,9 @@ async function admit($, trigger) {
   if (request?.status === 'cancelled' && request.id && trigger !== 'auto' &&
       state.checkedPreparation !== key) {
     state.checkedPreparation = key;
-    state.compact = { id: request.id, status: 'failed', revision: state.revision, reason: 'Reservation cancelled' };
+    state.compact = { id: request.id,
+      ...(typeof request.preparation === 'string' ? { preparation: request.preparation } : {}),
+      status: 'failed', revision: state.revision, reason: 'Reservation cancelled' };
     await save($);
     return 'Auto Compact cancelled its pending /compact. Run /compact again to compact manually.';
   }
@@ -216,7 +217,7 @@ export function registerObserver(on, config) {
   configuration = config;
   writes = Promise.resolve();
   lastReceiptValue = null;
-  carriedOver = null;
+  checkedPreparationRestored = null;
   confirming = null;
   state = {
     version: 1, launchId: configuration.launchId, generation: crypto.randomUUID(),

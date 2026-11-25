@@ -121,11 +121,11 @@ export function createOperationWorker(options: {
   // Reports: what a stopped worker's run meets is its stopping, not a fault.
   const onError = (error: unknown) => { if (live()) options.onError(error); };
   // Retiring a finished operation's native request. A stopped worker starts no
-  // retirement, since one it started would not be ordered with the next
-  // instance's writes; the request stays prepared, as after a crash at this
-  // point. A release that fails or outlasts its wait is not reported either:
-  // the operation has already ended, and a request it leaves prepared is
-  // checked like any other at the next /compact (docs/runtime.md).
+  // retirement, because its durable writes have closed (the plugin's stop closes
+  // them first); a request left prepared is retired by the next instance's
+  // startup recovery, and until then the observer checks at most one /compact
+  // against it. A release that fails or outlasts its wait is not reported
+  // either: the operation has already ended (docs/runtime.md).
   const release = async (operation: StoredOperation) => {
     if (live() && operation.evidence?.native && gateway.release)
       await wait(gateway.release(operation), INSPECT_TIMEOUT_MS).catch(() => {});

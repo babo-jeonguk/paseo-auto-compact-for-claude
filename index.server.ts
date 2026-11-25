@@ -4,7 +4,7 @@ import { createScheduler, TICK_INTERVAL_MS } from "./server/scheduler";
 import { createCachedStore, createStore } from "./server/store";
 import { createStateChanges } from "./server/state-changes";
 import { createObserver } from "./server/observer";
-import { createDurableWrites } from "./server/durable";
+import { createDurableWrites, type DurableFiles } from "./server/durable";
 import { createReporter } from "./server/report";
 import { claudeProvider } from "./shared/providers";
 import {
@@ -19,10 +19,11 @@ import {
 } from "./shared/rpc";
 import { compactSettings } from "./shared/settings";
 
-export default function contribute(server: PluginServerContext) {
+// Paseo passes only the server; tests hold file steps through `files`.
+export default function contribute(server: PluginServerContext, options: { files?: DurableFiles } = {}) {
   const settings = server.registerSettings(compactSettings);
   // One lifetime for every durable write: the state store and the observer.
-  const writes = createDurableWrites();
+  const writes = createDurableWrites(options.files);
   const observer = createObserver({ writes });
   const host = createGateway({ observer });
   // Work cut off by shutdown recovers from durable state on next start; see

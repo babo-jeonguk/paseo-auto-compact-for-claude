@@ -308,14 +308,7 @@ export function createScheduler(options: {
     }
     await store.write(state);
     await cleanup();
-    // Retire requests an earlier instance left prepared, before the worker's
-    // first pass; a stopped scheduler starts none.
-    if (gateway.recover) {
-      try {
-        await wait(begin(() => gateway.recover!(request =>
-          leftoverRetirement(request, state.operations.find(operation => operation.id === request.id)))));
-      } catch (error) { onError(error); }
-    }
+    return state;
   }
   async function cleanup() {
     if (!receipts) return;
@@ -341,7 +334,19 @@ export function createScheduler(options: {
       return result;
     }),
   });
-  const ready = serialize(recover);
+  // Retire requests an earlier instance left prepared, decided against the
+  // operations the startup transaction just saved. It runs outside the state
+  // queue and does not hold `ready`: a request file held at the file system
+  // must not hold every later state change, and a stop ends the wait. It may
+  // run alongside the worker's first pass, which is safe because the observer
+  // leaves this instance's own preparations alone and serializes every write of
+  // a request file. Each failure is reported on its own.
+  const ready = serialize(recover).then(state => {
+    if (!gateway.recover) return;
+    void wait(begin(() => gateway.recover!(
+      request => leftoverRetirement(request, state.operations.find(operation => operation.id === request.id)),
+      onError))).catch(onError);
+  });
 
   async function view(
     agent: Observation,

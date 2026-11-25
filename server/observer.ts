@@ -48,22 +48,37 @@ const ReceiptSchema = z.object({
   preparation: z.string().optional(),
   prepared: PreparedIdentitySchema.nullable().optional(),
 });
+// request.json as its retirement paths read it: the empty placeholder session
+// open writes, a prepared request, and a retired one.
+const RequestSchema = z.object({
+  id: z.string().optional(), preparation: z.string().optional(), status: z.string().optional(),
+}).passthrough();
+// The one reader of request.json. A file that is not one of ours throws, so no
+// retirement rewrites it; only a missing file is absence.
+const readRequest = async (path: string) =>
+  RequestSchema.parse(JSON.parse(await readFile(path, 'utf8')));
 type NativeRecord = {
   id: string | null; launchId: string; generation: string; sessionId: string | null;
   revision: number; status: 'running' | 'completed' | 'failed' | 'unknown'; reason?: string | null;
   refusal?: string | null; preparation?: string;
   prepared?: z.infer<typeof PreparedIdentitySchema> | null;
 };
+// A record and a request or evidence belong to the same preparation unless both
+// name a preparation and the two differ. A record or evidence naming none, from
+// an earlier release or a rollback, is matched by the operation ID alone.
+function samePreparation(recordPreparation: string | undefined, attribution: string | undefined) {
+  return recordPreparation === undefined || attribution === undefined ||
+    recordPreparation === attribution;
+}
 // One rule for both durable receipts and live ledger polls: a record settles
 // `operation` when it comes from the exact prepared observer identity and
 // revision, or when a newer generation in the same launch and Claude session
 // explicitly refused that exact prepared request because the query restarted.
-// Completion always requires the exact prepared identity. A record that names
-// another preparation of the operation settles nothing: that was a different
-// request, however it ended.
+// Completion always requires the exact prepared identity. A record of another
+// preparation settles nothing: that was a different request, however it ended.
 function matchNativeRecord(record: NativeRecord, operation: NativeOperation) {
   if (record.id !== operation.id || record.status === 'running') return null;
-  if (typeof record.preparation === 'string' && record.preparation !== operation.preparation) return null;
+  if (!samePreparation(record.preparation, operation.preparation)) return null;
   if (record.launchId === operation.launchId && record.generation === operation.generation &&
       record.sessionId === operation.sessionId && record.revision === operation.revision) {
     return { status: record.status, detail: record.reason ??
@@ -169,11 +184,11 @@ export function createObserver(options: { home?: string; now?: () => number; wri
   }
   // The record a retired request leaves: the identity it retired and its
   // outcome. A preparation is named only when the request had one.
-  const retiredRecord = (id: string, preparation: unknown, status: 'settled' | 'cancelled') =>
-    ({ id, ...(typeof preparation === 'string' ? { preparation } : {}), status });
+  const retiredRecord = (id: string, preparation: string | undefined, status: 'settled' | 'cancelled') =>
+    ({ id, ...(preparation !== undefined ? { preparation } : {}), status });
   // Settled requests must not intercept later ordinary/manual compaction. An
   // unobserved send remains cancelled so a late PreCompact cannot run it.
-  async function retiredStatus(directory: string, id: string, sent: boolean) {
+  async function retiredStatus(directory: string, id: string, preparation: string | undefined, sent: boolean) {
     // The ledger can be caught mid-write; then only a durable receipt can prove consumption.
     const ledger = await readFile(join(directory, 'ledger.json'), 'utf8')
       .then(text => LedgerSchema.safeParse(JSON.parse(text)))
@@ -183,10 +198,12 @@ export function createObserver(options: { home?: string; now?: () => number; wri
     const recorded = await readFile(join(directory, '..', 'receipts', receiptName(id)), 'utf8')
       .then(text => {
         const parsed = ReceiptSchema.safeParse(JSON.parse(text));
-        return parsed.success && parsed.data.id === id;
+        return parsed.success && parsed.data.id === id &&
+          samePreparation(parsed.data.preparation, preparation);
       })
       .catch(() => false);
-    const consumed = (ledger?.success && ledger.data.compact?.id === id) || recorded;
+    const consumed = (ledger?.success && ledger.data.compact?.id === id &&
+        samePreparation(ledger.data.compact.preparation, preparation)) || recorded;
     return !sent || consumed ? 'settled' as const : 'cancelled' as const;
   }
   // null means there is no usable observer: none launched, an incompatible,
@@ -261,13 +278,13 @@ export function createObserver(options: { home?: string; now?: () => number; wri
     // The read, the check and the write are one writer of this file, so they
     // cannot be split by a newer preparation landing in between.
     await writes.run(() => requestLock(path, async () => {
-      const request = JSON.parse(await readFile(path, 'utf8'));
-      if (!request || typeof request !== 'object' || request.id !== operation.id) return;
+      const request = await readRequest(path);
+      if (request.id !== operation.id) return;
       // Retire only the preparation this call is about; a retry's newer
       // preparation of the same operation is left alone.
-      if (operation.preparation !== undefined && request.preparation !== operation.preparation) return;
+      if (!samePreparation(request.preparation, operation.preparation)) return;
       await writes.replace(path, JSON.stringify(retiredRecord(operation.id, request.preparation,
-        await retiredStatus(operation.directory, operation.id, sent))));
+        await retiredStatus(operation.directory, operation.id, request.preparation, sent))));
     }));
   }
   return {
@@ -415,6 +432,8 @@ export function createObserver(options: { home?: string; now?: () => number; wri
           generation: ledger.generation, sessionId: ledger.sessionId }, operation);
       }
       if (ledger.compact?.id !== operation.id || ledger.compact.status === 'running') return null;
+      // A record of another preparation is no answer yet, whatever its revision.
+      if (!samePreparation(ledger.compact.preparation, operation.preparation)) return null;
       if (ledger.compact.revision !== operation.revision)
         return { status: 'unknown' as const, detail: 'Compaction receipt belongs to another activity revision' };
       return matchNativeRecord({ ...ledger.compact, launchId: ledger.launchId,
@@ -425,52 +444,49 @@ export function createObserver(options: { home?: string; now?: () => number; wri
     // recovered after a restart, may leave its native request prepared. Retire
     // it so that it can no longer claim a later /compact. A request this
     // instance prepared belongs to its own attempt and is left alone.
-    async recoverPrepared(decide: LeftoverDecision) {
-      const failures: unknown[] = [];
+    async recoverPrepared(decide: LeftoverDecision, report: (error: unknown) => void) {
       const parents = await readdir(base, { withFileTypes: true }).catch(error => {
         if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
         throw error;
       });
-      for (const entry of parents) {
-        if (!/^[a-f0-9]{64}$/.test(entry.name)) continue;
+      // Each conversation runs on its own: a held or unreadable request file
+      // neither holds another conversation's recovery nor has its failure
+      // reported as anybody else's.
+      await Promise.all(parents.map(async entry => {
+        if (!/^[a-f0-9]{64}$/.test(entry.name)) return;
         const parent = join(base, entry.name);
         try {
           // Never traverse a linked agent directory.
           const info = await lstat(parent);
-          if (!info.isDirectory() || info.isSymbolicLink()) continue;
+          if (!info.isDirectory() || info.isSymbolicLink()) return;
           const manifest = ManifestSchema.parse(JSON.parse(await readFile(join(parent, 'current.json'), 'utf8')));
           const directory = join(parent, manifest.launchId), path = join(directory, 'request.json');
           await writes.run(() => requestLock(path, async () => {
-            let request: { id?: unknown; preparation?: unknown; status?: unknown } | null;
+            let request: z.infer<typeof RequestSchema>;
             try {
-              request = JSON.parse(await readFile(path, 'utf8'));
+              request = await readRequest(path);
             } catch (error) {
               if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
               throw error;
             }
-            if (!request || typeof request !== 'object') return;
-            if (request.status !== 'prepared' || typeof request.id !== 'string') return;
-            if (typeof request.preparation === 'string' && preparations.has(request.preparation)) return;
+            if (request.status !== 'prepared' || request.id === undefined) return;
+            if (request.preparation !== undefined && preparations.has(request.preparation)) return;
             const decision = decide({ id: request.id,
-              ...(typeof request.preparation === 'string' ? { preparation: request.preparation } : {}) });
+              ...(request.preparation !== undefined ? { preparation: request.preparation } : {}) });
             if (decision === null) return;
             await writes.replace(path, JSON.stringify(retiredRecord(request.id, request.preparation,
-              await retiredStatus(directory, request.id, decision.sent))));
+              await retiredStatus(directory, request.id, request.preparation, decision.sent))));
           }));
         } catch (error) {
           // A missing manifest or launch is a conversation with nothing prepared.
-          if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
-          failures.push(error);
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+          report(error);
         }
-      }
-      // One conversation's failure does not keep the others' requests
-      // prepared; it is reported once the scan has ended.
-      if (failures.length === 1) throw failures[0];
-      if (failures.length > 1) throw new AggregateError(failures);
+      }));
     },
     async release(agentId: string, operation: Pick<NativeOperation, 'id' | 'launchId' | 'preparation'>, sent: boolean) {
       const directory = join(agentDirectory(agentId), operation.launchId);
-      const request = JSON.parse(await readFile(join(directory, 'request.json'), 'utf8'));
+      const request = await readRequest(join(directory, 'request.json'));
       if (request.id === operation.id && request.status === 'prepared')
         await cancel({ directory, id: operation.id, preparation: operation.preparation }, sent);
     },

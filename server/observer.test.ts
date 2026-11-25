@@ -91,7 +91,7 @@ const READABLE_BUILDS = ['f8a02403e4f6c17e010ddda4d0385109fe8c480dfc379c9bb91d30
   // main after the lint cleanup: why-comments and a named heartbeat only
   '4ab2a02a0d279eb0db390fa1462b83db78aa1dea74c8e12af7f07174eb7789b5',
   // main after per-preparation /compact checks (#35)
-  '46312549effb53d2a5dfa20fc47e4b1296195abfffa155612caf2a32659c44a1'];
+  '5a63cf937b60c41787f011a1384a22e8cabb02a67249d86b17f22fa6c1f2afe6'];
 
 test('the current observer build is listed, so the build it replaces stays checked', () => {
   assert(READABLE_BUILDS.includes(observerAsset.version),

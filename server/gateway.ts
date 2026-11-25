@@ -156,8 +156,10 @@ export function createGateway(options: {
         }
       },
       // Startup retires what an earlier instance left prepared, as the
-      // scheduler's leftover decision says.
-      recover: (decide: LeftoverDecision) => observer.recoverPrepared(decide),
+      // scheduler's leftover decision says; each conversation's failure is the
+      // scheduler's to report.
+      recover: async (decide: LeftoverDecision, report: (error: unknown) => void) =>
+        observer.recoverPrepared(decide, report),
     } : {}),
     compact: (id, expected, execution) => compact(id, expected, false, undefined, execution),
     async inspect(operation) {
@@ -335,11 +337,11 @@ export function createGateway(options: {
       }
       const cleanupMs = options.cleanupTimeoutMs ?? CLEANUP_TIMEOUT_MS;
       // A preparation that outlives the wait on it is still retired once it
-      // lands; the cleanup wait bounds waiting, it does not cancel the work.
-      // The turn ends with those writes, however late.
-      // When the plugin stops after dispatch, leave the prepared request intact
-      // so a restarting query can still attribute its refusal; the next instance's
-      // reconciliation retires it once the operation settles.
+      // lands while the plugin runs; the cleanup wait bounds waiting, it does
+      // not cancel the work. The turn ends with those writes, however late.
+      // Once the plugin's durable writes have closed (it stopped after dispatch),
+      // the retirement is refused and the next instance's startup recovery
+      // retires the request, so a restarting query can still attribute its refusal.
       const prepared = operation !== undefined ? Promise.resolve(operation) : preparing;
       const retire = prepared && !(sent && stopped)
         ? prepared.then(value => observer!.cancel(value, sent), () => undefined)

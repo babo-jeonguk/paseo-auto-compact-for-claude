@@ -146,5 +146,5 @@ export interface Gateway {
   /** Retire a finished operation's native request; best effort. */
   release?: (operation: StoredOperation) => Promise<void>;
   /** Retire native requests an earlier plugin instance left prepared, as `decide` says. */
-  recover?: (decide: LeftoverDecision) => Promise<void>;
+  recover?: (decide: LeftoverDecision, report: (error: unknown) => void) => Promise<void>;
 }
