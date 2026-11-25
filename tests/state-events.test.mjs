@@ -83,8 +83,8 @@ test("several changes heard during one read lead to one more read after it, not 
 });
 
 // Without its own wait, the operation's read would wait for the held status
-// read, which only the operation's read releases; the timeout ends that.
-test("a change reads each of a conversation's queries again when its own read ends, not when another's does", { timeout: 5_000 }, async (t) => {
+// read, which only the operation's read releases; the runner's bound ends that.
+test("a change reads each of a conversation's queries again when its own read ends, not when another's does", async (t) => {
   const scope = cleanupScope(t);
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   scope.defer(() => client.clear());
