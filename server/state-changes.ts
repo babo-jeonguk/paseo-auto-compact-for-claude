@@ -1,4 +1,5 @@
 import type { State, StoredOperation } from "./model";
+import { publicOperation } from "./operations";
 
 // JSON with object keys in sorted order, so two records with the same fields in
 // a different key order serialize alike. The store reads records from a file,
@@ -11,23 +12,14 @@ function canonical(value: unknown): string {
   });
 }
 
-// Only the fields a row renders. Worker progress (updatedAt, owner, attempt,
-// nextAttemptAt, evidence, sendBy, deliveryExpiresAt, reservationEndedAt,
-// inputFingerprint) moves while an operation is worked on and is not shown, so
-// saving it must not make a screen read again.
+// Every field the operation RPC returns is shown except updatedAt, which the
+// worker moves while an operation is worked on. The fields the store keeps only
+// for the worker are not in the projection at all, so saving them must not make
+// a screen read again.
 function shownOperation(operation: StoredOperation) {
-  return {
-    id: operation.id,
-    agentId: operation.agentId,
-    revision: operation.revision,
-    target: { sessionId: operation.target.sessionId, activityKey: operation.target.activityKey },
-    kind: operation.kind,
-    state: operation.state,
-    createdAt: operation.createdAt,
-    result: operation.result
-      ? { code: operation.result.code, message: operation.result.message }
-      : null,
-  };
+  const shown: Partial<ReturnType<typeof publicOperation>> = { ...publicOperation(operation) };
+  delete shown.updatedAt;
+  return shown;
 }
 
 function shown(state: State, agentId: string): string {
@@ -37,8 +29,8 @@ function shown(state: State, agentId: string): string {
     jobs: state.jobs.filter(job => job.agentId === agentId),
     operations: state.operations
       .filter(operation => operation.agentId === agentId)
-      .map(shownOperation)
-      .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)),
+      .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+      .map(shownOperation),
   });
 }
 

@@ -62,6 +62,12 @@ export function sessionPollDelay(input: { active: boolean; failures: number }): 
   return input.failures >= SESSION_BACKOFF_FAILURES ? SESSION_BACKOFF_MS : SESSION_POLL_MS;
 }
 
+// A live subscription refreshes the list on every change; without one the list has nothing else.
+export function listPollDelay(input: { live: boolean; active: boolean }): number | false {
+  if (input.live || !input.active) return false;
+  return SESSION_POLL_MS;
+}
+
 // Changes arrive through the subscription; this lookup only covers a surface
 // without one, at the status safety cadence, until a missing record is given up.
 export function operationPollDelay(input: {

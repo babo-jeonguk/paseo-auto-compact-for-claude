@@ -21,8 +21,10 @@ import {
 import { useQuery } from "@tanstack/react-query";
 import { compactSettings } from "../shared/settings";
 import { listRpc } from "../shared/rpc";
+import { listPollDelay } from "./cadence";
 import { formatTokenThreshold, listKey, parseTokenThreshold } from "./format";
 import { useStateChanges } from "./state-events";
+import { useSurfaceActive } from "./surface";
 
 function NumberSetting({
   label,
@@ -210,11 +212,13 @@ export function CompactSettingsScreen({ theme, host }: PluginSurfaceProps) {
   const settings = useSettings(compactSettings);
   const list = useRpc(listRpc);
   const toast = useToast();
+  const live = useStateChanges({ hostId: host.id });
+  const active = useSurfaceActive();
   const query = useQuery({
     queryKey: listKey(host.id),
     queryFn: () => list({}),
+    refetchInterval: () => listPollDelay({ live, active }),
   });
-  useStateChanges({ hostId: host.id });
   const providers = [...(query.data?.providers ?? [])].sort(
     (a, b) =>
       Number(b.id === "claude") - Number(a.id === "claude") ||
