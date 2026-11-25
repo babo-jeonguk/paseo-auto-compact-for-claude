@@ -70,6 +70,8 @@ npm run lint
 
 `npm test` and `test:focused` fail any unit test that runs longer than 60 seconds, so a broken wait fails instead of hanging. The product's waits run on injected timers that unit tests drive, so a unit test that starts no real process takes under a second. One that does (git, the scripts under test, the cleanup scope's own checks, one of which waits out a short runner bound) is bounded by its processes' own time limits; the rest of the bound is room for slow CI runners. A test stopped at the bound skips its own `finally` but still runs its `t.after()` hooks, which is why cleanup is registered with the test's cleanup scope, whose one hook releases everything the test acquired. A real timer such a test leaves running keeps the process alive after the failure is printed, until that timer ends or, for one that repeats, the CI job's time limit.
 
+Both scripts load TypeScript through `tests/support/loader.mjs`, which turns off tsx's compile cache. tsx writes that cache asynchronously inside the test process after compiling a file it has not seen, which `drained()` reports as pending work; with the cache off, the first run after an edit and every CI run behave like any other. `tests/loader.test.mjs` runs a `drained()` test on a fresh temp directory to keep it that way.
+
 After committing, use a disposable detached worktree for native validation. The runner records the exact commit and keeps results in `test-results/snapshots/<sha>-<timestamp>/`. Editing or pushing your original checkout does not change the files being tested.
 
 ```sh
