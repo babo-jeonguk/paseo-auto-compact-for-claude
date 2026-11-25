@@ -4,9 +4,15 @@ let state;
 let configuration;
 let writes = Promise.resolve();
 let lastReceiptValue = null;
-// A cancelled request blocks one late plugin /compact. Claude cannot tell that
-// command from the user's own, so later ones run as unrequested compaction.
-let consumedCancelId = null;
+// Paseo can restart Claude's query inside the same launch, so a new observer
+// generation reads this once from the ledger to remember what the previous one
+// already checked; it is reset in registerObserver.
+let carriedOver;
+// One identity per preparation of a request. Requests from earlier releases
+// and cancelled records carry no preparation, so their id and prepared time
+// stand in for one.
+const preparationKey = request => typeof request?.preparation === 'string'
+  ? request.preparation : `${request.id}@${request.preparedAt}`;
 // The /compact whose context reset is being read after the command returned.
 // Input submitted then does not refill the context; the next model request does.
 let confirming = null;
@@ -21,7 +27,24 @@ const HEARTBEAT_MS = 5_000;
 // Must equal QUERY_RESTARTED_REFUSAL in server/observer.ts.
 const QUERY_RESTARTED_REFUSAL = 'query_restarted';
 const QUERY_RESTARTED_REASON = 'Claude query restarted before compaction ran';
+// A new generation of the same launch (Paseo restarts Claude's query) must not
+// check a leftover preparation again, so it adopts the previous generation's
+// value. A missing, empty or unreadable ledger carries nothing over.
+async function carryOver($) {
+  carriedOver ??= (async () => {
+    try {
+      const ledger = JSON.parse(await $.fs.read(configuration.ledger));
+      if (ledger?.launchId === state.launchId && typeof ledger.checkedPreparation === 'string')
+        state.checkedPreparation = ledger.checkedPreparation;
+    } catch {
+      // Nothing to carry over.
+    }
+  })();
+  return carriedOver;
+}
 async function save($) {
+  // The first save of a generation must not erase what the previous one checked.
+  await carryOver($);
   const now = await $.clock.now();
   if (state.updatedAt && now < state.updatedAt - CLOCK_STEP_TOLERANCE_MS) {
     state.cacheRequest = null;
@@ -38,6 +61,7 @@ async function save($) {
           sessionId: state.sessionId, revision: compact.revision, status: compact.status,
           reason: compact.reason ?? null, observedAt: compact.observedAt,
           ...(compact.refusal ? { refusal: compact.refusal } : {}),
+          ...(typeof compact.preparation === 'string' ? { preparation: compact.preparation } : {}),
           ...(compact.prepared ? { prepared: compact.prepared } : {}) }) } : null;
   writes = writes.catch(() => {}).then(async () => {
     // A receipt survives later activity and launch pruning. Partial reads are
@@ -70,13 +94,18 @@ async function cachePolicy($) {
 }
 
 async function admit($, trigger) {
+  // Adopt what the previous generation of this launch already checked before deciding.
+  await carryOver($);
   let request;
   try { request = JSON.parse(await $.fs.read(configuration.request)); } catch { /* a missing or half-written request is no request */ }
+  const key = request ? preparationKey(request) : null;
   const now = await $.clock.now();
   // Unrequested/manual/CLI compaction is observed but cannot complete an
   // automatic operation. The host also pins the public send's message/turn id.
-  if (request?.status === 'cancelled' && request.id && trigger !== 'auto' && consumedCancelId !== request.id) {
-    consumedCancelId = request.id;
+  // A leftover request must refuse at most once, so one preparation is checked once.
+  if (request?.status === 'cancelled' && request.id && trigger !== 'auto' &&
+      state.checkedPreparation !== key) {
+    state.checkedPreparation = key;
     state.compact = { id: request.id, status: 'failed', revision: state.revision, reason: 'Reservation cancelled' };
     await save($);
     return 'Auto Compact cancelled its pending /compact. Run /compact again to compact manually.';
@@ -84,7 +113,8 @@ async function admit($, trigger) {
   let reason = null;
   let refusal = null;
   let prepared = null;
-  if (!request || request.status !== 'prepared' || trigger === 'auto' || state.compact?.id === request.id)
+  if (!request || request.status !== 'prepared' || trigger === 'auto' ||
+      state.checkedPreparation === key)
     state.compact = { id: null, status: 'running', revision: state.revision };
   else {
     // Paseo can restart Claude's query inside the same launch and resumed
@@ -110,8 +140,10 @@ async function admit($, trigger) {
     else if (request.requireCache && (request.clockEpoch !== state.clockEpoch ||
         !Number.isFinite(request.cacheDeadline) || now >= request.cacheDeadline - 30_000))
       reason = 'Cache window passed';
-    state.compact = { id: request.id, status: reason ? 'failed' : 'running',
-      revision: state.revision, reason,
+    state.checkedPreparation = key;
+    state.compact = { id: request.id,
+      ...(typeof request.preparation === 'string' ? { preparation: request.preparation } : {}),
+      status: reason ? 'failed' : 'running', revision: state.revision, reason,
       ...(refusal ? { refusal, prepared } : {}) };
   }
   state.cacheRequest = null;
@@ -184,13 +216,18 @@ export function registerObserver(on, config) {
   configuration = config;
   writes = Promise.resolve();
   lastReceiptValue = null;
-  consumedCancelId = null;
+  carriedOver = null;
   confirming = null;
   state = {
     version: 1, launchId: configuration.launchId, generation: crypto.randomUUID(),
     sessionId: null, updatedAt: 0, revision: 0, activeTurns: [], pendingInputs: 0,
     ordinaryEndedAt: null, ordinaryRevision: null, cacheRequest: null, transcriptPath: null,
     compact: null, closed: false, clockEpoch: 0,
+    // A cancelled request blocks one late plugin /compact. Claude cannot tell
+    // that command from the user's own, so later ones run as unrequested
+    // compaction. This names the last preparation any /compact was checked
+    // against, so each one is refused (or admitted) at most once.
+    checkedPreparation: null,
   };
   let heartbeat;
   let requestStartedAt = null;

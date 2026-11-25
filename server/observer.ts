@@ -87,8 +87,12 @@ const ManifestSchema = z.object({ launchId: z.string().uuid(), build: z.string()
 const MAX_FILE_BYTES = 32_768;
 // The input-counting, command-guard, cancellation, clock-step and restart-refusal
 // fixes keep the same ledger and reservation contract, as do comment-only edits.
+// The per-preparation check keeps that contract too: its new checkedPreparation
+// ledger field is additive, so older readers ignore it.
 // Keep already-open sessions observable until reopen.
 const compatibleBuilds = new Set([observerAsset.version,
+  // main before per-preparation checks (#35)
+  '4ab2a02a0d279eb0db390fa1462b83db78aa1dea74c8e12af7f07174eb7789b5',
   'f8a02403e4f6c17e010ddda4d0385109fe8c480dfc379c9bb91d309671f87c7a',
   '61a0e12639e417cd28f7a651c789c00e10606bf994d960276f1916914eb3e6d4',
   'af6c6639f8c3058a73d5e982e308b69f5572fc6439a0c8fea61c1ca629ef4239',
