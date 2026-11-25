@@ -2,6 +2,20 @@
 
 Rules for reviewing a change in this repository. Each one is a judgement call; cite it by its heading.
 
+## Anti-patterns
+
+Code or test shapes that AI spreads and that overfit, fragment, or hide defects. Review checks these first—any "yes" is a finding (details in the linked heading):
+
+1. **Overfits one environment or example?** Branches on local OS, version strings, observed wording/timing, or a narrower condition than the contract allows ([General path first](#general-path-first), [Host compatibility by capability](#host-compatibility-by-capability)).
+2. **Stacks a parallel path or duplicates a rule?** Bolts a sibling path, ad-hoc guard, or copied rule onto existing code instead of generalizing it, or leaks format-compatibility branches past the read boundary ([One rule, one place](#one-rule-one-place), [General path first](#general-path-first), [Durable state stays compatible](#durable-state-stays-compatible)).
+3. **Hides a failure or proves too little?** Swallows errors without reason, resends irreversible work, sleeps or counts loop turns, or tests only one narrow example a special-case guard can pass ([Never send twice](#never-send-twice), [Errors are classified](#errors-are-classified), [Tests](#tests)).
+4. **Mixes decisions with ambient effects or leaks resources?** Reads real time/host state in decision logic, uses global timers in server or unit tests, or leaves cleanup outside the cleanup scope ([Decisions apart from effects](#decisions-apart-from-effects), [Named timings](#named-timings), [Tests](#tests)).
+5. **Drifts from the contract?** Changes behavior without updating `docs/runtime.md`, or claims more than code and tests establish ([Documentation tiers](#documentation-tiers)).
+
+Allowed (not anti-patterns): an isolated side path for a verified OS/host difference on top of a working general path, with a comment explaining why; a capability check for a feature newer than 0.16.2 with a working fallback; one-place normalization of older formats or observer builds at the read boundary; boundary fault injection and observation spies that check inputs; fail-closed handling when an outcome cannot be proven.
+
+Review fixes follow the same bar: remove the cause or ad-hoc guard instead of layering another exception branch.
+
 ## Documentation tiers
 
 - `README.md` and `OVERVIEW.md` are for users and the registry listing: what the plugin does, how to install, use, update and remove it, its controls and settings, and what data it touches. Timing internals, event ordering, races and recovery rules there are a finding.
@@ -42,7 +56,7 @@ The plugin requires Paseo 0.16.2, and SDK 0.16.2 is the compile-time contract. W
 
 ## General path first
 
-Make code work in the general case, then add special handling on top. Do not depend on one OS, path form, exact wording or timing, and do not fail everything when an optional signal is missing: keep a reservation with a stated assumption rather than blocking the feature.
+Make the general path work first; add an isolated side path on top only for a verified OS or host difference, with a comment explaining why. When extending behavior, generalize the existing model and update affected callers rather than bolting on a parallel path. Keep legacy-format and compatibility normalization at the schema or read boundary instead of branching through inner logic. Do not depend on one OS, path form, exact wording or timing, and do not fail everything when an optional signal is missing: keep a reservation with a stated assumption rather than blocking the feature.
 
 ## Tests
 
