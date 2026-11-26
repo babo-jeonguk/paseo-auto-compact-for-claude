@@ -37,7 +37,8 @@ const contextMock = 'A unit test mocks through its test context (t.mock), which 
 const cleanupInFinally = 'A test stopped at the runner\'s bound never reaches its finally, so what acquires something ' +
   'that would outlive the test (a timer, process, server or temporary folder) registers its release with the test\'s ' +
   'cleanup scope (tests/support/scope.ts) as it acquires it; the runner still runs the scope\'s hook. A finally ' +
-  'that must still wait says why it is safe in a disable comment (CODING_STANDARDS.md "Tests").';
+  'never waits: what must happen at the end of a test, however it ends, is a release registered with the cleanup ' +
+  'scope (CODING_STANDARDS.md "Tests").';
 const temporaryFolder = 'A unit test creates a temporary folder through its cleanup scope (folder() in ' +
   'tests/support/scope.ts), which registers the removal in the same call, so no step between creating the folder ' +
   'and registering its removal can leak it (CODING_STANDARDS.md "Tests").';

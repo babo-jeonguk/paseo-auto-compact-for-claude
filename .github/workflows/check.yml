@@ -27,19 +27,8 @@ jobs:
       - run: npm ci --ignore-scripts
       - if: matrix.paseo-sdk != '0.16.2'
         run: npm install --ignore-scripts --no-save --package-lock=false @getpaseo/client@${{ matrix.paseo-sdk }} @getpaseo/plugin@${{ matrix.paseo-sdk }} @getpaseo/protocol@${{ matrix.paseo-sdk }}
+      # check ends with lint, which reads the types of the SDK installed above.
       - run: npm run check
-  lint:
-    # Lint does not depend on the OS or the Paseo SDK under test, so it runs once.
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: npm
-      - run: npm ci --ignore-scripts
-      - run: npm run lint
   simulation:
     strategy:
       fail-fast: false

@@ -16,7 +16,7 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint --max-warnings 0 . && echo ESLint found no problems",
     "test": "node --import ./tests/support/loader.mjs --test --test-isolation=none --test-timeout=60000 server/*.test.ts scripts/*.test.ts tests/*.test.mjs",
-    "check": "npm run check:observer && npm run typecheck && npm test",
+    "check": "npm run check:observer && npm run typecheck && npm test && npm run lint",
     "prepack": "npm run build:observer && npm run check",
     "build:observer": "node scripts/build-observer.mjs",
     "check:observer": "node scripts/build-observer.mjs --check",

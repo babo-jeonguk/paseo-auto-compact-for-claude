@@ -14,7 +14,7 @@ npm run test:update
 
 In Windows PowerShell, `npm.cmd run test:update` also works when execution policy blocks `npm.ps1`. Run with **Windows Node** to test Windows; WSL Node tests Linux. The runner records `process.platform`, architecture, OS release, Node/Claude/Paseo versions and product source hashes.
 
-The update command runs observer consistency, type checks and the fast regression suite. After committing, run `npm run test:release` for those checks and the full native matrix on an isolated snapshot with Paseo **0.16.2** and **0.17.1**. Install the pinned native tools once with `npm ci --prefix tests/simulation --ignore-scripts`. This needs network access and can take several minutes; later runs reuse them. Nothing is installed globally and no Claude login is required.
+The update command runs observer consistency, type checks, the fast regression suite and lint. After committing, run `npm run test:release` for those checks and the full native matrix on an isolated snapshot with Paseo **0.16.2** and **0.17.1**. Install the pinned native tools once with `npm ci --prefix tests/simulation --ignore-scripts`. This needs network access and can take several minutes; later runs reuse them. Nothing is installed globally and no Claude login is required.
 
 ## What is real and what is simulated
 
