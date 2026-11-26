@@ -230,6 +230,48 @@ const serverRealTimeRules = [globalTimeout, {
   message: serverRealTime,
 }];
 
+// A TypeScript directive, read with TypeScript's own grammar (singleLinePragmaRegEx
+// and commentDirectiveRegEx* in typescript/lib/typescript.js): the check and
+// nocheck pragmas belong to a line comment, and TypeScript lowercases their
+// name and reads it whole; the ignore and expect-error directives are read as
+// written at the start of a line comment or of a block comment's last line.
+// typescript-eslint's ban-ts-comment reads the pragmas case-sensitively and by
+// prefix, so it passes `// @TS-NOCHECK` and rejects `// @ts-checked by ...`.
+const pragma = /^\/\/\/?\s*@([^\s:]+)(?:[\s:]|$)/;
+const lineDirective = /^\/\/\/?\s*@(ts-expect-error|ts-ignore)/;
+const blockDirective = /^(?:\/|\*)*\s*@(ts-expect-error|ts-ignore)/;
+const typescriptDirective = (comment) => {
+  if (comment.type === "Line") {
+    const name = pragma.exec(`//${comment.value}`)?.[1].toLowerCase();
+    if (name === "ts-check" || name === "ts-nocheck") return name;
+    return lineDirective.exec(`//${comment.value}`)?.[1];
+  }
+  const lastLine = `/*${comment.value}`.split(/\r\n?|[\n\u2028\u2029]/).at(-1).trimStart();
+  return blockDirective.exec(lastLine)?.[1];
+};
+const directives = {
+  rules: {
+    "typescript-directive": {
+      meta: {
+        type: "problem",
+        schema: [],
+        messages: {
+          directive: 'A TypeScript directive ("@{{name}}") hides a type error instead of fixing it, with or ' +
+            'without a description: fix the type or the code (CODING_STANDARDS.md "Comments say why").',
+        },
+      },
+      create: (context) => ({
+        Program() {
+          for (const comment of context.sourceCode.getAllComments()) {
+            const name = typescriptDirective(comment);
+            if (name) context.report({ loc: comment.loc, messageId: "directive", data: { name } });
+          }
+        },
+      }),
+    },
+  },
+};
+
 // The selectors of each group of files, listed once so a boundary below takes
 // the same list less the one rule it is the boundary for.
 const testSupportSyntax = [...unitTestRules, ...sharedMockTimersRules];
@@ -246,13 +288,13 @@ export const projectRules = [
     // effect and is reported as a warning, which fails lint; a file that is the
     // boundary for a rule is an entry here that names the standard it
     // implements. A TypeScript directive hides a type error instead of fixing
-    // it, so none is allowed, with or without a description.
+    // it, so none is allowed, with or without a description; the directive rule
+    // above replaces ban-ts-comment, which misreads the pragmas.
     linterOptions: { noInlineConfig: true },
-    plugins: { "@typescript-eslint": tseslint.plugin },
+    plugins: { "@typescript-eslint": tseslint.plugin, directives },
     rules: {
-      "@typescript-eslint/ban-ts-comment": ["error", {
-        "ts-check": true, "ts-expect-error": true, "ts-ignore": true, "ts-nocheck": true,
-      }],
+      "@typescript-eslint/ban-ts-comment": "off",
+      "directives/typescript-directive": "error",
     },
   },
   {
