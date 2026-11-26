@@ -12,10 +12,12 @@ const findings = (file, code) => linter.verify(code, config, file).map(({ messag
   assert(!fatal, message);
   return message;
 });
-const flags = (file, code, standard) => {
+// The sample reports exactly one finding per expected pattern.
+const flags = (file, code, ...expected) => {
   const messages = findings(file, code);
-  assert.equal(messages.length, 1, `${file}: ${code}\n${messages.join('\n')}`);
-  assert.match(messages[0], standard);
+  const shown = `${file}: ${code}\n${messages.join('\n')}`;
+  assert.equal(messages.length, expected.length, shown);
+  for (const pattern of expected) assert(messages.some(message => pattern.test(message)), shown);
 };
 const passes = (file, code) => assert.deepEqual(findings(file, code), [], `${file}: ${code}`);
 
@@ -400,35 +402,38 @@ test('the cleanup scope may start only a delayed global setTimeout', () => {
 test('a directive comment has no effect and is reported', () => {
   const noEffect = /has no effect because you have 'noInlineConfig'/;
   const serverTime = /CODING_STANDARDS\.md "Decisions apart from effects"/;
-  const reports = (file, code, ...expected) => {
-    const messages = findings(file, code);
-    assert.equal(messages.length, expected.length, `${file}: ${code}\n${messages.join('\n')}`);
-    for (const pattern of expected) assert(messages.some(message => pattern.test(message)), `${file}: ${code}\n${messages.join('\n')}`);
-  };
   for (const code of [
     '// eslint-disable-next-line no-restricted-syntax -- the one real timer\nsetTimeout(fire, POLL_MS);',
     'setTimeout(fire, POLL_MS); // eslint-disable-line no-restricted-syntax',
     '/* eslint-disable no-restricted-syntax */\nsetTimeout(fire, POLL_MS);',
     '/* eslint-disable */\nsetTimeout(fire, POLL_MS);',
     '/* eslint no-restricted-syntax: off */\nsetTimeout(fire, POLL_MS);',
-  ]) reports('server/a.ts', code, noEffect, serverTime);
-  reports('tests/a.test.mjs', '// eslint-disable-next-line no-restricted-syntax\nsetTimeout(resolve, 50);', noEffect, /CODING_STANDARDS\.md "Tests"/);
+  ]) flags('server/a.ts', code, noEffect, serverTime);
+  flags('tests/a.test.mjs', '// eslint-disable-next-line no-restricted-syntax\nsetTimeout(resolve, 50);', noEffect, /CODING_STANDARDS\.md "Tests"/);
   for (const file of ['server/a.ts', 'tests/a.test.mjs', 'scripts/a.mjs'])
-    reports(file, '/* global fire */\nfire();', noEffect);
+    flags(file, '/* global fire */\nfire();', noEffect);
 });
 
 // A TypeScript directive hides a type error rather than fixing it, so none is
-// allowed, with or without a description.
+// allowed, with or without a description, in any spelling TypeScript reads as
+// one: it reads @ts-check and @ts-nocheck in any case.
 test('every TypeScript directive is rejected', () => {
-  for (const code of [
-    '// @ts-ignore\nconst a: number = "1";',
-    '// @ts-expect-error\nconst a: number = "1";',
-    '// @ts-expect-error: the host types lag behind its replies\nconst a: number = "1";',
-    '/* @ts-expect-error */ const a: number = "1";',
-    '// @ts-nocheck\nconst a = 1;',
-    '// @ts-check\nconst a = 1;',
-  ]) flags('server/a.ts', code, /"@ts-(ignore|expect-error|nocheck|check)"/);
-  flags('tests/a.test.mjs', '// @ts-check\nconst a = 1;', /"@ts-check"/);
+  const directive = /TypeScript directive[^]*CODING_STANDARDS\.md "Comments say why"/;
+  for (const file of ['server/a.ts', 'tests/a.test.mjs']) {
+    for (const code of [
+      '// @ts-ignore\nconst a = reply.count;',
+      '//@ts-ignore because the reply is untyped\nconst a = reply.count;',
+      '// @ts-expect-error\nconst a = reply.count;',
+      '// @ts-expect-error: the host types lag behind its replies\nconst a = reply.count;',
+      '/* @ts-expect-error */ const a = reply.count;',
+      '/**\n * The reply is untyped.\n * @ts-ignore */\nconst a = reply.count;',
+      '// @ts-nocheck\nconst a = 1;',
+      '// @TS-NOCHECK\nconst a = 1;',
+      '/// @Ts-NoCheck: the host types lag\nconst a = 1;',
+      '// @ts-check\nconst a = 1;',
+      '// @TS-CHECK\nconst a = 1;',
+    ]) flags(file, code, directive);
+  }
 });
 
 test('ordinary comments are not directives', () => {
@@ -438,6 +443,8 @@ test('ordinary comments are not directives', () => {
       '/** The one real timer the scope keeps; eslint reads its boundary from the configuration. */\nconst a = 1;',
       '// global state lives in the store\nconst a = 1;',
       '/* A ts-expect-error pragma would hide the type error here. */\nconst a = 1;',
+      '// @ts-checked by the compiler on every build\nconst a = 1;',
+      '/* @ts-nocheck is read only from a line comment */\nconst a = 1;',
     ]) passes(file, code);
   }
 });
