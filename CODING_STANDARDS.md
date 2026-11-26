@@ -24,7 +24,7 @@ Review fixes follow the same bar: remove the cause or ad-hoc guard instead of la
 
 ## One rule, one place
 
-A rule lives in the module that owns it, and every caller asks that module. The automatic compaction policy is in `server/policy.ts`, which both the scheduler and the worker call; deadlines and timeouts are in `server/deadline.ts`; client polling cadences are in `client/cadence.ts`. A copy of a rule, or a second constant with the same meaning, is a finding.
+A rule lives in the module that owns it, and every caller asks that module. The automatic compaction policy is in `server/policy.ts`, which both the scheduler and the worker call; deadlines and timeouts are in `server/deadline.ts`; client polling cadences are in `client/cadence.ts`. Work that must run one at a time goes through the serial queue in `server/queue.ts`, and work in flight that must later be waited for through the task group in `server/group.ts`; both hand each caller its own work's outcome. A hand-written promise chain or set of settled copies in their place is a copy of that rule. A copy of a rule, or a second constant with the same meaning, is a finding.
 
 ## Named timings
 
