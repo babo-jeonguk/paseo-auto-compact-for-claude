@@ -4,7 +4,7 @@ import { finishedState, operationRowStatus, operationPending, type CompactOperat
 import { Refusal, readable, samePreparation, unchanged, type CompactOutcome, type Gateway, type LeftoverRequest,
   type State, type StateStore, type StoredOperation } from "./model";
 import type { Settings } from "../shared/settings";
-import { createLifetime, deadlineOf, INSPECT_TIMEOUT_MS, OBSERVATION_MS, readWithin, Stopped, systemTimers,
+import { createLifetime, DeadlineExceeded, deadlineOf, INSPECT_TIMEOUT_MS, OBSERVATION_MS, readWithin, Stopped, systemTimers,
   type Timers } from "./deadline";
 import { automaticBlock } from "./policy";
 
@@ -106,20 +106,23 @@ export function createOperationWorker(options: {
   const { store, gateway, settings, now } = options;
   const timers = options.timers ?? systemTimers;
   const owner = randomUUID();
+  // Reports: a stopped worker's run can still meet a fault of work it already
+  // issued; the reporter keeps the stop itself quiet.
+  const onError = (error: unknown) => options.onError(error);
   // The worker's one lifetime, which stop() ends. Every await of a run waits on
   // it — reads, state transactions, the dispatch call — as the gateway's waits
-  // take the gateway's signal, and a read starts only while it lasts. Every side effect (a state write, a report, a
-  // native request's release, a retry's wake-up, and a send, which the gateway
-  // asks `current()` about) goes through an owner below.
+  // take the gateway's signal, and a read starts only while it lasts. Every
+  // side effect (a state write, a native request's release, a retry's wake-up,
+  // and a send, which the gateway asks `current()` about) is fenced while it
+  // lasts; a report is not, since a fault of work already issued still matters.
   const lifetime = createLifetime(timers, error => onError(error));
   const { live, wait, begin } = lifetime;
   // State writes: a stopped worker's transaction changes nothing and fails,
   // checked when it runs, since the queue can hold it past stop(); the caller's
-  // wait on it also ends at once.
-  const update = <T>(change: (state: State) => T) =>
-    wait(options.update(state => { if (!live()) throw new Stopped(); return change(state); }));
-  // Reports: what a stopped worker's run meets is its stopping, not a fault.
-  const onError = (error: unknown) => { if (live()) options.onError(error); };
+  // wait on it also ends at once. A run passes its own owner for a rejection
+  // that arrives after that wait ended.
+  const update = <T>(change: (state: State) => T, owner: (error: unknown) => void = onError) =>
+    wait(options.update(state => { if (!live()) throw new Stopped(); return change(state); }), Infinity, owner);
   // Retiring a finished operation's native request. A stopped worker starts no
   // retirement, because its durable writes have closed (the plugin's stop closes
   // them first); a request left prepared is retired by the next instance's
@@ -132,8 +135,9 @@ export function createOperationWorker(options: {
   };
   // Outcomes whose terminal write failed; they are written again, never re-earned.
   const outcomes = new Map<string, Ending>();
-  // The last fault of work being retried; reported only if the work expires.
-  const faults = new Map<string, unknown>();
+  // The faults of work being retried, reported only if the request expires:
+  // the diagnostic first, then whatever joined it.
+  const faults = new Map<string, unknown[]>();
   let lastConnected = true;
   // Runs this worker has in flight, keyed by operation, so a second reconcile
   // never starts the same operation twice.
@@ -153,18 +157,20 @@ export function createOperationWorker(options: {
   // Sending must start by sendBy, and automatic work within its delivery window.
   const expiredUnsent = (operation: StoredOperation) =>
     now() >= operation.sendBy! || now() > (operation.deliveryExpiresAt ?? Infinity);
-  async function finish(id: string, ending: Ending) {
+  async function finish(id: string, ending: Ending, owner: (error: unknown) => void = onError) {
     outcomes.set(id, ending);
     const finished = await update(state => {
       const operation = state.operations.find(entry => entry.id === id);
       if (!held(operation)) return null;
       settle(operation, ending);
       return structuredClone(operation);
-    });
+    }, owner);
     outcomes.delete(id);
     const fault = faults.get(id);
     faults.delete(id);
-    if (finished && ending === "expired" && fault !== undefined) onError(fault);
+    if (finished && ending === "expired" && fault?.length)
+      onError(fault.length === 1 ? fault[0]
+        : new AggregateError(fault, "Compaction request expired after these faults"));
     if (finished) await release(finished);
   }
   // One owner of this worker's retry wake-ups. A retry saved by a worker that
@@ -200,6 +206,17 @@ export function createOperationWorker(options: {
   }
   async function run(candidate: StoredOperation, connected: boolean) {
     let claimed: StoredOperation | undefined;
+    // A fault this attempt's work meets after a wait on it ended, or in its
+    // cleanup, joins the run while it is going; after it ended, it is reported
+    // at once. A refusal is a condition the run classifies itself; the reporter
+    // keeps the plugin's own stop quiet.
+    let ended = false;
+    const joined: unknown[] = [];
+    const late = (error: unknown) => {
+      if (error instanceof Refusal) return;
+      if (ended) onError(error);
+      else joined.push(error);
+    };
     try {
       if (!outcomes.has(candidate.id) && now() < (candidate.nextAttemptAt ?? 0) && now() < deadlineOf(candidate)) return;
       // Expiry and retained local outcomes can progress even before host attach.
@@ -219,26 +236,26 @@ export function createOperationWorker(options: {
           current.attempt = (current.attempt ?? 0) + 1;
         }
         return structuredClone(current);
-      });
+      }, late);
       if (!operation) return;
       claimed = operation;
       const remembered = outcomes.get(operation.id);
-      if (remembered) return await finish(operation.id, remembered);
+      if (remembered) return await finish(operation.id, remembered, late);
       if (operation.evidence?.dispatchStartedAt !== undefined) {
         let result: CompactOutcome | null = null;
         if (gateway.inspect && (connected || operation.evidence?.boundary)) {
-          try { result = await wait(begin(() => gateway.inspect!(operation)), INSPECT_TIMEOUT_MS); }
+          try { result = await wait(begin(() => gateway.inspect!(operation)), INSPECT_TIMEOUT_MS, late); }
           catch (error) { onError(error); }
         }
-        if (result) return await finish(operation.id, result);
+        if (result) return await finish(operation.id, result, late);
         if (now() >= deadlineOf(operation)) return await finish(operation.id,
-          { status: "unknown", detail: "Compaction deadline passed without matching completion evidence; no automatic retry" });
+          { status: "unknown", detail: "Compaction deadline passed without matching completion evidence; no automatic retry" }, late);
         return;
       }
       // Sending must start by this time; observation then has its own deadline.
       const sendBy = operation.sendBy!;
-      if (expiredUnsent(operation)) return await finish(operation.id, "expired");
-      const read = <T>(work: () => Promise<T>) => readWithin(begin(work), sendBy, now(), timers, onError, lifetime.signal);
+      if (expiredUnsent(operation)) return await finish(operation.id, "expired", late);
+      const read = <T>(work: () => Promise<T>) => readWithin(begin(work), sendBy, now(), timers, late, lifetime.signal);
       // Reading nothing is not evidence of change: an unreadable host, observer
       // or setting is thrown as a fault and retried; only a reading that shows a
       // change ends the attempt.
@@ -255,14 +272,14 @@ export function createOperationWorker(options: {
       if (!agent?.eligible || !agent.idle || !unchanged(operation, agent) ||
           (operation.kind === "automatic" && (!gateway.automatic || !await allowed())))
         return await finish(operation.id,
-          { status: "failed", detail: "Session, activity or policy changed before dispatch" });
+          { status: "failed", detail: "Session, activity or policy changed before dispatch" }, late);
       let observeUntil: number | null = null;
       const execution = {
         id: operation.id, sendBy: sendBy,
         // The gateway asks this right before sending and again at the dispatch
         // marker, so a stopped worker sends nothing.
         current: () => live() && now() < (observeUntil ?? sendBy),
-        fault: (_error: unknown) => { throw new Error("not implemented"); },
+        fault: late,
         checkpoint: async (evidence: NonNullable<StoredOperation["evidence"]>) => {
           await update(state => {
             const current = state.operations.find(entry => entry.id === operation.id);
@@ -272,20 +289,20 @@ export function createOperationWorker(options: {
               invalidated: !!current.evidence?.invalidated || !!evidence.invalidated };
             if (current.evidence.dispatchStartedAt !== undefined) current.state = "observing";
             current.updatedAt = now();
-          });
+          }, late);
           if (evidence.dispatchStartedAt !== undefined) observeUntil = evidence.dispatchStartedAt + OBSERVATION_MS;
         },
       };
       // Before the dispatch marker the gateway throws instead; see below.
       const outcome = await wait(operation.kind === "automatic"
         ? gateway.automatic!(agent, { expiresAt: Math.min(operation.deliveryExpiresAt ?? Infinity, sendBy), allowed }, execution)
-        : gateway.compact(agent.agentId, agent, execution));
+        : gateway.compact(agent.agentId, agent, execution), Infinity, late);
       if (outcome.status === "unknown") {
-        const saved = (await wait(begin(() => store.read()))).operations.find(entry => entry.id === operation.id);
+        const saved = (await wait(begin(() => store.read()), Infinity, late)).operations.find(entry => entry.id === operation.id);
         if (saved?.evidence?.dispatchStartedAt !== undefined && !saved.evidence.invalidated && now() < deadlineOf(saved))
           return; // Ambiguous delivery continues through evidence reconciliation.
       }
-      await finish(operation.id, outcome);
+      await finish(operation.id, outcome, late);
     } catch (error) {
       // The one place an error before the dispatch marker is classified. A
       // refusal ends the attempt with nothing sent. A fault keeps the durable
@@ -293,7 +310,20 @@ export function createOperationWorker(options: {
       // only the fault that ends it is reported. The decision is made on the
       // stored record, never on the copy taken at claim: work whose marker was
       // written during this run is not ours to expire, and is never resent.
-      if (!claimed || outcomes.has(claimed.id)) return onError(error);
+      // A deadline or stop that ended a wait on the attempt's work is replaced
+      // by the fault that work handed over: it explains why the attempt failed.
+      const bound = (fault: unknown) => fault instanceof DeadlineExceeded || fault instanceof Stopped;
+      const cause = bound(error) ? joined.findIndex(fault => !bound(fault)) : -1;
+      const diagnostic = cause < 0 ? error : joined[cause];
+      const beside = joined.filter((_fault, index) => index !== cause);
+      // The faults beside the diagnostic can no longer end the request, but
+      // dropping them would hide a defect of work this run issued.
+      const report = () => {
+        joined.length = 0;
+        onError(diagnostic);
+        for (const fault of beside) onError(fault);
+      };
+      if (!claimed || outcomes.has(claimed.id)) return report();
       const id = claimed.id;
       try {
         const next = await update(state => {
@@ -309,14 +339,24 @@ export function createOperationWorker(options: {
           delete current.owner;
           current.updatedAt = now();
           return delay;
-        });
-        if (next === "not-classified") return onError(error);
-        if (next === "refused") return await finish(id, { status: "failed", detail: (error as Refusal).message });
-        faults.set(id, error);
-        if (next === "expired") return await finish(id, "expired");
+        }, late);
+        if (next === "not-classified") return report();
+        // A refusal is not a fault, but a fault that joined it still is.
+        if (next === "refused") return await finish(id, { status: "failed", detail: (error as Refusal).message }, late);
+        // The faults of work being retried stay with its record: they are
+        // reported if the request expires, and never again by this run.
+        faults.set(id, [diagnostic, ...beside]);
+        joined.length = 0;
+        if (next === "expired") return await finish(id, "expired", late);
         // This operation wakes itself for its retry; other conversations keep running.
         armRetry(id, next);
       } catch (writeError) { onError(writeError); }
+    } finally {
+      ended = true;
+      // A fault handed over while the run was going that did not become its
+      // stored diagnostic can no longer end the request, but dropping it would
+      // hide a defect of work this run issued.
+      for (const fault of joined.splice(0)) onError(fault);
     }
   }
   return { reconcile, stop() {

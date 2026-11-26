@@ -4,7 +4,7 @@ import { Refusal, readable, targetOf, unchanged, type Gateway, type Observation,
   type LeftoverDecision, type OperationEvidence, type StoredOperation } from "./model";
 import type { createObserver } from "./observer";
 import { bounded, CLEANUP_TIMEOUT_MS, deadlineOf, LIVE_OBSERVATION_MS, observationEndBy, pause, readWithin, SEND_DEADLINE_MS,
-  SEND_TIMEOUT_MS, systemTimers, type Timers } from "./deadline";
+  SEND_TIMEOUT_MS, Stopped, systemTimers, type Timers } from "./deadline";
 import { claudeProvider } from "../shared/providers";
 import { SESSION_RESUME_REQUIRED } from "../shared/rpc";
 export { claudeProvider } from "../shared/providers";
@@ -258,8 +258,10 @@ export function createGateway(options: {
       });
       await read(subscription.ready);
       const current = readable(await read(gateway.refresh(agentId)));
-      // Running out of time or being stopped is not a reading of the session.
-      if (!currentWorker() || now() > startBy) throw new Error("Send deadline passed or worker stopped before send");
+      // Running out of time is a fault the worker retries until the send
+      // deadline; before then, a worker that is no longer current has stopped.
+      if (now() > startBy || now() >= deadline) throw new Error("Send deadline passed before send");
+      if (stopped || !execution.current()) throw new Stopped();
       if (!current?.idle || !unchanged({ revision: before.revision, target: targetOf(before) }, current) ||
           (guard && !await read(guard.allowed())))
         throw new Refusal("Reservation cancelled or session changed before send");

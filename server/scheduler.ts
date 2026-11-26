@@ -126,8 +126,9 @@ export function createScheduler(options: {
   const settings = () => wait(begin(() => options.settings()), INSPECT_TIMEOUT_MS);
   const refresh = (id: string) => wait(begin(() => gateway.refresh(id)), INSPECT_TIMEOUT_MS);
   const now = options.now ?? Date.now;
-  // What a stopped scheduler's pass meets is its stopping, not a fault.
-  const onError = (error: unknown) => { if (live()) options.onError?.(error); };
+  // The reporter keeps the stop itself quiet, but work issued before it can
+  // still fail after stop, and that failure is a defect.
+  const onError = (error: unknown) => { options.onError?.(error); };
   const receiptFiles = options.receipts;
   const receipts: OperationReceipts | undefined = receiptFiles && {
     remove: (agentId, operationId) => wait(begin(() => receiptFiles.remove(agentId, operationId))),
