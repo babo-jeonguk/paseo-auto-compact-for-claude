@@ -1,4 +1,3 @@
-import comments from "@eslint-community/eslint-plugin-eslint-comments/configs";
 import js from "@eslint/js";
 import { defineConfig, globalIgnores } from "eslint/config";
 import globals from "globals";
@@ -241,6 +240,21 @@ const without = (rules, boundary) => rules.filter(rule => rule !== boundary);
 // boundary entry comes after its group's.
 export const projectRules = [
   {
+    // A comment never turns a rule off. With inline configuration off, a
+    // directive (eslint-disable, /* eslint ... */, /* global ... */) has no
+    // effect and is reported as a warning, which fails lint; a file that is the
+    // boundary for a rule is an entry here that names the standard it
+    // implements. A TypeScript directive hides a type error instead of fixing
+    // it, so none is allowed, with or without a description.
+    linterOptions: { noInlineConfig: true },
+    plugins: { "@typescript-eslint": tseslint.plugin },
+    rules: {
+      "@typescript-eslint/ban-ts-comment": ["error", {
+        "ts-check": true, "ts-expect-error": true, "ts-ignore": true, "ts-nocheck": true,
+      }],
+    },
+  },
+  {
     files: unitTests,
     ignores: testSupport,
     rules: { "no-restricted-syntax": ["error", ...unitTestRules, ...mockTimersRules, ...ownTimerFakeRules, ...turnWaitRules, ...scopeRules] },
@@ -280,13 +294,6 @@ export default defineConfig([
     // Generated from server/observer-source.mjs, which is linted instead.
     "server/observer-assets.generated.ts",
   ]),
-  {
-    // A disable comment says why, and one that no longer suppresses anything
-    // is an error so it cannot outlive its reason.
-    linterOptions: { reportUnusedDisableDirectives: "error", reportUnusedInlineConfigs: "error" },
-  },
-  comments.recommended,
-  { rules: { "@eslint-community/eslint-comments/require-description": "error" } },
   js.configs.recommended,
   tseslint.configs.recommended,
   { languageOptions: { globals: globals.node } },

@@ -33,7 +33,6 @@
     "test:simulation:0.17": "node --no-maglev tests/simulation/run.mjs --paseo 0.17.1"
   },
   "devDependencies": {
-    "@eslint-community/eslint-plugin-eslint-comments": "^4.8.1",
     "@eslint/js": "^10.0.1",
     "@getpaseo/client": "0.16.2",
     "@getpaseo/plugin": "0.16.2",
