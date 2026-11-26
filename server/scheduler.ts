@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { createLifetime, INSPECT_TIMEOUT_MS, SEND_DEADLINE_MS, Stopped, systemTimers, type Timers } from "./deadline";
+import { createLifetime, DeadlineExceeded, INSPECT_TIMEOUT_MS, SEND_DEADLINE_MS, Stopped, systemTimers,
+  type Timers } from "./deadline";
 import type { Settings } from "../shared/settings";
 import { knownBlockedReason, operationPending, operationRowStatus, SESSION_RESUME_REQUIRED, type Blocked, type BlockedReason,
   type CompactTarget, type Row } from "../shared/rpc";
@@ -9,6 +10,8 @@ import { createOperationWorker, leftoverRetirement, recoverOperations, inputFing
   publicOperation, sameActivity, syncJobs } from "./operations";
 import { automaticBlock, dueAt, DELIVERY_WINDOW_MS } from "./policy";
 import { HISTORY_RETENTION_MS, HISTORY_SWEEP_INTERVAL_MS, pruneOperationHistory, type OperationReceipts } from "./retention";
+import { createGroup } from "./group";
+import { createQueue } from "./queue";
 
 const jobTarget = (job: { sessionId?: string | null; activityKey?: string | null }): CompactTarget =>
   ({ sessionId: job.sessionId ?? null, activityKey: job.activityKey ?? null });
@@ -107,8 +110,7 @@ export function createScheduler(options: {
   // work, and that I/O starts only while it lasts. Every side effect goes
   // through one owner that does nothing once it has ended: state writes
   // (`store`), reports (`onError`), receipt removals and sweeps (`receipts`),
-  // the single-flight timer (`finish`) and submissions to the worker, whose
-  // own lifetime ends with this one.
+  // and submissions to the worker, whose own lifetime ends with this one.
   const lifetime = createLifetime(timers, error => onError(error));
   const { live, wait, begin } = lifetime;
   // Every write passes through syncJobs, the only writer of jobs' attempt fields.
@@ -134,18 +136,13 @@ export function createScheduler(options: {
     remove: (agentId, operationId) => wait(begin(() => receiptFiles.remove(agentId, operationId))),
     sweep: (retained, cutoff) => wait(begin(() => receiptFiles.sweep(retained, cutoff))),
   };
-  let tail: Promise<unknown> = Promise.resolve();
+  const queue = createQueue();
   let nextCleanupAt = -Infinity;
   // The state queue. A transaction's caller waits on the lifetime, so one
   // queued behind a held transaction ends at once on stop; the queue itself
   // follows the transaction, whose reads and writes then refuse.
-  const serialize = <T>(fn: () => Promise<T>): Promise<T> => {
-    const result = tail.then(fn);
-    tail = result.catch(() => {});
-    return wait(result);
-  };
+  const serialize = <T>(fn: () => Promise<T>): Promise<T> => wait(queue.run(fn));
   let nextFullScanAt = -Infinity;
-  let observing = false;
   // Reads run outside the state transaction, so order observations by when they
   // were read: the newest read wins per conversation. A restart clears this
   // because no read survives one.
@@ -162,14 +159,11 @@ export function createScheduler(options: {
   const fence = (agentId: string, seq: number) => {
     if (seq > (latestRead.get(agentId) ?? 0)) latestRead.set(agentId, seq);
   };
-  let planStartedAt = 0;
-  let hostWork: Promise<unknown> = Promise.resolve();
-  // The single-flight timer. Its handle is recorded even when the timers return
-  // none, so an armed timer is always cleared.
-  let hostTimer: { handle: unknown } | undefined;
   type Plan = { full: boolean; attention: boolean; agentIds: Set<string> };
   const newPlan = (): Plan => ({ full: false, attention: false, agentIds: new Set() });
-  let pending: { plan: Plan; promise: Promise<void>; resolve(): void; reject(error: unknown): void } | null = null;
+  type Flight = { group: ReturnType<typeof createGroup>; startedAt: number };
+  let flight: Flight | null = null;
+  let pending: { plan: Plan; promise: Promise<void> } | null = null;
   const observedTurns = (entries: ReadonlyArray<{ agent: Observation; endedAt: number; seq?: number }>) =>
     serialize(async () => {
       const state = await store.read();
@@ -194,28 +188,31 @@ export function createScheduler(options: {
     target.attention ||= source.attention;
     for (const id of source.agentIds) target.agentIds.add(id);
   };
-  async function runPlan(plan: Plan) {
+  async function runPlan(plan: Plan, group: ReturnType<typeof createGroup>) {
     const seq = ++reads;
-    // A read starts when the host call starts, so this records each observation
-    // there: the raw read holds single-flight, and its wait is bounded from then.
-    const started: Promise<Observation | null>[] = [];
     const waits: Promise<Observation | null>[] = [];
     const failures: unknown[] = [];
-    const track = (observation: Promise<Observation | null>) => {
-      started.push(observation);
-      const bound = wait(observation, INSPECT_TIMEOUT_MS);
-      bound.catch((reason) => { failures.push(reason); });
-      waits.push(bound);
+    // Failures available when the pass completes are delivered with it; one that
+    // arrives later goes to the error owner as it arrives.
+    let completed = false;
+    const fail = (error: unknown) => {
+      if (completed) onError(error);
+      else failures.push(error);
     };
+    // Each observation is handled at handover: its bounded wait keeps the raw
+    // read in the group until it ends, and its failure joins this pass.
+    const observe = (observation: Promise<Observation | null>) => {
+      waits.push(wait(group.track(observation), INSPECT_TIMEOUT_MS).catch((error: unknown) => {
+        fail(error);
+        return null;
+      }));
+    };
+    let listed = true;
     if (plan.full) {
-      const listing = begin(() => gateway.list(track));
-      // A listing page that fails or times out fails the whole scan, but reads
-      // started on any page still hold single-flight until they settle.
-      hostWork = (async () => {
-        await listing.catch(() => {});
-        await Promise.allSettled(started);
-      })();
-      await wait(listing, INSPECT_TIMEOUT_MS);
+      // A listing page that fails or times out records nothing of this scan, but
+      // observations it already handed over still deliver their failures.
+      try { await wait(group.track(begin(() => gateway.list(observe))), INSPECT_TIMEOUT_MS); }
+      catch (error) { listed = false; fail(error); }
     } else {
       const ids = new Set(plan.agentIds);
       if (plan.attention) {
@@ -229,59 +226,62 @@ export function createScheduler(options: {
       if (ids.size === 0) return;
       // Paseo cannot list agents by ID, so conversations that need attention
       // are read one by one instead of paging the whole directory.
-      for (const id of ids) track(begin(() => gateway.refresh(id)));
-      hostWork = Promise.allSettled(started);
+      for (const id of ids) observe(begin(() => gateway.refresh(id)));
     }
-    // Each observation is bounded on its own, so one conversation's timeout
-    // does not hide another's result. Single-flight stays on the raw reads
-    // until every host read ends.
-    const results = await Promise.allSettled(waits);
-    const agents = results
-      .flatMap((result) => result.status === "fulfilled" && result.value ? [result.value] : []);
-    for (const agent of agents) fence(agent.agentId, seq);
-    const entries = agents
-      .filter((agent) => agent.activityKey && agent.observedEndedAt != null)
-      .map((agent) => ({ agent, endedAt: agent.observedEndedAt!, seq }));
-    if (entries.length) await observedTurns(entries);
-    // Record every successful observation before reporting the first failure or
-    // timeout.
-    if (failures.length) throw failures[0];
+    // Each observation is bounded on its own, so one conversation's timeout does
+    // not hide another's result. Only a successful listing records anything.
+    const agents = (await Promise.all(waits))
+      .filter((agent): agent is Observation => agent !== null);
+    if (listed) {
+      for (const agent of agents) fence(agent.agentId, seq);
+      const entries = agents.flatMap(agent =>
+        agent.activityKey && agent.observedEndedAt != null
+          ? [{ agent, endedAt: agent.observedEndedAt, seq }] : []);
+      try { if (entries.length) await observedTurns(entries); }
+      catch (error) { fail(error); }
+    }
+    completed = true;
+    if (failures.length) {
+      // A pass ended only by the plugin's own stop reports that stop; any other
+      // failure is delivered with the group, even beside a stop.
+      if (failures.every(failure => failure instanceof Stopped)) throw failures[0];
+      throw new AggregateError(failures, "Observation pass failed");
+    }
   }
-  function release() {
-    if (hostTimer) { timers.clearTimeout(hostTimer.handle); hostTimer = undefined; }
-    observing = false;
-    const next = pending;
-    pending = null;
-    if (!next) return;
-    start(next.plan).then(next.resolve, next.reject);
+  // One pass holds the conversation reads it started, and any raw host work
+  // they left behind, until it ends or a full scan interval passes.
+  function start(plan: Plan): Promise<void> {
+    const group = createGroup();
+    flight = { group, startedAt: now() };
+    return group.track(runPlan(plan, group));
   }
-  function finish() {
-    // A timed-out host read is not cancelled: keep single-flight until it ends,
-    // but never longer than a full scan interval. A stopped scheduler arms no
-    // timer for it.
-    if (!live()) return release();
-    let released = false;
-    const once = () => { if (released) return; released = true; release(); };
-    hostWork.then(once, once);
-    hostTimer = { handle: timers.setTimeout(once,
-      Math.max(0, planStartedAt + FULL_SCAN_INTERVAL_MS - now())) };
-  }
-  function start(plan: Plan) {
-    observing = true;
-    planStartedAt = now();
-    hostWork = Promise.resolve();
-    const run = runPlan(plan);
-    run.then(finish, finish);
-    return run;
+  const flying = () =>
+    flight !== null && live() && flight.group.busy() &&
+    now() < flight.startedAt + FULL_SCAN_INTERVAL_MS;
+  async function landed(last: Flight) {
+    try {
+      await wait(last.group.idle(), last.startedAt + FULL_SCAN_INTERVAL_MS - now());
+    } catch (error) {
+      // The bound's own end is the expected end of the hold; anything else is a
+      // defect of the pass.
+      if (!(error instanceof DeadlineExceeded || error instanceof Stopped)) throw error;
+    }
   }
   const observe = (scope: ObservationScope): Promise<void> => {
     const plan = planFor(scope);
-    if (!observing) return start(plan);
     if (pending) { mergePlan(pending.plan, plan); return pending.promise; }
-    let resolve!: () => void, reject!: (error: unknown) => void;
-    const promise = new Promise<void>((ok, fail) => { resolve = ok; reject = fail; });
-    pending = { plan, promise, resolve, reject };
-    return promise;
+    const last = flying() ? flight : null;
+    if (!last) return start(plan);
+    // The entry exists before the async body can read its plan after the wait.
+    const entry: { plan: Plan; promise: Promise<void> } = { plan, promise: Promise.resolve() };
+    entry.promise = (async () => {
+      // Whatever ends the hold, the next call starts or queues a pass of its own.
+      try { await landed(last); }
+      finally { pending = null; }
+      await start(entry.plan);
+    })();
+    pending = entry;
+    return entry.promise;
   };
   const due = (job: Job, config: Settings) => dueAt(job.endedAt, config);
   function reversibleSkip(
@@ -626,7 +626,6 @@ export function createScheduler(options: {
     idle: worker.idle,
     stop() {
       lifetime.end();
-      release();
       worker.stop();
     },
     // Hooks are queued, but the gateway marks own turns synchronously before calling this.
@@ -671,9 +670,21 @@ export function createScheduler(options: {
         serialize(() => store.read()),
         settings(),
         wait(begin(async () => {
-          const observations: Promise<Observation>[] = [];
-          await gateway.list((observation) => observations.push(observation));
-          return Promise.all(observations);
+          const observed: Promise<Observation | null>[] = [];
+          let incomplete = false;
+          await gateway.list((observation) => {
+            // Every observation defect reaches the reporter, even when a later
+            // page fails or hangs. An incomplete list still rejects so the
+            // screen keeps its Retry.
+            observed.push(observation.catch((error: unknown) => {
+              incomplete = true;
+              onError(error);
+              return null;
+            }));
+          });
+          const agents = await Promise.all(observed);
+          if (incomplete) throw new Error("Conversation list incomplete: an observation failed");
+          return agents.filter((agent): agent is Observation => agent !== null);
         }), INSPECT_TIMEOUT_MS),
       ]);
       return Promise.all(
