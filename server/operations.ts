@@ -111,7 +111,7 @@ export function createOperationWorker(options: {
   // take the gateway's signal, and a read starts only while it lasts. Every side effect (a state write, a report, a
   // native request's release, a retry's wake-up, and a send, which the gateway
   // asks `current()` about) goes through an owner below.
-  const lifetime = createLifetime(timers);
+  const lifetime = createLifetime(timers, error => onError(error));
   const { live, wait, begin } = lifetime;
   // State writes: a stopped worker's transaction changes nothing and fails,
   // checked when it runs, since the queue can hold it past stop(); the caller's
@@ -238,7 +238,7 @@ export function createOperationWorker(options: {
       // Sending must start by this time; observation then has its own deadline.
       const sendBy = operation.sendBy!;
       if (expiredUnsent(operation)) return await finish(operation.id, "expired");
-      const read = <T>(work: () => Promise<T>) => readWithin(begin(work), sendBy, now(), timers, lifetime.signal);
+      const read = <T>(work: () => Promise<T>) => readWithin(begin(work), sendBy, now(), timers, onError, lifetime.signal);
       // Reading nothing is not evidence of change: an unreadable host, observer
       // or setting is thrown as a fault and retried; only a reading that shows a
       // change ends the attempt.
@@ -262,6 +262,7 @@ export function createOperationWorker(options: {
         // The gateway asks this right before sending and again at the dispatch
         // marker, so a stopped worker sends nothing.
         current: () => live() && now() < (observeUntil ?? sendBy),
+        fault: (_error: unknown) => { throw new Error("not implemented"); },
         checkpoint: async (evidence: NonNullable<StoredOperation["evidence"]>) => {
           await update(state => {
             const current = state.operations.find(entry => entry.id === operation.id);

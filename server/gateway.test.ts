@@ -2,8 +2,9 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { DeadlineExceeded, INSPECT_TIMEOUT_MS, OBSERVATION_MS, Stopped } from "./deadline";
-import { Refusal, type OperationEvidence, type StoredOperation } from "./model";
+import { randomUUID } from "node:crypto";
+import { DeadlineExceeded, INSPECT_TIMEOUT_MS, OBSERVATION_MS, SEND_DEADLINE_MS, Stopped } from "./deadline";
+import { Refusal, type ExecutionContext, type OperationEvidence, type StoredOperation } from "./model";
 import { createGateway, EVIDENCE_POLL_MS } from "./gateway";
 import { createObserver, QUERY_RESTARTED_REFUSAL } from "./observer";
 import { createOperationWorker } from "./operations";
@@ -128,8 +129,27 @@ function fixture(
     config: { get: async () => ({ config: { providers: {} } }) },
     agents: { ref: () => ref },
   } as unknown as PluginHandlerContext["paseo"]);
-  return Object.assign(host, { ref, clock, sendCount: () => sends,
-    setAgent: (patch: Record<string, unknown>) => Object.assign(agent, patch) });
+  return { ...host, ...attempts(host, clock.now), ref, clock, sendCount: () => sends,
+    setAgent: (patch: Record<string, unknown>) => Object.assign(agent, patch) };
+}
+
+// The worker's part in an attempt a test starts without one: a fresh
+// identity, the send deadline the worker gives a new request of that kind, and
+// an owner that keeps the faults the attempt hands it (`faults`).
+function attempts(host: ReturnType<typeof createGateway>, now: () => number) {
+  const faults: unknown[] = [];
+  const fault = (error: unknown) => { faults.push(error); };
+  const execution = (kind: keyof typeof SEND_DEADLINE_MS): ExecutionContext => ({
+    id: randomUUID(), sendBy: now() + SEND_DEADLINE_MS[kind], checkpoint: async () => {}, current: () => true,
+    fault,
+  });
+  const { compact, automatic } = host.gateway;
+  return { faults, fault, gateway: { ...host.gateway,
+    compact: (id: string, expected?: Parameters<typeof compact>[1], given?: ExecutionContext) =>
+      compact(id, expected, given ?? execution("manual")),
+    automatic: automatic && ((expected: Parameters<typeof automatic>[0], guard?: Parameters<typeof automatic>[1],
+      given?: ExecutionContext) => automatic(expected, guard, given ?? execution("automatic"))),
+  } };
 }
 
 test("gateway requires completed manual boundary from command turn and same persistence session", async (t) => {
@@ -287,7 +307,7 @@ async function overlap(scope: CleanupScope, { receipt = { status: 'completed', d
   };
   const saved: OperationEvidence[] = [];
   const result = await host.gateway.automatic!((await host.gateway.refresh('a'))!, undefined, {
-    id: 'overlap', sendBy: host.clock.now() + 30_000, checkpoint: async evidence => { saved.push(evidence); }, current: () => true,
+    id: 'overlap', sendBy: host.clock.now() + 30_000, checkpoint: async evidence => { saved.push(evidence); }, current: () => true, fault: host.fault,
   });
   assert.equal(host.sendCount(), 1, '/compact is never sent twice');
   return { result, evidence: saved.at(-1) };
@@ -376,7 +396,7 @@ test('Claude admits the compaction for as long as it can be observed, not only u
   const host = fixture(scope, [], undefined, false, [], { observer: native });
   const sendBy = host.clock.now() + 1_000;
   await host.gateway.automatic!((await host.gateway.refresh('a'))!, { expiresAt: host.clock.now() + 500, allowed: async () => true },
-    { id: 'late-admission', sendBy, checkpoint: async () => {}, current: () => true });
+    { id: 'late-admission', sendBy, checkpoint: async () => {}, current: () => true, fault: host.fault });
   assert.equal(admitted, sendBy + OBSERVATION_MS);
   assert.equal(host.sendCount(), 1);
 });
@@ -395,7 +415,7 @@ test('a send that starts just before its deadline is still observed in full', as
   // The send takes past its deadline, so the boundary arrives after it.
   host.ref.send = async (text, options) => { time += 80; return send(text, options); };
   const result = await host.gateway.compact("a", undefined, {
-    id: "late-request", sendBy: time + 40, checkpoint: async () => {}, current: () => true,
+    id: "late-request", sendBy: time + 40, checkpoint: async () => {}, current: () => true, fault: host.fault,
   });
   assert.equal(result.status, "completed");
   assert.equal(host.sendCount(), 1);
@@ -437,7 +457,7 @@ test('observer ownership is rechecked at the dispatch boundary, in memory, and e
   const result = await host.gateway.compact('a', (await host.gateway.refresh('a'))!, {
     id: 'ownership-race', sendBy: host.clock.now() + 30_000,
     checkpoint: async evidence => { saved.push(evidence); markerPersisted ||= evidence.dispatchStartedAt !== undefined; },
-    current: () => true,
+    current: () => true, fault: host.fault,
   });
   assert.equal(result.status, 'unknown');
   assert.match(result.detail, /observer changed.*no automatic retry/i);
@@ -514,7 +534,7 @@ test("every external gateway wait is bounded, including send and release", async
     // A wait that expires before sending is a fault for the worker to retry.
     if (stalled === "subscribe" || stalled === "refresh") {
       const attempt = host.gateway.compact("a", undefined, { id: "stalled", sendBy: host.clock.now() + 50,
-        checkpoint: async () => {}, current: () => true });
+        checkpoint: async () => {}, current: () => true, fault: host.fault });
       // The stalled call's wait ends at the send deadline, not before.
       await bound(50);
       await host.clock.tick(49);
@@ -591,7 +611,7 @@ test("a native request whose preparation outlives the wait on it is retired once
     native.cancel = async (operation: { id: string }, sent?: boolean) => { retire(`${operation.id}:${sent}`); };
     const host = fixture(scope, [], undefined, false, [], { observer: native });
     const attempt = host.gateway.automatic!((await host.gateway.refresh("a"))!, undefined, {
-      id: `late-${ending}`, sendBy: host.clock.now() + 30_000, checkpoint: async () => {}, current: () => true,
+      id: `late-${ending}`, sendBy: host.clock.now() + 30_000, checkpoint: async () => {}, current: () => true, fault: host.fault,
     });
     const ended = attempt.then(() => null, (error: unknown) => error);
     await reached;
@@ -638,7 +658,7 @@ function stalledPreparation() {
 // and then on its cleanup.
 async function abandonedPreparation(host: ReturnType<typeof fixture>, reached: Promise<void>, id: string) {
   const attempt = host.gateway.automatic!((await host.gateway.refresh("a"))!, undefined, {
-    id, sendBy: host.clock.now() + 30_000, checkpoint: async () => {}, current: () => true,
+    id, sendBy: host.clock.now() + 30_000, checkpoint: async () => {}, current: () => true, fault: host.fault,
   }).then(() => null, (error: unknown) => error);
   await reached;
   await host.clock.armed(INSPECT_TIMEOUT_MS);
@@ -654,7 +674,7 @@ test("a retry prepares a conversation's native request only after an earlier att
   const host = fixture(scope, [], undefined, false, [], { observer: native });
   await abandonedPreparation(host, reached, "retried");
   const agent = (await host.gateway.refresh("a"))!;
-  const execution = () => ({ id: "retried", sendBy: host.clock.now() + 30_000, checkpoint: async () => {}, current: () => true });
+  const execution = () => ({ id: "retried", sendBy: host.clock.now() + 30_000, checkpoint: async () => {}, current: () => true, fault: host.fault });
   // While that preparation is still being written, a retry waits for it as a
   // read before sending, and gives up at the read deadline.
   const waiting = host.gateway.automatic!(agent, undefined, execution()).then(() => null, (error: unknown) => error);
@@ -717,7 +737,7 @@ test("stable identity and durable send marker precede provider dispatch", async 
   };
   const result = await host.gateway.compact("a", undefined, {
     id: "caller-request", sendBy: host.clock.now() + 1000,
-    checkpoint: async evidence => { checkpoints.push(evidence); }, current: () => true,
+    checkpoint: async evidence => { checkpoints.push(evidence); }, current: () => true, fault: host.fault,
   });
   assert.equal(result.status, "completed");
   assert.equal(checkpoints.at(-1)?.boundary, true);
@@ -731,7 +751,7 @@ test("failed marker persistence never sends and late send rejection is consumed"
   // A fault before sending is the worker's to retry, so it is thrown, not an outcome.
   await assert.rejects(host.gateway.compact("a", undefined, {
     id: "caller-request", sendBy: host.clock.now() + 1000,
-    checkpoint: async () => { throw new Error("disk full"); }, current: () => true,
+    checkpoint: async () => { throw new Error("disk full"); }, current: () => true, fault: host.fault,
   }), /disk full/);
   assert.equal(host.sendCount(), 0);
   let reject!: (error: Error) => void;
@@ -1063,7 +1083,7 @@ test("a live view lost while completion is verified is proved again from history
   let reads = 0;
   host.ref.timeline.refetch = async () => { reads++; return { entries: [command("verify"), { turnId: "compact-1", item: BOUNDARY_ITEM }] }; };
   const result = await host.gateway.automatic!((await refresh().then(() => host.gateway.refresh("a")))!, undefined, {
-    id: "verify", sendBy: host.clock.now() + 30_000, checkpoint: async () => {}, current: () => true,
+    id: "verify", sendBy: host.clock.now() + 30_000, checkpoint: async () => {}, current: () => true, fault: host.fault,
   });
   assert.equal(result.status, "completed");
   assert.ok(reads > 0, "the proof seen before the loss was not trusted on its own");
@@ -1103,7 +1123,7 @@ async function lostView(scope: CleanupScope, lost: typeof LOST_VIEW[number], { l
   const id = `lost-${lost}`;
   const saved: OperationEvidence[] = [];
   const result = await host.gateway.automatic!((await host.gateway.refresh("a"))!, undefined, {
-    id, sendBy: now(host.clock.now()) + 30_000, checkpoint: async evidence => { saved.push(evidence); }, current: () => true,
+    id, sendBy: now(host.clock.now()) + 30_000, checkpoint: async evidence => { saved.push(evidence); }, current: () => true, fault: host.fault,
   });
   assert.equal(host.sendCount(), 1, "/compact is never sent twice");
   return { result, evidence: saved.at(-1), reads };
@@ -1224,7 +1244,7 @@ test("after a lost live view, history is read at most once a second while comple
   // The page never shows the boundary, so the attempt keeps polling.
   host.ref.timeline.refetch = async () => { reads++; return { entries: [command("interval")] }; };
   const attempt = host.gateway.automatic!((await host.gateway.refresh("a"))!, undefined, {
-    id: "interval", sendBy: time + 30_000, checkpoint: async () => {}, current: () => true,
+    id: "interval", sendBy: time + 30_000, checkpoint: async () => {}, current: () => true, fault: host.fault,
   });
   // Past the live deadline, so the attempt ends even if the test stops early,
   // at a failed assertion or at the test runner's bound.
@@ -1368,7 +1388,7 @@ test("live observation reports a confirmed query-restart refusal promptly for bo
       });
     };
     const agent = (await host.gateway.refresh("a"))!;
-    const execution = { id: `op-${kind}`, sendBy: time + 30_000, checkpoint: async () => {}, current: () => true };
+    const execution = { id: `op-${kind}`, sendBy: time + 30_000, checkpoint: async () => {}, current: () => true, fault: host.fault };
     const outcome = kind === "automatic"
       ? await host.gateway.automatic!(agent, { expiresAt: time + 30_000, allowed: async () => true }, execution)
       : await host.gateway.compact("a", agent, execution);
@@ -1412,7 +1432,7 @@ test("a generation change without a matching refusal stays pending until the obs
   const agent = (await host.gateway.refresh("a"))!;
   let settled = false;
   attempt = host.gateway.compact("a", agent, {
-    id: "gen-only", sendBy: time + 30_000, checkpoint: async () => {}, current: () => true,
+    id: "gen-only", sendBy: time + 30_000, checkpoint: async () => {}, current: () => true, fault: host.fault,
   });
   void attempt.finally(() => { settled = true; });
   const until = (done: () => boolean) =>
@@ -1448,7 +1468,7 @@ test("stopping the plugin after dispatch preserves request.json so a query-resta
   const agent = (await host.gateway.refresh("a"))!;
   const outcome = await host.gateway.compact("a", agent, {
     id: "stop-after-dispatch", sendBy: time + 30_000,
-    checkpoint: async evidence => { saved = evidence; }, current: () => true,
+    checkpoint: async evidence => { saved = evidence; }, current: () => true, fault: host.fault,
   });
   assert.equal(outcome.status, "unknown");
   assert.equal(host.sendCount(), 1);
@@ -1532,7 +1552,7 @@ test("the gateway records which preparation of the native request it sends again
   const saved: OperationEvidence[] = [];
   await host.gateway.compact("a", (await host.gateway.refresh("a"))!, {
     id: "operation-1", sendBy: host.clock.now() + 30_000,
-    checkpoint: async evidence => { saved.push(evidence); }, current: () => true,
+    checkpoint: async evidence => { saved.push(evidence); }, current: () => true, fault: host.fault,
   });
   assert.equal(saved[0]?.native?.preparation, "preparation-1");
   assert(saved.every(evidence => evidence.native?.preparation === "preparation-1"));

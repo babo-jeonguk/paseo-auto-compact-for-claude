@@ -9,11 +9,12 @@ import { cleanupScope } from "../tests/support/scope";
 import { drainer } from "../tests/support/drained";
 import { gate } from "../tests/support/gate";
 import { DEFAULT_SETTINGS, type Settings } from "../shared/settings";
+import { DeadlineExceeded, Stopped } from "./deadline";
 import { Refusal, type CompactOutcome, type ExecutionContext, type Gateway, type Observation,
   type State, type StoredOperation } from "./model";
 
 type Evidence = CompactOutcome | null | ((operation: StoredOperation) => CompactOutcome | null);
-type Hook = (execution: ExecutionContext | undefined) => Promise<CompactOutcome>;
+type Hook = (execution: ExecutionContext) => Promise<CompactOutcome>;
 
 function fixture(options: { agents?: string[] } = {}) {
   let time = 1000;
@@ -54,7 +55,7 @@ function fixture(options: { agents?: string[] } = {}) {
         sends++;
         return outcome;
       }
-      await execution!.checkpoint({ dispatchStartedAt: time });
+      await execution.checkpoint({ dispatchStartedAt: time });
       sends++;
       return { status: "completed", detail: "matching evidence" };
     },
@@ -99,7 +100,9 @@ function fixture(options: { agents?: string[] } = {}) {
         if (stale) { const value = stale; stale = null; return structuredClone(value); }
         return structuredClone(state);
       }, write: async next => { state = next; signal.changed(); } },
-    update, settings, now: () => time, timers, onError: error => errors.push(error) });
+    update, settings, now: () => time, timers,
+    // A report wakes the tests waiting for it.
+    onError: error => { errors.push(error); signal.changed(); } });
   return { make, gateway, errors, calls, events,
     // Waits until the condition holds after a stored state or a recorded event.
     until: signal.until,
@@ -165,7 +168,7 @@ test("dispatch marker recovery observes without resending and uses matching evid
 test("unconfirmed send remains observable until its fixed deadline, never retried", async () => {
   const f = fixture();
   f.gateway.compact = async (_id, _expected, execution) => {
-    await execution!.checkpoint({ dispatchStartedAt: 1000 });
+    await execution.checkpoint({ dispatchStartedAt: 1000 });
     return { status: "unknown", detail: "send timed out" };
   };
   const worker = f.make();
@@ -257,10 +260,10 @@ const NATIVE = { id: "operation-a", launchId: "launch", generation: "gen-1", ses
 // Sends as the gateway does: an attempt whose worker is no longer current
 // throws before the dispatch marker and stops at it after, and "a:sent" is
 // recorded only when the send itself happens.
-async function send(f: Fixture, execution: ExecutionContext | undefined, native = false) {
-  if (!execution!.current()) throw new Error("Send deadline passed or worker stopped before send");
-  await execution!.checkpoint({ dispatchStartedAt: f.time, ...native ? { native: NATIVE } : {} });
-  if (!execution!.current()) return { status: "unknown" as const, detail: "Worker stopped at dispatch boundary" };
+async function send(f: Fixture, execution: ExecutionContext, native = false) {
+  if (!execution.current()) throw new Error("Send deadline passed or worker stopped before send");
+  await execution.checkpoint({ dispatchStartedAt: f.time, ...native ? { native: NATIVE } : {} });
+  if (!execution.current()) return { status: "unknown" as const, detail: "Worker stopped at dispatch boundary" };
   f.record("a:sent");
   return { status: "completed" as const, detail: "matching evidence" };
 }
@@ -334,7 +337,7 @@ const stopPoints: Record<string, (f: Fixture) => { worker: ReturnType<Fixture["m
   "the state read after an unknown outcome": f => {
     const read = later(() => f.holdRead());
     f.hook("a", async execution => {
-      await execution!.checkpoint({ dispatchStartedAt: f.time });
+      await execution.checkpoint({ dispatchStartedAt: f.time });
       read.arm();
       return { status: "unknown", detail: "Compaction completion unconfirmed" };
     });
@@ -479,7 +482,7 @@ test("a refusal ends the attempt without retry and records that nothing was sent
 test("a failure after the dispatch marker is recorded as sent", async () => {
   const f = fixture(), worker = f.make();
   f.gateway.compact = async (_id, _expected, execution) => {
-    await execution!.checkpoint({ dispatchStartedAt: 1000 });
+    await execution.checkpoint({ dispatchStartedAt: 1000 });
     return { status: "failed", detail: "Compact turn failed" };
   };
   await worker.reconcile();
@@ -503,7 +506,7 @@ test("stopped workers cannot publish late results over recovered operations", as
   let reached!: () => void;
   const reaching = new Promise<void>(resolve => { reached = resolve; });
   f.gateway.compact = async (_id, _expected, execution) => {
-    await execution!.checkpoint({ dispatchStartedAt: 1000 });
+    await execution.checkpoint({ dispatchStartedAt: 1000 });
     return new Promise(resolve => { release = resolve; reached(); });
   };
   const running = first.reconcile();
@@ -543,7 +546,7 @@ test("a send late in its window is observed for the full time from the dispatch 
   f.operation.sendBy = 1000 + 10_000; // e.g. the end of an automatic delivery window
   f.gateway.compact = async (_id, _expected, execution) => {
     f.advance(9_000);
-    await execution!.checkpoint({ dispatchStartedAt: 10_000 });
+    await execution.checkpoint({ dispatchStartedAt: 10_000 });
     return { status: "unknown", detail: "send unconfirmed" };
   };
   const worker = f.make();
@@ -558,7 +561,7 @@ test("a send late in its window is observed for the full time from the dispatch 
 test("observation ends unknown a fixed time after the dispatch marker", async () => {
   const f = fixture();
   f.gateway.compact = async (_id, _expected, execution) => {
-    await execution!.checkpoint({ dispatchStartedAt: 1000 });
+    await execution.checkpoint({ dispatchStartedAt: 1000 });
     return { status: "unknown", detail: "send unconfirmed" };
   };
   const worker = f.make();
@@ -598,7 +601,7 @@ test("a fault after the dispatch marker never expires the work as unsent, even p
   const f = fixture();
   f.gateway.compact = async (_id, _expected, execution) => {
     f.advance(100_000);
-    await execution!.checkpoint({ dispatchStartedAt: 101_000 });
+    await execution.checkpoint({ dispatchStartedAt: 101_000 });
     f.advance(90_000); // past the send deadline (181 s), inside the observation (281 s)
     f.failReads = 1; // the worker's own read after the outcome fails
     return { status: "unknown", detail: "send unconfirmed" };
@@ -614,7 +617,7 @@ test("conversations run independently: a held send does not delay another conver
   let releaseA!: () => void;
   const heldA = new Promise<void>(resolve => { releaseA = resolve; });
   f.hook("a", async execution => {
-    await execution!.checkpoint({ dispatchStartedAt: 1000 });
+    await execution.checkpoint({ dispatchStartedAt: 1000 });
     f.record("a:marker");
     await heldA;
     f.record("a:release");
@@ -654,7 +657,7 @@ test("a fault in one conversation is retried without delaying another conversati
 test("an ambiguous send stays observable without delaying another conversation", async () => {
   const f = fixture({ agents: ["a", "b"] });
   f.hook("a", async execution => {
-    await execution!.checkpoint({ dispatchStartedAt: 1000 });
+    await execution.checkpoint({ dispatchStartedAt: 1000 });
     return { status: "unknown", detail: "send timed out" };
   });
   const worker = f.make();
@@ -674,13 +677,13 @@ test("overlapping checkpoints and completions of two conversations keep both evi
   const gateA = new Promise<void>(resolve => { releaseA = resolve; });
   const gateB = new Promise<void>(resolve => { releaseB = resolve; });
   f.hook("a", async execution => {
-    await execution!.checkpoint({ dispatchStartedAt: 2000, turnId: "turn-a" });
+    await execution.checkpoint({ dispatchStartedAt: 2000, turnId: "turn-a" });
     f.record("a:checkpointed");
     await gateA;
     return { status: "completed", detail: "A completed" };
   });
   f.hook("b", async execution => {
-    await execution!.checkpoint({ dispatchStartedAt: 3000, boundary: true });
+    await execution.checkpoint({ dispatchStartedAt: 3000, boundary: true });
     f.record("b:checkpointed");
     await gateB;
     return { status: "completed", detail: "B completed" };
@@ -709,7 +712,7 @@ test("concurrent reconciles start each operation only once", async () => {
   let release!: () => void;
   const held = new Promise<void>(resolve => { release = resolve; });
   f.hook("a", async execution => {
-    await execution!.checkpoint({ dispatchStartedAt: 1000 });
+    await execution.checkpoint({ dispatchStartedAt: 1000 });
     await held;
     return { status: "completed", detail: "completed" };
   });
@@ -749,12 +752,12 @@ test("a stopped worker cannot publish late results for any of several operations
   const f = fixture({ agents: ["a", "b"] });
   let releaseA!: (outcome: CompactOutcome) => void, releaseB!: (outcome: CompactOutcome) => void;
   f.hook("a", async execution => {
-    await execution!.checkpoint({ dispatchStartedAt: 1000 });
+    await execution.checkpoint({ dispatchStartedAt: 1000 });
     f.record("a:checkpointed");
     return new Promise(resolve => { releaseA = resolve; });
   });
   f.hook("b", async execution => {
-    await execution!.checkpoint({ dispatchStartedAt: 1000 });
+    await execution.checkpoint({ dispatchStartedAt: 1000 });
     f.record("b:checkpointed");
     return new Promise(resolve => { releaseB = resolve; });
   });
@@ -826,4 +829,100 @@ test("a request an earlier instance left prepared is kept only while its operati
     result: { code: "expired_before_dispatch", message: "m" } })), { sent: false });
   // An operation no longer retained ended at least the retention period ago.
   assert.deepEqual(leftoverRetirement(request("p"), undefined), { sent: false });
+});
+
+// Faults a gateway hands to the run that started its work, as a wait that
+// already ended or a cleanup step would hand them.
+test("a fault an attempt's work met explains the run's fault in place of the deadline that ended its wait", async () => {
+  const f = fixture(), worker = f.make();
+  const late = new Error("EACCES: request.json");
+  f.hook("a", async execution => {
+    // The wait on the work ended at its deadline; the work then failed.
+    execution.fault(late);
+    throw new DeadlineExceeded();
+  });
+  await worker.reconcile();
+  assert.equal(f.operation.state, "requested", "a fault before the marker is retried");
+  assert.deepEqual(f.errors, [], "a retried fault is not reported");
+  f.advance(200_000);
+  await worker.reconcile();
+  assert.equal(f.operation.state, "expired");
+  assert.deepEqual(f.errors, [late], "the fault that ended the request is the work's own, not the deadline");
+  worker.stop();
+});
+
+test("a fault an earlier run's work meets after that run ended is reported at once, even while a retry runs", async () => {
+  const f = fixture(), worker = f.make();
+  let earlier: ExecutionContext | undefined;
+  f.hook("a", async execution => { earlier = execution; throw new Error("EBUSY"); });
+  await worker.reconcile();
+  assert.equal(f.operation.state, "requested");
+  const held = gate();
+  f.hook("a", async execution => {
+    assert.notEqual(execution, earlier, "each run is its own execution");
+    await held.pass();
+    return { status: "completed", detail: "matching evidence" };
+  });
+  f.advance(2_000);
+  const retry = worker.reconcile();
+  await held.reached;
+  const late = new Error("EIO: retirement of the earlier preparation");
+  assert.ok(earlier, "the first run handed the gateway its execution");
+  earlier.fault(late);
+  earlier.fault(new Refusal("Claude is still working"));
+  assert.deepEqual(f.errors, [late], "the earlier run's fault is its own and is reported; a refusal never is");
+  held.release();
+  await retry;
+  assert.equal(f.operation.state, "succeeded", "the retry's outcome is unchanged");
+  assert.deepEqual(f.errors, [late]);
+  worker.stop();
+});
+
+test("a cleanup fault of a run that ends otherwise is reported once that run ends, and leaves its outcome alone", async () => {
+  const f = fixture(), worker = f.make();
+  const cleanup = new Error("EIO: subscription release");
+  f.hook("a", async execution => {
+    execution.fault(cleanup);
+    await execution.checkpoint({ dispatchStartedAt: f.time });
+    return { status: "completed", detail: "matching evidence" };
+  });
+  await worker.reconcile();
+  assert.equal(f.operation.state, "succeeded");
+  assert.deepEqual(f.errors, [cleanup]);
+  worker.stop();
+});
+
+test("faults a retried run met beside its own are reported with it if the request expires", async () => {
+  const f = fixture(), worker = f.make();
+  const thrown = new Error("EBUSY"), beside = new Error("EIO: subscription release");
+  f.hook("a", async execution => { execution.fault(beside); throw thrown; });
+  await worker.reconcile();
+  assert.equal(f.errors.length, 0);
+  f.advance(200_000);
+  await worker.reconcile();
+  assert.equal(f.operation.state, "expired");
+  assert.equal(f.errors.length, 1);
+  const [reported] = f.errors;
+  assert.ok(reported instanceof AggregateError, "one report carries the run's faults together");
+  assert.deepEqual(reported.errors, [thrown, beside]);
+  worker.stop();
+});
+
+test("a read already issued when the worker stops still has its failure reported", async () => {
+  const f = fixture(), worker = f.make();
+  let fail!: (error: Error) => void;
+  let reading!: () => void;
+  const started = new Promise<void>(resolve => { reading = resolve; });
+  f.gateway.refresh = () => { reading(); return new Promise<never>((_resolve, reject) => { fail = reject; }); };
+  const running = worker.reconcile();
+  await started;
+  worker.stop();
+  await running;
+  await worker.idle();
+  const defect = new Error("EIO: host read");
+  fail(defect);
+  await f.until(() => f.errors.includes(defect));
+  assert.ok(f.errors.every(error => error === defect || error instanceof Stopped),
+    "besides the stop itself, which the reporter keeps quiet, only the read's own failure is handed on");
+  assert.equal(f.sends, 0);
 });

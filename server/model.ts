@@ -63,6 +63,9 @@ export interface ExecutionContext {
   sendBy: number;
   checkpoint(evidence: OperationEvidence): Promise<void>;
   current(): boolean;
+  // The owner of a fault the attempt's work meets after a wait on it ended, or
+  // in the attempt's cleanup: the worker run that started the attempt.
+  fault(error: unknown): void;
 }
 // "failed" never says whether anything was sent; the persisted dispatch marker does.
 export type CompactOutcome = { status: "completed" | "failed" | "unknown"; detail: string };
@@ -140,15 +143,15 @@ export interface Gateway {
   refresh(agentId: string): Promise<Observation | null>;
   compact(
     agentId: string,
-    expected?: Observation,
-    execution?: ExecutionContext
+    expected: Observation | undefined,
+    execution: ExecutionContext
   ): Promise<CompactOutcome>;
   /** Automatic dispatch observes native activity; TTL may use the disclosed default. */
   readiness?: (expected: Observation, dueAt?: number) => Promise<Blocked | null>;
   automatic?: (
     expected: Observation,
-    guard?: DispatchGuard,
-    execution?: ExecutionContext
+    guard: DispatchGuard | undefined,
+    execution: ExecutionContext
   ) => Promise<CompactOutcome>;
   inspect?: (operation: StoredOperation) => Promise<CompactOutcome | null>;
   /** Retire a finished operation's native request; best effort. */

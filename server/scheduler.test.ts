@@ -15,7 +15,8 @@ import { drainer } from "../tests/support/drained";
 import { gate, type Gate } from "../tests/support/gate";
 import { cleanupScope } from "../tests/support/scope";
 import type { Blocked } from "../shared/rpc";
-import { Refusal, type Gateway, type Observation, type State, type StateStore } from "./model";
+import { Refusal, type DispatchGuard, type ExecutionContext, type Gateway, type Observation, type State,
+  type StateStore } from "./model";
 
 function fixture(automatic = true) {
   let time = 1_000_000;
@@ -132,7 +133,8 @@ function fixture(automatic = true) {
     },
     refresh,
     compact,
-    ...(automatic ? { automatic: async (expected: Observation) => compact(expected.agentId) } : {}),
+    ...(automatic ? { automatic: async (expected: Observation, _guard: DispatchGuard | undefined, execution: ExecutionContext) =>
+      compact(expected.agentId, expected, execution) } : {}),
   };
   // Passed to the scheduler only by a test that asks for history cleanup.
   const receipts: OperationReceipts = {
@@ -677,7 +679,7 @@ test("ambiguous in-flight restart and failed compact never retry automatically",
   let sends = 0;
   f.gateway.automatic = async (_agent, _guard, execution) => {
     sends++;
-    await execution!.checkpoint({ dispatchStartedAt: f.time });
+    await execution.checkpoint({ dispatchStartedAt: f.time });
     return new Promise(() => {});
   };
   f.advance(55 * 60_000);
@@ -1237,7 +1239,7 @@ test("restart observes a dispatched operation and an old worker cannot overwrite
   let reached!: () => void;
   const reaching = new Promise<void>(resolve => { reached = resolve; });
   f.gateway.compact = async (_id, _agent, execution) => {
-    await execution!.checkpoint({ dispatchStartedAt: f.time });
+    await execution.checkpoint({ dispatchStartedAt: f.time });
     await new Promise<void>(resolve => { release = resolve; reached(); });
     return { status: "completed", detail: "Late completion" };
   };
@@ -1322,7 +1324,7 @@ test("every write derives the jobs' attempt fields from their operations", async
   let reached!: () => void;
   const reaching = new Promise<void>(resolve => { reached = resolve; });
   f.gateway.compact = async (_id, _agent, execution) => {
-    await execution!.checkpoint({ dispatchStartedAt: f.time });
+    await execution.checkpoint({ dispatchStartedAt: f.time });
     await new Promise<void>(resolve => { release = resolve; reached(); });
     return { status: "completed", detail: "Completed" };
   };

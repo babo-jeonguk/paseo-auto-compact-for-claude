@@ -142,7 +142,8 @@ export function createGateway(options: {
       return current ? observation(current.agent) : null;
     },
     ...(observer ? {
-      automatic: (expected: Observation, guard?: DispatchGuard, execution?: ExecutionContext) => compact(expected.agentId, expected, true, guard, execution),
+      automatic: (expected: Observation, guard: DispatchGuard | undefined, execution: ExecutionContext) =>
+        compact(expected.agentId, expected, true, guard, execution),
       readiness: (expected: Observation, dueAt?: number) => observer.readiness(expected, dueAt),
       async release(operation: StoredOperation) {
         const native = operation.evidence?.native;
@@ -178,7 +179,7 @@ export function createGateway(options: {
   const history = async (agentId: string, id: string) =>
     pinnedCommand((await requireApi().agents.ref(agentId).timeline.refetch({ limit: 200 })).entries, id);
   async function compact(agentId: string, expected: Observation | undefined, automatic: boolean,
-    guard?: DispatchGuard, execution?: ExecutionContext): ReturnType<Gateway["compact"]> {
+    guard: DispatchGuard | undefined, execution: ExecutionContext): ReturnType<Gateway["compact"]> {
     if (stopped) throw new Error("Plugin stopped");
     // A concurrent dispatch of this conversation is a condition, not a fault.
     if (busy.has(agentId)) throw new Refusal("Compaction already running for this conversation");
@@ -188,8 +189,8 @@ export function createGateway(options: {
     const live = options.timeoutMs ?? LIVE_OBSERVATION_MS;
     const sendBy = execution?.sendBy ?? now() + SEND_DEADLINE_MS[automatic ? "automatic" : "manual"];
     let deadline = sendBy;
-    const wait = <T>(work: Promise<T>) => bounded(work, deadline - now(), timers, stopping.signal);
-    const read = <T>(work: Promise<T>) => readWithin(work, deadline, now(), timers, stopping.signal);
+    const wait = <T>(work: Promise<T>) => bounded(work, deadline - now(), timers, execution.fault, stopping.signal);
+    const read = <T>(work: Promise<T>) => readWithin(work, deadline, now(), timers, execution.fault, stopping.signal);
     const currentWorker = () => !stopped && (execution?.current() ?? true) && now() < deadline;
     const ref = requireApi().agents.ref(agentId);
     busy.add(agentId);
@@ -286,7 +287,8 @@ export function createGateway(options: {
       const send = ref.send("/compact", { messageId: id });
       // A rejection/timeout may still mean delivery. Inspect evidence until the
       // original deadline; late send rejection is consumed by bounded().
-      await bounded(send, Math.min(options.dispatchTimeoutMs ?? SEND_TIMEOUT_MS, deadline - now()), timers, stopping.signal)
+      await bounded(send, Math.min(options.dispatchTimeoutMs ?? SEND_TIMEOUT_MS, deadline - now()), timers, execution.fault,
+        stopping.signal)
         .catch(() => {});
       while (currentWorker()) {
         await checkpoint();
@@ -352,8 +354,9 @@ export function createGateway(options: {
         else turn.end();
       }
       await Promise.all([
-        retire ? bounded(retire, cleanupMs, timers, stopping.signal).catch(() => {}) : undefined,
-        subscription ? bounded(Promise.resolve(subscription.release()), cleanupMs, timers, stopping.signal).catch(() => {}) : undefined,
+        retire ? bounded(retire, cleanupMs, timers, execution.fault, stopping.signal).catch(() => {}) : undefined,
+        subscription ? bounded(Promise.resolve(subscription.release()), cleanupMs, timers, execution.fault, stopping.signal)
+          .catch(() => {}) : undefined,
       ]);
       busy.delete(agentId);
     }

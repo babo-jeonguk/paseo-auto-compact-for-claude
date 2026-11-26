@@ -6,7 +6,7 @@ import { createObserver, QUERY_RESTARTED_REFUSAL } from './observer';
 import { CLOCK_STEP_TOLERANCE_MS } from './deadline';
 import { observerAsset } from './observer-assets.generated';
 import type { PluginSessionOpenRequest } from '@getpaseo/plugin/server';
-import type { Observation, StoredOperation } from './model';
+import type { ExecutionContext, Observation, StoredOperation } from './model';
 import { cleanupScope, type CleanupScope } from '../tests/support/scope';
 import { createDurableWrites, type DurableFiles } from './durable';
 import { createGateway } from './gateway';
@@ -544,8 +544,12 @@ test('after a reload the gateway sends nothing to the launch the previous instan
     agents: { ref: () => ({ refresh: async () => ({ agent }), send: async () => { sends++; sentOnce(); },
       timeline: { subscribe: () => ({ ready: Promise.resolve(), release() {} }) } }) },
   } as unknown as PluginHandlerContext['paseo']);
+  // The worker's part in each attempt; nothing here is late, so its owner is handed nothing.
+  const faults: unknown[] = [];
+  const execution = (id: string): ExecutionContext => ({ id, sendBy: f.now() + 10_000, checkpoint: async () => {},
+    current: () => true, fault: error => { faults.push(error); } });
   assert.equal((await host.gateway.refresh('a'))!.resumeRequired, true);
-  await assert.rejects(host.gateway.compact('a'),
+  await assert.rejects(host.gateway.compact('a', undefined, execution('stale')),
     (error: unknown) => error instanceof Refusal && error.message === SESSION_RESUME_REQUIRED);
   // An ordinary message reopens the session, which prepares a fresh launch.
   const reopened = await next.prepareSession(f.request, true);
@@ -554,12 +558,16 @@ test('after a reload the gateway sends nothing to the launch the previous instan
   assert.equal((await host.gateway.refresh('a'))!.resumeRequired, undefined);
   assert.equal(sends, 0);
   // The next request then goes to the fresh launch.
-  void host.gateway.compact('a').catch(() => {});
+  const compacting = host.gateway.compact('a', undefined, execution('fresh'));
   await sent;
   assert.equal(sends, 1);
   const request = await requestFile(join(f.parent, launchId));
   assert.equal(request.status, 'prepared');
   assert.equal(request.launchId, launchId);
+  // Stopping ends the attempt's observation; what was sent stays unconfirmed.
+  host.stop();
+  assert.equal((await compacting).status, 'unknown');
+  assert.deepEqual(faults, []);
 });
 
 test('requests an earlier instance left prepared are retired as decided, once, and this instance leaves its own alone', async (t) => {

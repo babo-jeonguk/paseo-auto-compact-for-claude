@@ -66,7 +66,8 @@ export const observationEndBy = (sendBy: number) => sendBy + OBSERVATION_MS;
 // wait ends only when the work settles or `stop` aborts. It settles once: a
 // late settle, abort or deadline after it ended does nothing. However it ends,
 // a timer it armed is cleared; a wait that armed none clears none.
-export function bounded<T>(work: Promise<T>, milliseconds: number, timers: Timers, stop?: AbortSignal): Promise<T> {
+export function bounded<T>(work: Promise<T>, milliseconds: number, timers: Timers, _late: (error: unknown) => void,
+  stop?: AbortSignal): Promise<T> {
   return new Promise((resolve, reject) => {
     let ended = false;
     let armed = false;
@@ -97,11 +98,11 @@ export function bounded<T>(work: Promise<T>, milliseconds: number, timers: Timer
 // lasts and returns it as it is, for the caller to wait on. Each side effect goes
 // through an owner that does nothing once `live()` is false, so no step of the
 // component checks for itself.
-export function createLifetime(timers: Timers) {
+export function createLifetime(timers: Timers, late: (error: unknown) => void) {
   const controller = new AbortController();
   const live = () => !controller.signal.aborted;
-  const wait = <T>(work: Promise<T>, milliseconds = Infinity) =>
-    bounded(work, milliseconds, timers, controller.signal);
+  const wait = <T>(work: Promise<T>, milliseconds = Infinity, owner = late) =>
+    bounded(work, milliseconds, timers, owner, controller.signal);
   return {
     signal: controller.signal,
     live,
@@ -113,10 +114,11 @@ export function createLifetime(timers: Timers) {
 
 // A pause of `milliseconds`, which `stop` ends early.
 export const pause = (milliseconds: number, timers: Timers, stop?: AbortSignal) =>
-  bounded(new Promise<never>(() => {}), milliseconds, timers, stop).catch((error: unknown) => {
+  bounded(new Promise<never>(() => {}), milliseconds, timers, () => {}, stop).catch((error: unknown) => {
     if (!(error instanceof DeadlineExceeded)) throw error;
   });
 
 // A pre-send read: at most INSPECT_TIMEOUT_MS, and never past `deadline`.
-export const readWithin = <T>(work: Promise<T>, deadline: number, now: number, timers: Timers, stop?: AbortSignal) =>
-  bounded(work, Math.min(INSPECT_TIMEOUT_MS, deadline - now), timers, stop);
+export const readWithin = <T>(work: Promise<T>, deadline: number, now: number, timers: Timers,
+  late: (error: unknown) => void, stop?: AbortSignal) =>
+  bounded(work, Math.min(INSPECT_TIMEOUT_MS, deadline - now), timers, late, stop);

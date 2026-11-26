@@ -109,7 +109,7 @@ export function createScheduler(options: {
   // (`store`), reports (`onError`), receipt removals and sweeps (`receipts`),
   // the single-flight timer (`finish`) and submissions to the worker, whose
   // own lifetime ends with this one.
-  const lifetime = createLifetime(timers);
+  const lifetime = createLifetime(timers, error => onError(error));
   const { live, wait, begin } = lifetime;
   // Every write passes through syncJobs, the only writer of jobs' attempt fields.
   // A stopped scheduler cannot write: it would put back state that a newer
