@@ -99,11 +99,16 @@ const number = "Literal[raw=/^\\.?[0-9]/]:not([value=0])";
 const literal = (call, position) =>
   `${call} > :nth-child(${position}):not(:function):matches(${number}, :has(${number}))`;
 
+// A real timer with any delay but 0 (the next turn), whatever the callback
+// does. setTimeout is its own rule: the cleanup scope's process time limit is
+// the one boundary for it.
+const delayed = (names) => `${globalCall(names)}[arguments.length>1]:not([arguments.1.value=0])`;
+const delayedTimeout = { selector: delayed("/^setTimeout$/"), message: realTime };
 // Rules for every unit test and its support modules.
 const unitTestRules = [
+        delayedTimeout,
         {
-          // Any delay but 0 (the next turn), whatever the callback does.
-          selector: `${globalCall(timer)}[arguments.length>1]:not([arguments.1.value=0])`,
+          selector: delayed("/^setInterval$/"),
           message: realTime,
         },
         {
@@ -214,17 +219,26 @@ const namedTimingRules = [{
 }];
 // Real time reached in server code: a global timer, a timeout signal (also
 // through the global object), or the timer modules imported, re-exported,
-// required or loaded as a built-in by a written name.
-const serverRealTimeRules = [{
-  selector: `${globalCall("/^(setTimeout|setInterval|setImmediate)$/")}, ` +
+// required or loaded as a built-in by a written name. The global setTimeout is
+// its own rule: the one real implementation of Timers is the boundary for it.
+const globalTimeout = { selector: globalCall("/^setTimeout$/"), message: serverRealTime };
+const serverRealTimeRules = [globalTimeout, {
+  selector: `${globalCall("/^(setInterval|setImmediate)$/")}, ` +
     `${abortTimeout}, ` +
     `:matches(ImportDeclaration, ExportNamedDeclaration, ExportAllDeclaration)[source.value=${timersModule}], ` +
     timersLoad,
   message: serverRealTime,
 }];
 
+// The selectors of each group of files, listed once so a boundary below takes
+// the same list less the one rule it is the boundary for.
+const testSupportSyntax = [...unitTestRules, ...sharedMockTimersRules];
+const serverSyntax = [...namedTimingRules, ...serverRealTimeRules];
+const without = (rules, boundary) => rules.filter(rule => rule !== boundary);
+
 // A later entry's no-restricted-syntax replaces an earlier one's for the same
-// file, so each entry lists every selector that applies to its files.
+// file, so each entry lists every selector that applies to its files, and a
+// boundary entry comes after its group's.
 export const projectRules = [
   {
     files: unitTests,
@@ -233,7 +247,13 @@ export const projectRules = [
   },
   {
     files: testSupport,
-    rules: { "no-restricted-syntax": ["error", ...unitTestRules, ...sharedMockTimersRules] },
+    rules: { "no-restricted-syntax": ["error", ...testSupportSyntax] },
+  },
+  {
+    // The cleanup scope's process time limit ends a real process's whole tree,
+    // so it keeps real time (CODING_STANDARDS.md "Tests").
+    files: ["tests/support/scope.ts"],
+    rules: { "no-restricted-syntax": ["error", ...without(testSupportSyntax, delayedTimeout)] },
   },
   {
     files: product,
@@ -243,7 +263,13 @@ export const projectRules = [
   {
     files: server,
     ignores: tests,
-    rules: { "no-restricted-syntax": ["error", ...namedTimingRules, ...serverRealTimeRules] },
+    rules: { "no-restricted-syntax": ["error", ...serverSyntax] },
+  },
+  {
+    // systemTimers, the one real implementation of the injected Timers
+    // (CODING_STANDARDS.md "Decisions apart from effects").
+    files: ["server/deadline.ts"],
+    rules: { "no-restricted-syntax": ["error", ...without(serverSyntax, globalTimeout)] },
   },
 ];
 
