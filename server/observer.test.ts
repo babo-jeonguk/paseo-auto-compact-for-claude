@@ -16,6 +16,7 @@ import { SESSION_RESUME_REQUIRED } from '../shared/rpc';
 import { heldFiles } from '../tests/support/files';
 import { fakeTimers } from '../tests/support/timers';
 import { drainer } from '../tests/support/drained';
+import { defects } from '../tests/support/defects';
 import type { PluginHandlerContext } from '@getpaseo/plugin/server';
 
 async function fixture(scope: CleanupScope, files?: DurableFiles) {
@@ -47,7 +48,10 @@ async function fixture(scope: CleanupScope, files?: DurableFiles) {
   await save();
   const agent: Observation = { agentId: 'a', title: null, workspace: home, provider: 'claude',
     revision: new Date(time).toISOString(), tokens: 210_000, eligible: true, idle: true, sessionId: 'native-a' };
-  return { home, request, prepared, observer, agent, ledger, save, directory, parent, manifest, writes,
+  // Failures the writes hand over once closed, as the plugin's teardown would get them.
+  const torndown: unknown[] = [];
+  return { home, request, prepared, observer, agent, ledger, save, directory, parent, manifest, writes, torndown,
+    close: () => writes.close(error => { torndown.push(error); }),
     now: () => time, advance(ms: number) { time += ms; } };
 }
 
@@ -518,7 +522,7 @@ test('once durable writes close, no launch, preparation or retirement is written
   const f = await fixture(cleanupScope(t));
   const prepared = await f.observer.prepare(f.agent, false, 1_030_000, 'operation');
   const manifest = await readFile(join(f.parent, 'current.json'), 'utf8');
-  f.writes.close();
+  f.close();
   await assert.rejects(f.observer.prepareSession(f.request, true), Stopped);
   await assert.rejects(f.observer.prepare(f.agent, false, 1_030_000, 'another'), Stopped);
   await assert.rejects(f.observer.cancel(prepared, false), Stopped);
@@ -526,6 +530,7 @@ test('once durable writes close, no launch, preparation or retirement is written
   assert.equal((await requestFile(f.directory)).preparation, prepared.preparation);
   assert.equal((await requestFile(f.directory)).status, 'prepared');
   await f.writes.drain();
+  assert.deepEqual(defects(f.torndown), []);
 });
 
 test('after a reload the gateway sends nothing to the launch the previous instance started, until a fresh launch opens', async (t) => {
@@ -734,13 +739,14 @@ test('across a reload, a retirement the stopped instance had issued lands before
   await held.reached;
   // The host stops the plugin (its writes close, then drain) and starts the
   // next instance only once that stop has ended.
-  f.writes.close();
+  f.close();
   let stopped = false;
   const stopping = f.writes.drain().then(() => { stopped = true; });
   await drained();
   assert.equal(stopped, false, 'the stop waits for the issued retirement');
   held.release();
   await stopping;
+  assert.deepEqual(defects(f.torndown), [], 'the issued retirement landed');
   const next = createObserver({ home: f.home, now: f.now, writes: createDurableWrites() });
   await next.recoverPrepared(() => assert.fail('the stopped instance already retired its request'),
     () => assert.fail('nothing fails'));
@@ -758,13 +764,14 @@ test('across a reload, a launch publication the stopped instance had issued land
   const held = holdRename(manifestPath);
   void f.observer.prepareSession(f.request, true).catch(() => {});
   await held.reached;
-  f.writes.close();
+  f.close();
   let stopped = false;
   const stopping = f.writes.drain().then(() => { stopped = true; });
   await drained();
   assert.equal(stopped, false, 'the stop waits for the issued publication');
   held.release();
   await stopping;
+  assert.deepEqual(defects(f.torndown), [], 'the issued publication landed');
   const next = createObserver({ home: f.home, now: f.now, writes: createDurableWrites() });
   const reopened = await next.prepareSession(f.request, true);
   const launchId = reopened.env.CLAUDE_CODE_PLUGIN_DIRS.split(delimiter).at(-1)!.split(/[\\/]/).at(-2)!;

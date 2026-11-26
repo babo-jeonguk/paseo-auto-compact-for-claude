@@ -7,7 +7,9 @@ export type DurableFiles = Pick<typeof fs, "writeFile" | "rename" | "rm">;
 export type DurableWrites = {
   run<T>(work: () => Promise<T>): Promise<T>;
   replace(path: string, contents: string): Promise<void>;
-  close(): void;
+  // Closes the writes, and hands every failure of a write still in flight to
+  // `teardown` as it settles (its caller still gets it too).
+  close(teardown: (error: unknown) => void): void;
   drain(): Promise<void>;
 };
 
@@ -46,7 +48,7 @@ export function createDurableWrites(files: DurableFiles = fs): DurableWrites {
   return {
     run,
     replace,
-    close() { closed = true; },
+    close(_teardown) { closed = true; },
     async drain() {
       // Work tracked while draining is drained too; a replacement can start no
       // work once closed, but run() may already have been called.
