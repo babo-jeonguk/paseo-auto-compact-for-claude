@@ -1,4 +1,3 @@
-import comments from "@eslint-community/eslint-plugin-eslint-comments/configs";
 import js from "@eslint/js";
 import { defineConfig, globalIgnores } from "eslint/config";
 import globals from "globals";
@@ -38,7 +37,8 @@ const contextMock = 'A unit test mocks through its test context (t.mock), which 
 const cleanupInFinally = 'A test stopped at the runner\'s bound never reaches its finally, so what acquires something ' +
   'that would outlive the test (a timer, process, server or temporary folder) registers its release with the test\'s ' +
   'cleanup scope (tests/support/scope.ts) as it acquires it; the runner still runs the scope\'s hook. A finally ' +
-  'that must still wait says why it is safe in a disable comment (CODING_STANDARDS.md "Tests").';
+  'never waits: what must happen at the end of a test, however it ends, is a release registered with the cleanup ' +
+  'scope (CODING_STANDARDS.md "Tests").';
 const temporaryFolder = 'A unit test creates a temporary folder through its cleanup scope (folder() in ' +
   'tests/support/scope.ts), which registers the removal in the same call, so no step between creating the folder ' +
   'and registering its removal can leak it (CODING_STANDARDS.md "Tests").';
@@ -99,11 +99,16 @@ const number = "Literal[raw=/^\\.?[0-9]/]:not([value=0])";
 const literal = (call, position) =>
   `${call} > :nth-child(${position}):not(:function):matches(${number}, :has(${number}))`;
 
+// A real timer with any delay but 0 (the next turn), whatever the callback
+// does. setTimeout is its own rule: the cleanup scope's process time limit is
+// the one boundary for it.
+const delayed = (names) => `${globalCall(names)}[arguments.length>1]:not([arguments.1.value=0])`;
+const delayedTimeout = { selector: delayed("/^setTimeout$/"), message: realTime };
 // Rules for every unit test and its support modules.
 const unitTestRules = [
+        delayedTimeout,
         {
-          // Any delay but 0 (the next turn), whatever the callback does.
-          selector: `${globalCall(timer)}[arguments.length>1]:not([arguments.1.value=0])`,
+          selector: delayed("/^setInterval$/"),
           message: realTime,
         },
         {
@@ -214,18 +219,86 @@ const namedTimingRules = [{
 }];
 // Real time reached in server code: a global timer, a timeout signal (also
 // through the global object), or the timer modules imported, re-exported,
-// required or loaded as a built-in by a written name.
-const serverRealTimeRules = [{
-  selector: `${globalCall("/^(setTimeout|setInterval|setImmediate)$/")}, ` +
+// required or loaded as a built-in by a written name. The global setTimeout is
+// its own rule: the one real implementation of Timers is the boundary for it.
+const globalTimeout = { selector: globalCall("/^setTimeout$/"), message: serverRealTime };
+const serverRealTimeRules = [globalTimeout, {
+  selector: `${globalCall("/^(setInterval|setImmediate)$/")}, ` +
     `${abortTimeout}, ` +
     `:matches(ImportDeclaration, ExportNamedDeclaration, ExportAllDeclaration)[source.value=${timersModule}], ` +
     timersLoad,
   message: serverRealTime,
 }];
 
+// A TypeScript directive, read with TypeScript's own grammar (singleLinePragmaRegEx
+// and commentDirectiveRegEx* in typescript/lib/typescript.js): the check and
+// nocheck pragmas belong to a line comment, and TypeScript lowercases their
+// name and reads it whole; the ignore and expect-error directives are read as
+// written at the start of a line comment or of a block comment's last line.
+// typescript-eslint's ban-ts-comment reads the pragmas case-sensitively and by
+// prefix, so it passes `// @TS-NOCHECK` and rejects `// @ts-checked by ...`.
+const pragma = /^\/\/\/?\s*@([^\s:]+)(?:[\s:]|$)/;
+const lineDirective = /^\/\/\/?\s*@(ts-expect-error|ts-ignore)/;
+const blockDirective = /^(?:\/|\*)*\s*@(ts-expect-error|ts-ignore)/;
+const typescriptDirective = (comment) => {
+  if (comment.type === "Line") {
+    const name = pragma.exec(`//${comment.value}`)?.[1].toLowerCase();
+    if (name === "ts-check" || name === "ts-nocheck") return name;
+    return lineDirective.exec(`//${comment.value}`)?.[1];
+  }
+  if (comment.type !== "Block") return undefined;
+  const lastLine = `/*${comment.value}`.split(/\r\n?|[\n\u2028\u2029]/).at(-1).trimStart();
+  return blockDirective.exec(lastLine)?.[1];
+};
+const directives = {
+  rules: {
+    "typescript-directive": {
+      meta: {
+        type: "problem",
+        schema: [],
+        messages: {
+          directive: 'A TypeScript directive ("@{{name}}") changes from a comment what the type checker reports, ' +
+            'with or without a description: which files are checked is set in tsconfig.json, and a type error is ' +
+            'fixed in the code (CODING_STANDARDS.md "Comments say why").',
+        },
+      },
+      create: (context) => ({
+        Program() {
+          for (const comment of context.sourceCode.getAllComments()) {
+            const name = typescriptDirective(comment);
+            if (name) context.report({ loc: comment.loc, messageId: "directive", data: { name } });
+          }
+        },
+      }),
+    },
+  },
+};
+
+// The selectors of each group of files, listed once so a boundary below takes
+// the same list less the one rule it is the boundary for.
+const testSupportSyntax = [...unitTestRules, ...sharedMockTimersRules];
+const serverSyntax = [...namedTimingRules, ...serverRealTimeRules];
+const without = (rules, boundary) => rules.filter(rule => rule !== boundary);
+
 // A later entry's no-restricted-syntax replaces an earlier one's for the same
-// file, so each entry lists every selector that applies to its files.
+// file, so each entry lists every selector that applies to its files, and a
+// boundary entry comes after its group's.
 export const projectRules = [
+  {
+    // A comment never turns a rule off. With inline configuration off, a
+    // directive (eslint-disable, /* eslint ... */, /* global ... */) has no
+    // effect and is reported as a warning, which fails lint; a file that is the
+    // boundary for a rule is an entry here that names the standard it
+    // implements. A TypeScript directive changes from a comment what the type
+    // checker reports, so none is allowed, with or without a description; the
+    // directive rule above replaces ban-ts-comment, which misreads the pragmas.
+    linterOptions: { noInlineConfig: true },
+    plugins: { "@typescript-eslint": tseslint.plugin, directives },
+    rules: {
+      "@typescript-eslint/ban-ts-comment": "off",
+      "directives/typescript-directive": "error",
+    },
+  },
   {
     files: unitTests,
     ignores: testSupport,
@@ -233,7 +306,13 @@ export const projectRules = [
   },
   {
     files: testSupport,
-    rules: { "no-restricted-syntax": ["error", ...unitTestRules, ...sharedMockTimersRules] },
+    rules: { "no-restricted-syntax": ["error", ...testSupportSyntax] },
+  },
+  {
+    // The cleanup scope's process time limit ends a real process's whole tree,
+    // so it keeps real time (CODING_STANDARDS.md "Tests").
+    files: ["tests/support/scope.ts"],
+    rules: { "no-restricted-syntax": ["error", ...without(testSupportSyntax, delayedTimeout)] },
   },
   {
     files: product,
@@ -243,7 +322,13 @@ export const projectRules = [
   {
     files: server,
     ignores: tests,
-    rules: { "no-restricted-syntax": ["error", ...namedTimingRules, ...serverRealTimeRules] },
+    rules: { "no-restricted-syntax": ["error", ...serverSyntax] },
+  },
+  {
+    // systemTimers, the one real implementation of the injected Timers
+    // (CODING_STANDARDS.md "Decisions apart from effects").
+    files: ["server/deadline.ts"],
+    rules: { "no-restricted-syntax": ["error", ...without(serverSyntax, globalTimeout)] },
   },
 ];
 
@@ -254,13 +339,6 @@ export default defineConfig([
     // Generated from server/observer-source.mjs, which is linted instead.
     "server/observer-assets.generated.ts",
   ]),
-  {
-    // A disable comment says why, and one that no longer suppresses anything
-    // is an error so it cannot outlive its reason.
-    linterOptions: { reportUnusedDisableDirectives: "error", reportUnusedInlineConfigs: "error" },
-  },
-  comments.recommended,
-  { rules: { "@eslint-community/eslint-comments/require-description": "error" } },
   js.configs.recommended,
   tseslint.configs.recommended,
   { languageOptions: { globals: globals.node } },

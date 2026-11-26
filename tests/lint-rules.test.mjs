@@ -12,10 +12,12 @@ const findings = (file, code) => linter.verify(code, config, file).map(({ messag
   assert(!fatal, message);
   return message;
 });
-const flags = (file, code, standard) => {
+// The sample reports exactly one finding per expected pattern.
+const flags = (file, code, ...expected) => {
   const messages = findings(file, code);
-  assert.equal(messages.length, 1, `${file}: ${code}\n${messages.join('\n')}`);
-  assert.match(messages[0], standard);
+  const shown = `${file}: ${code}\n${messages.join('\n')}`;
+  assert.equal(messages.length, expected.length, shown);
+  for (const pattern of expected) assert(messages.some(message => pattern.test(message)), shown);
 };
 const passes = (file, code) => assert.deepEqual(findings(file, code), [], `${file}: ${code}`);
 
@@ -170,7 +172,7 @@ test('unit tests register cleanup that waits with their scope, not in finally', 
       'try { await run(); } finally { release(); await running; }',
       'try { await run(); } finally { if (root) await rm(root); }',
       'try { await run(); } finally { for await (const line of lines) log(line); }',
-    ]) flags(file, code, /CODING_STANDARDS\.md "Tests"/);
+    ]) flags(file, code, /A finally never waits[^]*release registered with the cleanup scope[^]*CODING_STANDARDS\.md "Tests"/);
     for (const code of [
       'try { await run(); } finally { release(); }',
       'scope.defer(async () => { await rm(dir, { recursive: true, force: true }); });',
@@ -357,4 +359,93 @@ test('product timer and deadline arguments are named constants', () => {
 test('the timing rule leaves tests alone', () => {
   for (const file of ['server/a.test.ts', 'tests/simulation/run.mjs', 'tests/e2e/run.mjs'])
     passes(file, 'bounded(work, 5_000);');
+});
+
+// The one real Timers implementation is a boundary in the lint configuration:
+// its module may call the global setTimeout, and every other server rule still
+// applies to it.
+test('the real Timers module may call only the global setTimeout', () => {
+  passes('server/deadline.ts', 'const timer = setTimeout(callback, milliseconds);');
+  for (const code of [
+    'setTimeout(fire, 50);',
+    'timers.setTimeout(fire, 50);',
+    'setInterval(tick, TICK_MS);',
+    'setImmediate(fire);',
+    'globalThis.setImmediate(fire);',
+    'AbortSignal.timeout(REGISTRY_TIMEOUT_MS);',
+    "import { setTimeout } from 'node:timers/promises';",
+    "await import('node:timers');",
+  ]) flags('server/deadline.ts', code, /CODING_STANDARDS\.md "(Decisions apart from effects|Named timings)"/);
+  flags('server/a.ts', 'const timer = setTimeout(callback, milliseconds);', /CODING_STANDARDS\.md "Decisions apart from effects"/);
+});
+
+// The cleanup scope's process time limit is the boundary for real timers in
+// the support modules: its module may start a delayed global setTimeout, and
+// every other test-support rule still applies to it.
+test('the cleanup scope may start only a delayed global setTimeout', () => {
+  passes('tests/support/scope.ts', 'const limit = setTimeout(() => { child.timedOut = true; }, timeout);');
+  for (const code of [
+    'setInterval(poll, 10);',
+    'globalThis.setInterval(poll, 10);',
+    'AbortSignal.timeout(50);',
+    "import { setTimeout } from 'node:timers/promises';",
+    'mock.timers.tick(1);',
+    "mock.method(console, 'error');",
+    'try { await run(); } finally { await rm(dir); }',
+    'for (let i = 0; i < 100 && !done(); i++) await settle();',
+  ]) flags('tests/support/scope.ts', code, /CODING_STANDARDS\.md "Tests"/);
+  flags('tests/support/a.ts', 'const limit = setTimeout(() => { child.timedOut = true; }, timeout);', /CODING_STANDARDS\.md "Tests"/);
+});
+
+// Inline configuration is off, so no comment turns a rule off or declares a
+// global: the directive is reported, and the rule it named still reports.
+test('a directive comment has no effect and is reported', () => {
+  const noEffect = /has no effect because you have 'noInlineConfig'/;
+  const serverTime = /CODING_STANDARDS\.md "Decisions apart from effects"/;
+  for (const code of [
+    '// eslint-disable-next-line no-restricted-syntax -- the one real timer\nsetTimeout(fire, POLL_MS);',
+    'setTimeout(fire, POLL_MS); // eslint-disable-line no-restricted-syntax',
+    '/* eslint-disable no-restricted-syntax */\nsetTimeout(fire, POLL_MS);',
+    '/* eslint-disable */\nsetTimeout(fire, POLL_MS);',
+    '/* eslint no-restricted-syntax: off */\nsetTimeout(fire, POLL_MS);',
+  ]) flags('server/a.ts', code, noEffect, serverTime);
+  flags('tests/a.test.mjs', '// eslint-disable-next-line no-restricted-syntax\nsetTimeout(resolve, 50);', noEffect, /CODING_STANDARDS\.md "Tests"/);
+  for (const file of ['server/a.ts', 'tests/a.test.mjs', 'scripts/a.mjs'])
+    flags(file, '/* global fire */\nfire();', noEffect);
+});
+
+// A TypeScript directive changes from a comment what the type checker
+// reports, so none is allowed, with or without a description, in any spelling
+// TypeScript reads as one: it reads @ts-check and @ts-nocheck in any case.
+test('every TypeScript directive is rejected', () => {
+  const directive = /TypeScript directive \("@ts-[a-z-]+"\) changes from a comment what the type checker reports[^]*tsconfig\.json[^]*CODING_STANDARDS\.md "Comments say why"/;
+  for (const file of ['server/a.ts', 'tests/a.test.mjs']) {
+    for (const code of [
+      '// @ts-ignore\nconst a = reply.count;',
+      '//@ts-ignore because the reply is untyped\nconst a = reply.count;',
+      '// @ts-expect-error\nconst a = reply.count;',
+      '// @ts-expect-error: the host types lag behind its replies\nconst a = reply.count;',
+      '/* @ts-expect-error */ const a = reply.count;',
+      '/**\n * The reply is untyped.\n * @ts-ignore */\nconst a = reply.count;',
+      '// @ts-nocheck\nconst a = 1;',
+      '// @TS-NOCHECK\nconst a = 1;',
+      '/// @Ts-NoCheck: the host types lag\nconst a = 1;',
+      '// @ts-check\nconst a = 1;',
+      '// @TS-CHECK\nconst a = 1;',
+    ]) flags(file, code, directive);
+  }
+});
+
+test('ordinary comments are not directives', () => {
+  for (const file of ['server/a.ts', 'tests/support/scope.ts', 'tests/a.test.mjs']) {
+    for (const code of [
+      '// The host reports turns out of order, so the latest read wins.\nconst a = 1;',
+      '/** The one real timer the scope keeps; eslint reads its boundary from the configuration. */\nconst a = 1;',
+      '// global state lives in the store\nconst a = 1;',
+      '/* A ts-expect-error pragma would hide the type error here. */\nconst a = 1;',
+      '// @ts-checked by the compiler on every build\nconst a = 1;',
+      '/* @ts-nocheck is read only from a line comment */\nconst a = 1;',
+      '#!/@ts-ignore-tools/bin/run\nconst a = 1;',
+    ]) passes(file, code);
+  }
 });

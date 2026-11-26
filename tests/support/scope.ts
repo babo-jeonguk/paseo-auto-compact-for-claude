@@ -128,7 +128,8 @@ export function cleanupScope(t: ScopeContext): CleanupScope {
       const limitFailure = new Promise<never>((_, reject) => { failAtLimit = reject; });
       limitFailure.catch(() => {}); // a spawn() caller learns of it from the release
       limitFailures.set(child, limitFailure);
-      // eslint-disable-next-line no-restricted-syntax -- the time limit a real process keeps (CODING_STANDARDS.md "Tests"); spawn's own would end only the direct child
+      // The scope keeps the time limit itself rather than passing spawn's
+      // `timeout`, which would end only the direct child.
       const limit = setTimeout(() => { child.timedOut = true; end().catch(failAtLimit); }, timeout);
       void closed.then(() => clearTimeout(limit));
       defer(async () => {
