@@ -9,7 +9,7 @@ import { createGateway, EVIDENCE_POLL_MS } from "./gateway";
 import { createObserver, QUERY_RESTARTED_REFUSAL } from "./observer";
 import { createOperationWorker } from "./operations";
 import { createScheduler } from "./scheduler";
-import { createKeyedQueue } from "./queue";
+import { createKeyedQueue, createQueue } from "./queue";
 import { DEFAULT_SETTINGS } from "../shared/settings";
 import { changes } from "../tests/support/changes";
 import { fakeTimers } from "../tests/support/timers";
@@ -1359,15 +1359,11 @@ test("an attempt that ends unknown after a lost live view stays open for reconci
     id: "lost-view", agentId: "a", revision: agent.revision!, target: { sessionId: agent.sessionId, activityKey: agent.activityKey ?? null },
     kind: "manual", state: "requested", createdAt: time, updatedAt: time, result: null, inputFingerprint: "lost-view",
     sendBy: time + 10_000, attempt: 0 }] };
-  let tail: Promise<unknown> = Promise.resolve();
+  const queue = createQueue();
   const errors: unknown[] = [];
   const worker = createOperationWorker({
     store: { read: async () => structuredClone(state), write: async next => { state = structuredClone(next); } },
-    update: change => {
-      const result = tail.then(() => { const next = structuredClone(state); const value = change(next); state = next; return value; });
-      tail = result.catch(() => {});
-      return result;
-    },
+    update: change => queue.run(async () => { const next = structuredClone(state); const value = change(next); state = next; return value; }),
     gateway: host.gateway, settings: async () => ({ ...DEFAULT_SETTINGS }), now: host.clock.now, timers: host.clock.timers, onError: error => errors.push(error),
   });
   await worker.reconcile();

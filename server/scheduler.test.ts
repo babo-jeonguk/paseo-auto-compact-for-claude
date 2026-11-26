@@ -6,7 +6,7 @@ import {
   type Settings,
 } from "../shared/settings";
 import { createScheduler, FULL_SCAN_INTERVAL_MS, TICK_INTERVAL_MS } from "./scheduler";
-import { INSPECT_TIMEOUT_MS, Stopped, type Timers } from "./deadline";
+import { DeadlineExceeded, INSPECT_TIMEOUT_MS, Stopped, type Timers } from "./deadline";
 import { DELIVERY_WINDOW_MS } from "./policy";
 import { HISTORY_RETENTION_MS, HISTORY_SWEEP_INTERVAL_MS, type OperationReceipts } from "./retention";
 import { changes } from "../tests/support/changes";
@@ -1928,7 +1928,8 @@ test("a refresh that fails does not end single-flight while a sibling refresh is
   // a fails at once; the merged pass reports it when b's read times out.
   await readBound(f, () => heldB);
   await f.timers.tick(INSPECT_TIMEOUT_MS);
-  await assert.rejects(merged[0], /host failed for a/);
+  await assert.rejects(merged[0], (error: unknown) => error instanceof AggregateError &&
+    error.errors.some(cause => cause instanceof Error && cause.message === "host failed for a"));
   const from = f.hostCalls.length;
   const again = s.observe({ kind: "agent", agentId: "b" });
   await f.drained();
@@ -2712,4 +2713,135 @@ test("a stopped scheduler starts no read, write, host call or timer for a call m
     { reads: 0, writes: 0, lists: 0, settings: 0, readiness: 0, refreshes: [] },
     "nothing is read, written or asked of the host");
   assert.deepEqual([f.calls, f.receiptCalls.length, defects(f.errors).length, f.timers.pending], [0, 0, 0, 0]);
+});
+
+// What a pass delivers: every failure it met by the time it completes, in one
+// group, and each later one to the error owner as it arrives.
+const failureOf = (outcome: Promise<unknown>) => outcome.then(() => null, (error: unknown) => error);
+const causesOf = (error: unknown) => {
+  assert.ok(error instanceof AggregateError, `the pass fails with every failure it met, not ${String(error)}`);
+  return error.errors;
+};
+
+test("an observation pass delivers every failure it met, not only the first", async () => {
+  const f = fixture();
+  const s = f.make();
+  await s.ready;
+  const first = new Error("EIO: a"), second = new Error("EIO: b");
+  f.gateway.list = async observe => { observe(Promise.reject(first)); observe(Promise.reject(second)); };
+  assert.deepEqual(causesOf(await failureOf(s.observe({ kind: "full" }))), [first, second]);
+  assert.deepEqual(f.errors, [], "on-time failures go to the caller, not also to the owner");
+});
+
+test("a pass with an observation that times out and one that fails delivers both", async () => {
+  const f = fixture();
+  const s = f.make();
+  await s.ready;
+  const fault = new Error("EACCES: ledger");
+  f.gateway.list = async observe => { observe(new Promise<never>(() => {})); observe(Promise.reject(fault)); };
+  const outcome = failureOf(s.observe({ kind: "full" }));
+  await readBound(f);
+  await f.timers.tick(INSPECT_TIMEOUT_MS);
+  const causes = causesOf(await outcome);
+  assert.equal(causes.length, 2);
+  assert.ok(causes.includes(fault), "the real fault is delivered");
+  assert.ok(causes.some(cause => cause instanceof DeadlineExceeded), "and so is the timeout beside it");
+});
+
+test("a listing or observation that fails after the pass stopped waiting on it reaches the error owner", async () => {
+  const f = fixture();
+  const s = f.make();
+  await s.ready;
+  let failListing!: (error: Error) => void;
+  let failRead!: (error: Error) => void;
+  f.gateway.list = observe => {
+    observe(new Promise<never>((_resolve, reject) => { failRead = reject; }));
+    return new Promise<never>((_resolve, reject) => { failListing = reject; });
+  };
+  const outcome = failureOf(s.observe({ kind: "full" }));
+  await readBound(f);
+  await f.timers.tick(INSPECT_TIMEOUT_MS);
+  assert.ok(causesOf(await outcome).every(cause => cause instanceof DeadlineExceeded), "both waits timed out");
+  assert.deepEqual(f.errors, []);
+  const listing = new Error("EIO: listing page"), read = new Error("EIO: ledger read");
+  failListing(listing);
+  failRead(read);
+  await f.drained();
+  assert.deepEqual(f.errors, [listing, read], "each late failure is handed to the owner as it arrives");
+});
+
+test("an observation that starts and fails after its pass completed reaches the error owner", async () => {
+  const f = fixture();
+  const s = f.make();
+  await s.ready;
+  const page = gate();
+  const late = new Error("EIO: ledger read on a later page");
+  f.gateway.list = async observe => { await page.pass(); observe(Promise.reject(late)); };
+  const outcome = failureOf(s.observe({ kind: "full" }));
+  await page.reached;
+  await readBound(f);
+  await f.timers.tick(INSPECT_TIMEOUT_MS);
+  assert.ok(causesOf(await outcome)[0] instanceof DeadlineExceeded, "the listing timed out");
+  page.release();
+  await f.drained();
+  assert.deepEqual(f.errors, [late]);
+});
+
+test("a full scan whose listing page fails records nothing, and still delivers the failures of reads already started", async () => {
+  const f = fixture();
+  f.agents.splice(0, 1, nativeAgent(f, "a"));
+  const s = f.make();
+  await s.ready;
+  const read = new Error("EIO: ledger of b"), page = new Error("listing page failed");
+  f.gateway.list = async observe => {
+    observe(Promise.resolve(structuredClone(f.agents[0])));
+    observe(Promise.reject(read));
+    throw page;
+  };
+  const causes = causesOf(await failureOf(s.observe({ kind: "full" })));
+  assert.deepEqual(new Set(causes), new Set([page, read]), "neither failure hides the other");
+  assert.deepEqual(reserved(f), [], "a partial full scan records nothing");
+});
+
+test("an observation that fails while the settings list is still paging is reported, and the list fails", async () => {
+  for (const later of ["ends", "fails"] as const) {
+    const f = fixture();
+    const s = f.make();
+    await s.ready;
+    const page = gate();
+    const observation = new Error("EIO: ledger"), listing = new Error("listing page failed");
+    f.gateway.list = async observe => {
+      observe(Promise.reject(observation));
+      await page.pass();
+      if (later === "fails") throw listing;
+    };
+    const outcome = failureOf(s.list());
+    await page.reached;
+    await f.drained();
+    assert.deepEqual(f.errors, [observation], `${later}: the failure is reported while paging goes on`);
+    page.release();
+    const error = await outcome;
+    assert.ok(error instanceof Error, `${later}: the list fails, so the screen offers Retry`);
+    if (later === "fails") assert.equal(error, listing, "a failed listing takes precedence");
+    assert.deepEqual(f.errors, [observation], `${later}: the observation's failure is reported once`);
+  }
+});
+
+test("a host read already issued when the scheduler stops still has its failure reported", async () => {
+  const f = fixture();
+  const s = f.make();
+  await s.ready;
+  let fail!: (error: Error) => void;
+  const reading = gate();
+  f.gateway.refresh = async () => { await reading.pass(); return new Promise<never>((_resolve, reject) => { fail = reject; }); };
+  const status = failureOf(s.session("a"));
+  await reading.reached;
+  reading.release();
+  await f.drained();
+  s.stop();
+  assert.ok(await status instanceof Stopped, "the call ends at the stop");
+  const defect = new TypeError("host read broke");
+  fail(defect);
+  await f.drained();
+  assert.deepEqual(defects(f.errors), [String(defect)], "the read's own failure is still handed on");
 });

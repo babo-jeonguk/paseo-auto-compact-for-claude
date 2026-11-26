@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createOperationWorker, leftoverRetirement, recoverOperations } from "./operations";
+import { createQueue } from "./queue";
 import { TICK_INTERVAL_MS } from "./scheduler";
 import { dueAt } from "./policy";
 import { changes } from "../tests/support/changes";
@@ -62,7 +63,8 @@ function fixture(options: { agents?: string[] } = {}) {
     },
     inspect: async operation => typeof evidence === "function" ? evidence(operation) : evidence,
   };
-  let tail: Promise<unknown> = Promise.resolve();
+  // The scheduler's state queue, as the worker gets it.
+  const queue = createQueue();
   // A held transaction is held before it is applied (`queued`), or applied and
   // then held before it returns to the worker; `skip` transactions pass before it.
   let holdUpdate: { skip: number; queued: boolean; reached: () => void; release: Promise<void> } | null = null;
@@ -74,7 +76,7 @@ function fixture(options: { agents?: string[] } = {}) {
     await hold.release;
   };
   const update = <T>(change: (state: State) => T): Promise<T> => {
-    const result = tail.then(async () => {
+    const result = queue.run(async () => {
       await holding(true);
       const next = structuredClone(state);
       const value = change(next);
@@ -84,7 +86,6 @@ function fixture(options: { agents?: string[] } = {}) {
       await holding(false);
       return value;
     });
-    tail = result.catch(() => {});
     updated?.(result);
     return result;
   };
