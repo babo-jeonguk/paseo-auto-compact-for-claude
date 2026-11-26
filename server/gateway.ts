@@ -1,12 +1,12 @@
 import type { PluginHandlerContext, PluginHookEvents } from "@getpaseo/plugin/server";
-import { randomUUID } from "node:crypto";
 import { Refusal, readable, targetOf, unchanged, type Gateway, type Observation, type DispatchGuard, type ExecutionContext,
   type LeftoverDecision, type OperationEvidence, type StoredOperation } from "./model";
 import type { createObserver } from "./observer";
-import { bounded, CLEANUP_TIMEOUT_MS, deadlineOf, LIVE_OBSERVATION_MS, observationEndBy, pause, readWithin, SEND_DEADLINE_MS,
+import { bounded, CLEANUP_TIMEOUT_MS, deadlineOf, DeadlineExceeded, LIVE_OBSERVATION_MS, observationEndBy, pause, readWithin,
   SEND_TIMEOUT_MS, Stopped, systemTimers, type Timers } from "./deadline";
 import { claudeProvider } from "../shared/providers";
 import { SESSION_RESUME_REQUIRED } from "../shared/rpc";
+import { createKeyedQueue } from "./queue";
 export { claudeProvider } from "../shared/providers";
 
 type Api = PluginHandlerContext["paseo"];
@@ -55,18 +55,9 @@ export function createGateway(options: {
   const pending = new Map<string, { turnId: string | null }>();
   const busy = new Set<string>();
   // One writer of a conversation's native request at a time: a turn ends with
-  // its last write, not with the wait on it.
-  const writers = new Map<string, { done: Promise<void>; end: () => void }>();
-  const takeTurn = (agentId: string) => {
-    const earlier = writers.get(agentId)?.done ?? Promise.resolve();
-    let end!: () => void;
-    const own = new Promise<void>(resolve => { end = resolve; });
-    const turn = { done: earlier.then(() => own), end };
-    writers.set(agentId, turn);
-    // Drop the entry once this chain has ended, unless a newer turn replaced it.
-    void turn.done.then(() => { if (writers.get(agentId) === turn) writers.delete(agentId); });
-    return { wait: earlier, end };
-  };
+  // its last write, not with the wait on it. The observer's own file work runs
+  // inside a turn.
+  const turns = createKeyedQueue<string>();
   // Stopping the gateway aborts this signal, which ends every wait on it at
   // once, cleanup waits included, and clears their timers.
   const stopping = new AbortController();
@@ -127,12 +118,9 @@ export function createGateway(options: {
         const page = await requireApi().agents.list({ filter: { includeBackground: true },
           page: { limit: 200, ...(cursor ? { cursor } : {}) } });
         // Observations run while later pages are listed. The caller handles
-        // each one from the moment it starts; until then a rejection must not
-        // count as unhandled.
+        // each one from the moment it is handed over (the Gateway.list contract).
         for (const { agent } of page.entries) {
-          const observed = observation(agent, config.providers);
-          observed.catch(() => {});
-          observe(observed);
+          observe(observation(agent, config.providers));
         }
         cursor = page.pageInfo.hasMore ? page.pageInfo.nextCursor ?? undefined : undefined;
       } while (cursor);
@@ -148,13 +136,8 @@ export function createGateway(options: {
       async release(operation: StoredOperation) {
         const native = operation.evidence?.native;
         if (!native) return;
-        const turn = takeTurn(operation.agentId);
-        await turn.wait;
-        try {
-          await observer.release(operation.agentId, native, operation.evidence?.dispatchStartedAt !== undefined);
-        } finally {
-          turn.end();
-        }
+        await turns.run(operation.agentId, () => observer.release(operation.agentId, native,
+          operation.evidence?.dispatchStartedAt !== undefined));
       },
       // Startup retires what an earlier instance left prepared, as the
       // scheduler's leftover decision says; each conversation's failure is the
@@ -187,17 +170,17 @@ export function createGateway(options: {
     // the send deadline applies; after it a fresh observation budget, so a late
     // send is still observed in full.
     const live = options.timeoutMs ?? LIVE_OBSERVATION_MS;
-    const sendBy = execution?.sendBy ?? now() + SEND_DEADLINE_MS[automatic ? "automatic" : "manual"];
+    const sendBy = execution.sendBy;
     let deadline = sendBy;
     const wait = <T>(work: Promise<T>) => bounded(work, deadline - now(), timers, execution.fault, stopping.signal);
     const read = <T>(work: Promise<T>) => readWithin(work, deadline, now(), timers, execution.fault, stopping.signal);
-    const currentWorker = () => !stopped && (execution?.current() ?? true) && now() < deadline;
+    const currentWorker = () => !stopped && execution.current() && now() < deadline;
     const ref = requireApi().agents.ref(agentId);
     busy.add(agentId);
-    const id = execution?.id ?? randomUUID();
+    const id = execution.id;
     let operation: Awaited<ReturnType<Observer['prepare']>['ready']> | undefined;
-    let preparing: ReturnType<Observer['prepare']>['ready'] | undefined;
-    let turn: ReturnType<typeof takeTurn> | undefined;
+    let preparation: ReturnType<Observer['prepare']> | undefined;
+    let turn: ReturnType<typeof turns.hold> | undefined;
     let sent = false, armed = false, ownershipLost = false;
     let boundary = false;
     // Lost live views so far. After one, the live command turn and boundary
@@ -213,7 +196,6 @@ export function createGateway(options: {
     const endings = new Map<string, End>();
     let saved = "", lastCheckpoint = 0;
     async function checkpoint(force = false) {
-      if (!execution) return;
       const { turnId, boundary } = proof();
       // A lost live view is not a change: the evidence stays valid, so
       // reconciliation keeps checking it until the observation deadline.
@@ -225,8 +207,8 @@ export function createGateway(options: {
     }
     try {
       if (observer) {
-        turn = takeTurn(agentId);
-        await read(turn.wait);
+        turn = turns.hold(agentId);
+        await read(turn.ready);
       }
       const before = readable(await read(gateway.refresh(agentId)));
       if (!before?.sessionId || !before.idle || !before.eligible ||
@@ -237,8 +219,8 @@ export function createGateway(options: {
       // for as long as it can still be observed.
       const startBy = Math.min(guard?.expiresAt ?? Infinity, sendBy);
       if (observer) {
-        preparing = observer.prepare(before, automatic, observationEndBy(sendBy), id).ready;
-        operation = await read(preparing);
+        preparation = observer.prepare(before, automatic, observationEndBy(sendBy), id);
+        operation = await read(preparation.ready);
         const { launchId, generation, sessionId, revision } = operation;
         // The preparation names this exact request, so a receipt from another
         // preparation of the same operation cannot settle it.
@@ -346,19 +328,20 @@ export function createGateway(options: {
       // Once the plugin's durable writes have closed (it stopped after dispatch),
       // the retirement is refused and the next instance's startup recovery
       // retires the request, so a restarting query can still attribute its refusal.
-      const prepared = operation !== undefined ? Promise.resolve(operation) : preparing;
-      const retire = prepared && !(sent && stopped)
-        ? prepared.then(value => observer!.cancel(value, sent), () => undefined)
-        : undefined;
-      const writes = retire ?? prepared;
-      if (turn) {
-        if (writes) void writes.then(turn.end, turn.end);
-        else turn.end();
-      }
+      const retirement = preparation && !(sent && stopped) ? preparation.retire(sent) : undefined;
+      turn?.release(preparation?.settled());
+      // The cleanup wait's own deadline or the stop is expected: the work goes
+      // on and a later failure reaches the attempt's owner through bounded().
+      // Any other failure goes to that owner without changing the outcome.
+      const cleanup = async (work: Promise<unknown>) => {
+        try { await bounded(work, cleanupMs, timers, execution.fault, stopping.signal); }
+        catch (error) {
+          if (!(error instanceof DeadlineExceeded || error instanceof Stopped)) execution.fault(error);
+        }
+      };
       await Promise.all([
-        retire ? bounded(retire, cleanupMs, timers, execution.fault, stopping.signal).catch(() => {}) : undefined,
-        subscription ? bounded(Promise.resolve(subscription.release()), cleanupMs, timers, execution.fault, stopping.signal)
-          .catch(() => {}) : undefined,
+        retirement && cleanup(retirement),
+        subscription && cleanup(Promise.resolve(subscription.release())),
       ]);
       busy.delete(agentId);
     }
