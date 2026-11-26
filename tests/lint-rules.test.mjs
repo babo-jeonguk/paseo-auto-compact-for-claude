@@ -170,7 +170,7 @@ test('unit tests register cleanup that waits with their scope, not in finally', 
       'try { await run(); } finally { release(); await running; }',
       'try { await run(); } finally { if (root) await rm(root); }',
       'try { await run(); } finally { for await (const line of lines) log(line); }',
-    ]) flags(file, code, /CODING_STANDARDS\.md "Tests"/);
+    ]) flags(file, code, /A finally never waits[^]*release registered with the cleanup scope[^]*CODING_STANDARDS\.md "Tests"/);
     for (const code of [
       'try { await run(); } finally { release(); }',
       'scope.defer(async () => { await rm(dir, { recursive: true, force: true }); });',
