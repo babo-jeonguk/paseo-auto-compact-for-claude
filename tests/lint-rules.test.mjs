@@ -394,3 +394,50 @@ test('the cleanup scope may start only a delayed global setTimeout', () => {
   ]) flags('tests/support/scope.ts', code, /CODING_STANDARDS\.md "Tests"/);
   flags('tests/support/a.ts', 'const limit = setTimeout(() => { child.timedOut = true; }, timeout);', /CODING_STANDARDS\.md "Tests"/);
 });
+
+// Inline configuration is off, so no comment turns a rule off or declares a
+// global: the directive is reported, and the rule it named still reports.
+test('a directive comment has no effect and is reported', () => {
+  const noEffect = /has no effect because you have 'noInlineConfig'/;
+  const serverTime = /CODING_STANDARDS\.md "Decisions apart from effects"/;
+  const reports = (file, code, ...expected) => {
+    const messages = findings(file, code);
+    assert.equal(messages.length, expected.length, `${file}: ${code}\n${messages.join('\n')}`);
+    for (const pattern of expected) assert(messages.some(message => pattern.test(message)), `${file}: ${code}\n${messages.join('\n')}`);
+  };
+  for (const code of [
+    '// eslint-disable-next-line no-restricted-syntax -- the one real timer\nsetTimeout(fire, POLL_MS);',
+    'setTimeout(fire, POLL_MS); // eslint-disable-line no-restricted-syntax',
+    '/* eslint-disable no-restricted-syntax */\nsetTimeout(fire, POLL_MS);',
+    '/* eslint-disable */\nsetTimeout(fire, POLL_MS);',
+    '/* eslint no-restricted-syntax: off */\nsetTimeout(fire, POLL_MS);',
+  ]) reports('server/a.ts', code, noEffect, serverTime);
+  reports('tests/a.test.mjs', '// eslint-disable-next-line no-restricted-syntax\nsetTimeout(resolve, 50);', noEffect, /CODING_STANDARDS\.md "Tests"/);
+  for (const file of ['server/a.ts', 'tests/a.test.mjs', 'scripts/a.mjs'])
+    reports(file, '/* global fire */\nfire();', noEffect);
+});
+
+// A TypeScript directive hides a type error rather than fixing it, so none is
+// allowed, with or without a description.
+test('every TypeScript directive is rejected', () => {
+  for (const code of [
+    '// @ts-ignore\nconst a: number = "1";',
+    '// @ts-expect-error\nconst a: number = "1";',
+    '// @ts-expect-error: the host types lag behind its replies\nconst a: number = "1";',
+    '/* @ts-expect-error */ const a: number = "1";',
+    '// @ts-nocheck\nconst a = 1;',
+    '// @ts-check\nconst a = 1;',
+  ]) flags('server/a.ts', code, /"@ts-(ignore|expect-error|nocheck|check)"/);
+  flags('tests/a.test.mjs', '// @ts-check\nconst a = 1;', /"@ts-check"/);
+});
+
+test('ordinary comments are not directives', () => {
+  for (const file of ['server/a.ts', 'tests/support/scope.ts', 'tests/a.test.mjs']) {
+    for (const code of [
+      '// The host reports turns out of order, so the latest read wins.\nconst a = 1;',
+      '/** The one real timer the scope keeps; eslint reads its boundary from the configuration. */\nconst a = 1;',
+      '// global state lives in the store\nconst a = 1;',
+      '/* A ts-expect-error pragma would hide the type error here. */\nconst a = 1;',
+    ]) passes(file, code);
+  }
+});
