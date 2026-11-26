@@ -1040,12 +1040,17 @@ test("a scan whose later listing page fails stays single-flight until reads star
   });
   const { scheduler, drained } = directoryScheduler(scope, dir);
   await scheduler.ready;
-  await assert.rejects(scheduler.observe({ kind: "full" }), /page failed/);
+  // The failed scan still delivers what a's read, started on the first page, meets.
+  const scan = scheduler.observe({ kind: "full" }).then(() => null, (error: unknown) => error);
+  await drained();
   const from = dir.calls.length;
   const next = scheduler.observe({ kind: "agent", agentId: "b" });
   await drained();
   assert.deepEqual(dir.calls.slice(from), [], "b is not read while a's read from the failed scan still runs");
   releaseA();
+  const failed = await scan;
+  assert.ok(failed instanceof AggregateError && failed.errors.some(cause => cause instanceof Error &&
+    cause.message === "page failed"), "the scan fails with its listing page");
   await next;
   // The gateway asks the host for b as the scheduler starts b's read, so a
   // start in the moment after the release is recorded before a's observation.
@@ -1066,7 +1071,7 @@ test("a listed conversation's read is bounded from when it starts, not from when
     holdRead: id => { if (id === "a") { startedA(); return heldA; } },
     holdPage: start => start === 1 ? page : undefined,
   });
-  const { scheduler, timers, until, listing, reserved } = directoryScheduler(scope, dir);
+  const { scheduler, timers, until, listing, reserved, drained } = directoryScheduler(scope, dir);
   try {
     await scheduler.ready;
     let settled: unknown = "pending";
@@ -1081,6 +1086,8 @@ test("a listed conversation's read is bounded from when it starts, not from when
     await timers.tick(4_000);
     releasePage();
     await listing();
+    // The scan's wait on the listing ends with the callbacks the listing queued.
+    await drained();
     // The deadline itself, not the scan's outcome: a rejection the 4 s tick
     // fired might not have reached the scan yet.
     assert.deepEqual([timers.pendingWithin(999), timers.pendingWithin(1_000)], [0, 1],

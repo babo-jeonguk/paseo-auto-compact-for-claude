@@ -1682,10 +1682,11 @@ test("a full scan reserves one listed conversation's finished reply although ano
   const s = f.make();
   await s.ready;
   try {
-    const scan = s.observe({ kind: "full" });
+    // Its outcome is held from the start: the timeout rejects it during the tick.
+    const scan = failureOf(s.observe({ kind: "full" }));
     await readBound(f);
     await f.timers.tick(INSPECT_TIMEOUT_MS);
-    await assert.rejects(scan, "a's timeout is still reported");
+    assert.ok(causesOf(await scan).some(cause => cause instanceof DeadlineExceeded), "a's timeout is still reported");
     assert.deepEqual(reserved(f), ["b"], "b's reservation is created by the scan");
     // a's observation is not cancelled: the next observation waits for it.
     const from = f.hostCalls.length;
@@ -2281,7 +2282,8 @@ test("one conversation's failed refresh does not drop another conversation's fin
   const merged = [s.observe({ kind: "agent", agentId: "a" }), s.observe({ kind: "agent", agentId: "b" })];
   release();
   await full;
-  await assert.rejects(merged[1], /host failed for a/, "the failure is still reported");
+  await assert.rejects(merged[1], (error: unknown) => error instanceof AggregateError &&
+    error.errors.some(cause => cause instanceof Error && cause.message === "host failed for a"), "the failure is still reported");
   assert.deepEqual(reserved(f), ["b"], "b's finished reply is reserved without waiting for a full scan");
 });
 
