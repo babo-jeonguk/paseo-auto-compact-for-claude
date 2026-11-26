@@ -291,6 +291,39 @@ export function createObserver(options: { home?: string; now?: () => number; wri
       request.id === operation.id && samePreparation(request.preparation, operation.preparation)
         ? { sent } : null);
   }
+  async function prepareRequest(agent: Observation, requireCache: boolean, expiresAt: number, id: string) {
+    const current = await read(agent.agentId);
+    if (current?.ledger === null) {
+      const placeholder = placeholderReason(current.preparedAt, agent);
+      // A starting observer is a fault: retried until the send deadline.
+      if (placeholder.reason === 'observer_starting') throw new Error(placeholder.detail);
+      throw new Refusal(placeholder.detail);
+    }
+    if (!current || current.ledger.sessionId !== agent.sessionId) throw new Refusal('Claude observer unavailable');
+    const { ledger, directory } = current;
+    if (ledger.activeTurns.length || ledger.pendingInputs || ledger.compact?.status === 'running')
+      throw new Refusal('Claude is still working');
+    if (requireCache) { const blocked = reason(ledger, agent); if (blocked) throw new Refusal(blocked.detail); }
+    const preparation: string = randomUUID();
+    const request = { id, preparation, launchId: ledger.launchId, generation: ledger.generation,
+      sessionId: ledger.sessionId, revision: ledger.revision, preparedAt: now(), expiresAt,
+      requireCache, cacheDeadline: ledger.cacheDeadline, clockEpoch: ledger.clockEpoch, status: 'prepared' };
+    // Remembered before the write, so a recovery scan running meanwhile can
+    // tell this instance's preparation from a leftover even before it lands.
+    preparations.add(preparation);
+    const receipts = join(agentDirectory(agent.agentId), 'receipts');
+    const path = join(directory, 'request.json');
+    return writes.run(async () => {
+      await mkdir(receipts, { recursive: true, mode: 0o700 });
+      // Pre-create the file for the Mod filesystem capability. Never erase a receipt.
+      await writeFile(receiptPath(agent.agentId, id), '{}', { mode: 0o600, flag: 'wx' })
+        .catch(error => { if (error.code !== 'EEXIST') throw error; });
+      // Serialized with this request's other writers, so a delayed retirement
+      // cannot replace this newer preparation.
+      await requestLock(path, () => writes.replace(path, JSON.stringify(request)));
+      return { ...request, directory };
+    });
+  }
   return {
     read,
     async removeReceipt(agentId: string, operationId: string) {
@@ -377,38 +410,17 @@ export function createObserver(options: { home?: string; now?: () => number; wri
       if (current?.ledger === null) return placeholderReason(current.preparedAt, agent);
       return reason(current?.ledger, agent, dueAt);
     },
-    async prepare(agent: Observation, requireCache: boolean, expiresAt: number, id: string = randomUUID()) {
-      const current = await read(agent.agentId);
-      if (current?.ledger === null) {
-        const placeholder = placeholderReason(current.preparedAt, agent);
-        // A starting observer is a fault: retried until the send deadline.
-        if (placeholder.reason === 'observer_starting') throw new Error(placeholder.detail);
-        throw new Refusal(placeholder.detail);
-      }
-      if (!current || current.ledger.sessionId !== agent.sessionId) throw new Refusal('Claude observer unavailable');
-      const { ledger, directory } = current;
-      if (ledger.activeTurns.length || ledger.pendingInputs || ledger.compact?.status === 'running')
-        throw new Refusal('Claude is still working');
-      if (requireCache) { const blocked = reason(ledger, agent); if (blocked) throw new Refusal(blocked.detail); }
-      const preparation: string = randomUUID();
-      const request = { id, preparation, launchId: ledger.launchId, generation: ledger.generation,
-        sessionId: ledger.sessionId, revision: ledger.revision, preparedAt: now(), expiresAt,
-        requireCache, cacheDeadline: ledger.cacheDeadline, clockEpoch: ledger.clockEpoch, status: 'prepared' };
-      // Remembered before the write, so a recovery scan running meanwhile can
-      // tell this instance's preparation from a leftover even before it lands.
-      preparations.add(preparation);
-      const receipts = join(agentDirectory(agent.agentId), 'receipts');
-      const path = join(directory, 'request.json');
-      return writes.run(async () => {
-        await mkdir(receipts, { recursive: true, mode: 0o700 });
-        // Pre-create the file for the Mod filesystem capability. Never erase a receipt.
-        await writeFile(receiptPath(agent.agentId, id), '{}', { mode: 0o600, flag: 'wx' })
-          .catch(error => { if (error.code !== 'EEXIST') throw error; });
-        // Serialized with this request's other writers, so a delayed retirement
-        // cannot replace this newer preparation.
-        await requestLock(path, () => writes.replace(path, JSON.stringify(request)));
-        return { ...request, directory };
-      });
+    // Preparing a conversation's native request: `ready` is its outcome, and
+    // `retire(sent)` retires it once its file work has ended, if that work
+    // reached the request file; `settled()` resolves once both have ended.
+    prepare(agent: Observation, requireCache: boolean, expiresAt: number, id: string = randomUUID()): {
+      ready: ReturnType<typeof prepareRequest>;
+      retire(sent: boolean): Promise<void>;
+      settled(): Promise<void>;
+    } {
+      return { ready: prepareRequest(agent, requireCache, expiresAt, id),
+        retire: async (_sent: boolean) => { throw new Error('not implemented'); },
+        settled: async () => { throw new Error('not implemented'); } };
     },
     async receipt(agentId: string, operation: NativeOperation) {
       try {

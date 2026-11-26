@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { mkdir, readFile, readdir, rm, symlink, utimes, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rename, rm, symlink, utimes, writeFile } from 'node:fs/promises';
 import { join, delimiter } from 'node:path';
 import { createObserver, QUERY_RESTARTED_REFUSAL } from './observer';
 import { CLOCK_STEP_TOLERANCE_MS } from './deadline';
@@ -110,7 +110,7 @@ test('the compatible pre-fix observer stays readable during rollout; unknown bui
     await writeFile(manifestPath, JSON.stringify({ ...f.manifest, build }));
     assert(await f.observer.read('a'));
     f.ledger.pendingInputs = 1; await f.save();
-    await assert.rejects(f.observer.prepare(f.agent, false, 1_030_000), /still working/);
+    await assert.rejects(f.observer.prepare(f.agent, false, 1_030_000).ready, /still working/);
   }
   await writeFile(manifestPath, JSON.stringify({ ...f.manifest, build: 'unknown-build' }));
   assert.equal(await f.observer.read('a'), null);
@@ -120,11 +120,11 @@ test('observer rejects mismatched sessions, busy native work, default TTL fallba
   const f = await fixture(cleanupScope(t));
   assert.match((await f.observer.readiness({ ...f.agent, sessionId: 'other' }))!.detail, /unavailable/);
   f.ledger.activeTurns = ['background']; await f.save();
-  await assert.rejects(f.observer.prepare(f.agent, true, 1_030_000), /still working/);
+  await assert.rejects(f.observer.prepare(f.agent, true, 1_030_000).ready, /still working/);
   f.ledger.activeTurns = []; f.ledger.transcriptPath = '/missing-transcript'; await f.save();
   assert.equal(await f.observer.readiness(f.agent, 1_000_000 + 55 * 60_000), null);
   assert.equal((await f.observer.read('a'))?.ledger?.cache?.source, 'default');
-  const manual = await f.observer.prepare(f.agent, false, 1_030_000);
+  const manual = await f.observer.prepare(f.agent, false, 1_030_000).ready;
   f.ledger.generation = 'reloaded'; await f.save();
   assert.equal(await f.observer.result('a', manual), null,
     'a generation change alone waits for a matching refusal or the observation deadline');
@@ -142,7 +142,7 @@ test('a ledger written just before a WSL clock step back stays readable; a far-f
   f.ledger.updatedAt = 1_001_800; await f.save();
   assert(await f.observer.read('a'));
   assert.equal(await f.observer.readiness(f.agent, 1_060_000), null);
-  const manual = await f.observer.prepare(f.agent, false, 1_030_000);
+  const manual = await f.observer.prepare(f.agent, false, 1_030_000).ready;
   assert.equal(manual.preparedAt, 1_000_000);
   f.ledger.updatedAt = 1_010_000; await f.save();
   assert(await f.observer.read('a'), 'the tolerance is inclusive');
@@ -159,7 +159,7 @@ test('the observer and the server use the same clock-step tolerance', async () =
 
 test('native receipt must match operation and revision; settling preserves subsequent manual compact', async (t) => {
   const f = await fixture(cleanupScope(t));
-  const operation = await f.observer.prepare(f.agent, true, 1_030_000);
+  const operation = await f.observer.prepare(f.agent, true, 1_030_000).ready;
   f.ledger.compact = { id: 'foreign', revision: 1, status: 'completed' }; await f.save();
   assert.equal(await f.observer.result('a', operation), null);
   f.ledger.compact = { id: operation.id, revision: 1, status: 'completed' }; await f.save();
@@ -172,7 +172,7 @@ test('native receipt must match operation and revision; settling preserves subse
   f.ledger.compact = { id: operation.id, revision: 1, status: 'running' }; await f.save();
   assert.equal(await f.observer.result('a', operation), null, 'still running is no answer yet');
   f.ledger.compact = { id: operation.id, revision: 1, status: 'completed' }; f.ledger.revision--; await f.save();
-  const next = await f.observer.prepare(f.agent, true, 1_030_000);
+  const next = await f.observer.prepare(f.agent, true, 1_030_000).ready;
   await f.observer.cancel(operation);
   assert.equal(JSON.parse(await readFile(join(f.directory, 'request.json'), 'utf8')).id, next.id);
   // Once a durable receipt exists, release settles request.json even if later
@@ -194,13 +194,13 @@ test('release caught in the middle of a ledger write still retires the request',
   const status = async () => JSON.parse(await readFile(join(f.directory, 'request.json'), 'utf8')).status;
   // Without a receipt, a sent request whose ledger cannot be read is cancelled,
   // as an unobserved send is.
-  const unrecorded = await f.observer.prepare(f.agent, true, 1_030_000);
+  const unrecorded = await f.observer.prepare(f.agent, true, 1_030_000).ready;
   await writeFile(ledgerPath, '');
   await f.observer.cancel(unrecorded);
   assert.equal(await status(), 'cancelled');
   // A durable receipt alone proves Claude consumed the request.
   await f.save();
-  const recorded = await f.observer.prepare(f.agent, true, 1_030_000);
+  const recorded = await f.observer.prepare(f.agent, true, 1_030_000).ready;
   await writeFile(join(f.parent, 'receipts', `${encodeURIComponent(recorded.id)}.json`), JSON.stringify({
     id: recorded.id, launchId: recorded.launchId, generation: recorded.generation, sessionId: recorded.sessionId,
     revision: recorded.revision, status: 'completed', reason: null, observedAt: 1_000_050,
@@ -241,7 +241,7 @@ test('opening a session removes closed or long-idle launches of that conversatio
 
 test('durable receipts survive closed-launch pruning and require every native identity field', async (t) => {
   const f = await fixture(cleanupScope(t));
-  const operation = await f.observer.prepare(f.agent, false, 1_030_000, 'caller-request');
+  const operation = await f.observer.prepare(f.agent, false, 1_030_000, 'caller-request').ready;
   assert.equal(operation.id, 'caller-request');
   const path = join(f.parent, 'receipts', 'caller-request.json');
   const receipt = { id: operation.id, launchId: operation.launchId, generation: operation.generation,
@@ -297,20 +297,20 @@ test('an observer that cannot be read is a fault, not an absent observer', async
   // Half-written ledger: thrown, so dispatch retries instead of treating it as gone.
   await writeFile(join(f.directory, 'ledger.json'), '{"version":1,');
   await assert.rejects(f.observer.read('a'), /could not be read/);
-  await assert.rejects(f.observer.prepare(f.agent, false, Date.now() + 30_000, 'op-1'), /could not be read/);
+  await assert.rejects(f.observer.prepare(f.agent, false, Date.now() + 30_000, 'op-1').ready, /could not be read/);
   assert.deepEqual(await f.observer.readiness(f.agent),
     { reason: 'observer_unreadable', detail: 'Claude observer status unavailable; retrying' });
   // Content that parses but is not a ledger is malformed too, even JSON null.
   await writeFile(join(f.directory, 'ledger.json'), 'null');
   await assert.rejects(f.observer.read('a'), /could not be read/);
-  await assert.rejects(f.observer.prepare(f.agent, false, Date.now() + 30_000, 'op-1'),
+  await assert.rejects(f.observer.prepare(f.agent, false, Date.now() + 30_000, 'op-1').ready,
     (error: Error) => error.constructor.name !== 'Refusal' && /could not be read/.test(error.message));
   assert.equal((await f.observer.readiness(f.agent))?.reason, 'observer_unreadable');
   // A genuinely missing or stale observer is absence, and a refusal at dispatch.
   await f.save();
   f.advance(60_001);
   assert.equal(await f.observer.read('a'), null);
-  await assert.rejects(f.observer.prepare(f.agent, false, Date.now() + 30_000, 'op-1'),
+  await assert.rejects(f.observer.prepare(f.agent, false, Date.now() + 30_000, 'op-1').ready,
     (error: Error) => error.constructor.name === 'Refusal');
   await rm(join(f.parent, 'current.json'));
   assert.equal(await f.observer.read('a'), null);
@@ -348,7 +348,7 @@ test('a placeholder ledger is a starting observer until a turn completes after t
   assert.equal((await f.observer.readiness(before))?.reason, 'observer_starting');
   assert.equal((await f.observer.read('a'))?.ledger, null, 'a placeholder is neither a fault nor absence');
   // Starting is a fault at dispatch, retried until the send deadline, never a refusal.
-  await assert.rejects(f.observer.prepare(before, false, 1_100_000),
+  await assert.rejects(f.observer.prepare(before, false, 1_100_000).ready,
     (error: Error) => error.constructor.name !== 'Refusal');
   // A turn that started after preparation and is still running proves nothing yet.
   const running = { ...f.agent, idle: false, revision: new Date(preparedAt + 1).toISOString() };
@@ -356,7 +356,7 @@ test('a placeholder ledger is a starting observer until a turn completes after t
   // Once that turn has finished, an attached observer would have written.
   const finished = { ...running, idle: true };
   assert.equal((await f.observer.readiness(finished))?.reason, 'observer_missing');
-  await assert.rejects(f.observer.prepare(finished, false, 1_100_000),
+  await assert.rejects(f.observer.prepare(finished, false, 1_100_000).ready,
     (error: Error) => error.constructor.name === 'Refusal');
   // The decision is read from disk, so a restarted plugin gives the same answers.
   const restarted = createObserver({ home: f.home, now: () => 1_035_000 });
@@ -381,7 +381,7 @@ test('a placeholder from a launch prepared before preparation times were recorde
 
 test('a confirmed query-restart refusal is accepted by both receipt and result; ambiguous or foreign records stay rejected', async (t) => {
   const f = await fixture(cleanupScope(t));
-  const operation = await f.observer.prepare(f.agent, false, 1_030_000, 'restart-op');
+  const operation = await f.observer.prepare(f.agent, false, 1_030_000, 'restart-op').ready;
   const path = join(f.parent, 'receipts', 'restart-op.json');
   const prepared = {
     launchId: operation.launchId, generation: operation.generation,
@@ -449,8 +449,8 @@ const requestFile = async (directory: string) => JSON.parse(await readFile(join(
 
 test('each preparation of a request has its own identity, and retiring one never retires another', async (t) => {
   const f = await fixture(cleanupScope(t));
-  const first = await f.observer.prepare(f.agent, false, 1_030_000, 'same-operation');
-  const second = await f.observer.prepare(f.agent, false, 1_030_000, 'same-operation');
+  const first = await f.observer.prepare(f.agent, false, 1_030_000, 'same-operation').ready;
+  const second = await f.observer.prepare(f.agent, false, 1_030_000, 'same-operation').ready;
   assert.equal(typeof first.preparation, 'string');
   assert.notEqual(first.preparation, second.preparation, 'a retry of the same operation is a new preparation');
   assert.equal((await requestFile(f.directory)).preparation, second.preparation);
@@ -479,10 +479,10 @@ test('a retirement and a newer preparation of the same request land in the order
   const { files, holdRename } = heldFiles();
   const f = await fixture(cleanupScope(t), files);
   const drained = drainer();
-  const first = await f.observer.prepare(f.agent, false, 1_030_000, 'same-operation');
+  const first = await f.observer.prepare(f.agent, false, 1_030_000, 'same-operation').ready;
   // The newer preparation's rename is issued and held at the file system.
   const held = holdRename(join(f.directory, 'request.json'));
-  const preparing = f.observer.prepare(f.agent, false, 1_030_000, 'same-operation');
+  const preparing = f.observer.prepare(f.agent, false, 1_030_000, 'same-operation').ready;
   await held.reached;
   // A late retirement of the earlier preparation, asked for after it, waits
   // for that rename to land rather than reading the request beneath it.
@@ -520,11 +520,11 @@ test('a delayed publication of an earlier launch cannot replace a newer active l
 
 test('once durable writes close, no launch, preparation or retirement is written', async (t) => {
   const f = await fixture(cleanupScope(t));
-  const prepared = await f.observer.prepare(f.agent, false, 1_030_000, 'operation');
+  const prepared = await f.observer.prepare(f.agent, false, 1_030_000, 'operation').ready;
   const manifest = await readFile(join(f.parent, 'current.json'), 'utf8');
   f.close();
   await assert.rejects(f.observer.prepareSession(f.request, true), Stopped);
-  await assert.rejects(f.observer.prepare(f.agent, false, 1_030_000, 'another'), Stopped);
+  await assert.rejects(f.observer.prepare(f.agent, false, 1_030_000, 'another').ready, Stopped);
   await assert.rejects(f.observer.cancel(prepared, false), Stopped);
   assert.equal(await readFile(join(f.parent, 'current.json'), 'utf8'), manifest);
   assert.equal((await requestFile(f.directory)).preparation, prepared.preparation);
@@ -578,7 +578,7 @@ test('after a reload the gateway sends nothing to the launch the previous instan
 test('requests an earlier instance left prepared are retired as decided, once, and this instance leaves its own alone', async (t) => {
   const f = await fixture(cleanupScope(t));
   // Left prepared by the instance before a reload.
-  const left = await f.observer.prepare(f.agent, false, 1_030_000, 'left');
+  const left = await f.observer.prepare(f.agent, false, 1_030_000, 'left').ready;
   const next = createObserver({ home: f.home, now: f.now, writes: createDurableWrites() });
   const offered: unknown[] = [];
   const reported: unknown[] = [];
@@ -588,12 +588,12 @@ test('requests an earlier instance left prepared are retired as decided, once, a
   assert.deepEqual(await requestFile(f.directory), { id: 'left', preparation: left.preparation, status: 'settled' });
   await next.recoverPrepared(() => assert.fail('a retired request is not offered again'), report);
   // A preparation this instance made is its own attempt's to retire.
-  const own = await next.prepare(f.agent, false, 1_030_000, 'own');
+  const own = await next.prepare(f.agent, false, 1_030_000, 'own').ready;
   await next.recoverPrepared(() => assert.fail('an own preparation is not a leftover'), report);
   assert.equal((await requestFile(f.directory)).preparation, own.preparation);
   // A leftover still needed for observation stays prepared; one that may have
   // been sent is retired as sent, here without any record that Claude consumed it.
-  const kept = await f.observer.prepare(f.agent, false, 1_030_000, 'observed');
+  const kept = await f.observer.prepare(f.agent, false, 1_030_000, 'observed').ready;
   const later = createObserver({ home: f.home, now: f.now, writes: createDurableWrites() });
   await later.recoverPrepared(() => null, report);
   assert.equal((await requestFile(f.directory)).status, 'prepared');
@@ -604,7 +604,7 @@ test('requests an earlier instance left prepared are retired as decided, once, a
 
 test('a native record from another preparation of the same operation settles nothing; one naming none still does', async (t) => {
   const f = await fixture(cleanupScope(t));
-  const operation = await f.observer.prepare(f.agent, true, 1_030_000, 'operation');
+  const operation = await f.observer.prepare(f.agent, true, 1_030_000, 'operation').ready;
   const native = { ...operation, preparation: operation.preparation };
   const receipt = (preparation?: string) => writeFile(join(f.parent, 'receipts', 'operation.json'), JSON.stringify({
     id: 'operation', launchId: operation.launchId, generation: operation.generation, sessionId: operation.sessionId,
@@ -626,7 +626,7 @@ test('a native record from another preparation of the same operation settles not
 
 test('a retirement counts only a record of its own preparation as Claude having consumed the request', async (t) => {
   const f = await fixture(cleanupScope(t));
-  const first = await f.observer.prepare(f.agent, true, 1_030_000, 'operation');
+  const first = await f.observer.prepare(f.agent, true, 1_030_000, 'operation').ready;
   // A /compact was checked against the first preparation and Claude ran it.
   await writeFile(join(f.parent, 'receipts', 'operation.json'), JSON.stringify({ id: 'operation',
     launchId: first.launchId, generation: first.generation, sessionId: first.sessionId, revision: first.revision,
@@ -634,11 +634,11 @@ test('a retirement counts only a record of its own preparation as Claude having 
   f.ledger.compact = { id: 'operation', revision: 1, status: 'completed', preparation: first.preparation } as typeof f.ledger.compact;
   await f.save();
   // A retry, sent and never observed: its late /compact must stay refused.
-  const second = await f.observer.prepare(f.agent, true, 1_030_000, 'operation');
+  const second = await f.observer.prepare(f.agent, true, 1_030_000, 'operation').ready;
   await f.observer.cancel(second, true);
   assert.deepEqual(await requestFile(f.directory), { id: 'operation', preparation: second.preparation, status: 'cancelled' });
   // Startup recovery retires a leftover by the same rule.
-  const third = await f.observer.prepare(f.agent, true, 1_030_000, 'operation');
+  const third = await f.observer.prepare(f.agent, true, 1_030_000, 'operation').ready;
   const next = createObserver({ home: f.home, now: f.now, writes: createDurableWrites() });
   const reported: unknown[] = [];
   await next.recoverPrepared(() => ({ sent: true }), error => { reported.push(error); });
@@ -648,8 +648,8 @@ test('a retirement counts only a record of its own preparation as Claude having 
 
 test('a live record of another preparation is no answer yet, whatever its revision', async (t) => {
   const f = await fixture(cleanupScope(t));
-  const first = await f.observer.prepare(f.agent, true, 1_030_000, 'operation');
-  const second = await f.observer.prepare(f.agent, true, 1_030_000, 'operation');
+  const first = await f.observer.prepare(f.agent, true, 1_030_000, 'operation').ready;
+  const second = await f.observer.prepare(f.agent, true, 1_030_000, 'operation').ready;
   f.ledger.compact = { id: 'operation', revision: 0, status: 'completed', preparation: first.preparation } as typeof f.ledger.compact;
   await f.save();
   assert.equal(await f.observer.result('a', second), null);
@@ -657,7 +657,7 @@ test('a live record of another preparation is no answer yet, whatever its revisi
 
 test('evidence naming no preparation, as an earlier release or a rollback left it, matches a record that names one', async (t) => {
   const f = await fixture(cleanupScope(t));
-  const operation = await f.observer.prepare(f.agent, true, 1_030_000, 'operation');
+  const operation = await f.observer.prepare(f.agent, true, 1_030_000, 'operation').ready;
   const { preparation, ...untagged } = operation;
   await writeFile(join(f.parent, 'receipts', 'operation.json'), JSON.stringify({ id: 'operation',
     launchId: operation.launchId, generation: operation.generation, sessionId: operation.sessionId,
@@ -670,7 +670,7 @@ test('evidence naming no preparation, as an earlier release or a rollback left i
 
 test('a request that does not validate is never rewritten by a retirement or recovery', async (t) => {
   const f = await fixture(cleanupScope(t));
-  const operation = await f.observer.prepare(f.agent, false, 1_030_000, 'operation');
+  const operation = await f.observer.prepare(f.agent, false, 1_030_000, 'operation').ready;
   const malformed = JSON.stringify({ ...await requestFile(f.directory), preparation: 5 });
   await writeFile(join(f.directory, 'request.json'), malformed);
   await assert.rejects(f.observer.cancel(operation, false));
@@ -732,7 +732,7 @@ test('across a reload, a retirement the stopped instance had issued lands before
   const { files, holdRename } = heldFiles();
   const f = await fixture(cleanupScope(t), files);
   const drained = drainer();
-  const first = await f.observer.prepare(f.agent, false, 1_030_000, 'operation');
+  const first = await f.observer.prepare(f.agent, false, 1_030_000, 'operation').ready;
   // A late retirement, issued and held at the file system.
   const held = holdRename(join(f.directory, 'request.json'));
   void f.observer.cancel(first, true).catch(() => {});
@@ -750,7 +750,7 @@ test('across a reload, a retirement the stopped instance had issued lands before
   const next = createObserver({ home: f.home, now: f.now, writes: createDurableWrites() });
   await next.recoverPrepared(() => assert.fail('the stopped instance already retired its request'),
     () => assert.fail('nothing fails'));
-  const second = await next.prepare(f.agent, false, 1_030_000, 'operation');
+  const second = await next.prepare(f.agent, false, 1_030_000, 'operation').ready;
   const request = await requestFile(f.directory);
   assert.equal(request.status, 'prepared', 'the next instance\'s preparation of the same request is intact');
   assert.equal(request.preparation, second.preparation);
@@ -781,12 +781,96 @@ test('across a reload, a launch publication the stopped instance had issued land
 
 test('a retirement leaves a request that is no longer prepared, or in a state it does not know, as it is', async (t) => {
   const f = await fixture(cleanupScope(t));
-  const operation = await f.observer.prepare(f.agent, false, 1_030_000, 'operation');
+  const operation = await f.observer.prepare(f.agent, false, 1_030_000, 'operation').ready;
   for (const status of ['settled', 'future-state', undefined]) {
     const record = JSON.stringify({ id: 'operation', preparation: operation.preparation, ...(status ? { status } : {}) });
     await writeFile(join(f.directory, 'request.json'), record);
     await f.observer.cancel(operation, true);
     await f.observer.release('a', operation, true);
     assert.equal(await readFile(join(f.directory, 'request.json'), 'utf8'), record, `${status}`);
+  }
+});
+
+// A preparation retires its own request: whenever its file work ends, and
+// only if that work reached the file.
+test('a retirement asked for before its preparation lands runs once it has, and retires exactly that preparation', async (t) => {
+  const { files, holdRename } = heldFiles();
+  const f = await fixture(cleanupScope(t), files);
+  const drained = drainer();
+  const held = holdRename(join(f.directory, 'request.json'));
+  const preparation = f.observer.prepare(f.agent, false, 1_030_000, 'operation');
+  await held.reached;
+  // The attempt has stopped waiting on its preparation and retires it now.
+  let retired = false;
+  const retiring = preparation.retire(false).then(() => { retired = true; });
+  await drained();
+  assert.equal(retired, false, 'the retirement waits for the preparation\'s own file work');
+  held.release();
+  const prepared = await preparation.ready;
+  await retiring;
+  assert.deepEqual(await requestFile(f.directory),
+    { id: 'operation', preparation: prepared.preparation, status: 'settled' });
+});
+
+test('retiring a preparation that never reached the request file changes nothing', async (t) => {
+  const f = await fixture(cleanupScope(t));
+  const earlier = await f.observer.prepare(f.agent, false, 1_030_000, 'earlier').ready;
+  const before = await readFile(join(f.directory, 'request.json'), 'utf8');
+  // Claude is busy, so this preparation is refused before it writes anything.
+  f.ledger.pendingInputs = 1; await f.save();
+  const refused = f.observer.prepare(f.agent, false, 1_030_000, 'refused');
+  await assert.rejects(refused.ready, Refusal);
+  await refused.retire(false);
+  await refused.settled();
+  assert.equal(await readFile(join(f.directory, 'request.json'), 'utf8'), before, 'the earlier request is untouched');
+  assert.equal((await requestFile(f.directory)).preparation, earlier.preparation);
+});
+
+test('a preparation whose rename failed leaves the earlier request, which its retirement does not touch', async (t) => {
+  const failure = new Error('EIO: rename');
+  let failNext = false;
+  const files: DurableFiles = { writeFile, rm,
+    rename: async (from, to) => {
+      if (failNext) { failNext = false; throw failure; }
+      return rename(from, to);
+    } };
+  const f = await fixture(cleanupScope(t), files);
+  const earlier = await f.observer.prepare(f.agent, false, 1_030_000, 'earlier').ready;
+  failNext = true;
+  const failed = f.observer.prepare(f.agent, false, 1_030_000, 'failed');
+  assert.equal(await failed.ready.then(() => null, (error: unknown) => error), failure);
+  await failed.retire(true);
+  const request = await requestFile(f.directory);
+  assert.equal(request.status, 'prepared');
+  assert.equal(request.preparation, earlier.preparation);
+});
+
+test('a preparation that published before its temporary file failed to go is still retired, and a newer one is left alone', async (t) => {
+  const cleanup = new Error('EACCES: rm');
+  let failNext = false;
+  const files: DurableFiles = { writeFile, rename,
+    rm: async (path, options) => {
+      if (failNext) { failNext = false; throw cleanup; }
+      return rm(path, options);
+    } };
+  for (const newer of [false, true]) {
+    const f = await fixture(cleanupScope(t), files);
+    failNext = true;
+    const published = f.observer.prepare(f.agent, false, 1_030_000, 'published');
+    assert.equal(await published.ready.then(() => null, (error: unknown) => error), cleanup,
+      'the preparation fails, although its rename landed');
+    const landed = await requestFile(f.directory);
+    assert.equal(landed.status, 'prepared', 'its request is on disk');
+    // Asked for after the failed one, so it lands before that one's retirement.
+    const next = newer ? f.observer.prepare(f.agent, false, 1_030_000, 'newer') : null;
+    await published.retire(false);
+    const request = await requestFile(f.directory);
+    if (next) {
+      const prepared = await next.ready;
+      assert.equal(request.status, 'prepared', 'the newer preparation is not retired');
+      assert.equal(request.preparation, prepared.preparation);
+    } else {
+      assert.deepEqual(request, { id: 'published', preparation: landed.preparation, status: 'settled' });
+    }
   }
 });

@@ -195,8 +195,8 @@ export function createGateway(options: {
     const ref = requireApi().agents.ref(agentId);
     busy.add(agentId);
     const id = execution?.id ?? randomUUID();
-    let operation: Awaited<ReturnType<Observer['prepare']>> | undefined;
-    let preparing: ReturnType<Observer['prepare']> | undefined;
+    let operation: Awaited<ReturnType<Observer['prepare']>['ready']> | undefined;
+    let preparing: ReturnType<Observer['prepare']>['ready'] | undefined;
     let turn: ReturnType<typeof takeTurn> | undefined;
     let sent = false, armed = false, ownershipLost = false;
     let boundary = false;
@@ -237,7 +237,7 @@ export function createGateway(options: {
       // for as long as it can still be observed.
       const startBy = Math.min(guard?.expiresAt ?? Infinity, sendBy);
       if (observer) {
-        preparing = observer.prepare(before, automatic, observationEndBy(sendBy), id);
+        preparing = observer.prepare(before, automatic, observationEndBy(sendBy), id).ready;
         operation = await read(preparing);
         const { launchId, generation, sessionId, revision } = operation;
         // The preparation names this exact request, so a receipt from another
