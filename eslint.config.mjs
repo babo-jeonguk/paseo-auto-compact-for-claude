@@ -246,6 +246,7 @@ const typescriptDirective = (comment) => {
     if (name === "ts-check" || name === "ts-nocheck") return name;
     return lineDirective.exec(`//${comment.value}`)?.[1];
   }
+  if (comment.type !== "Block") return undefined;
   const lastLine = `/*${comment.value}`.split(/\r\n?|[\n\u2028\u2029]/).at(-1).trimStart();
   return blockDirective.exec(lastLine)?.[1];
 };
@@ -256,8 +257,9 @@ const directives = {
         type: "problem",
         schema: [],
         messages: {
-          directive: 'A TypeScript directive ("@{{name}}") hides a type error instead of fixing it, with or ' +
-            'without a description: fix the type or the code (CODING_STANDARDS.md "Comments say why").',
+          directive: 'A TypeScript directive ("@{{name}}") changes from a comment what the type checker reports, ' +
+            'with or without a description: which files are checked is set in tsconfig.json, and a type error is ' +
+            'fixed in the code (CODING_STANDARDS.md "Comments say why").',
         },
       },
       create: (context) => ({
@@ -287,9 +289,9 @@ export const projectRules = [
     // directive (eslint-disable, /* eslint ... */, /* global ... */) has no
     // effect and is reported as a warning, which fails lint; a file that is the
     // boundary for a rule is an entry here that names the standard it
-    // implements. A TypeScript directive hides a type error instead of fixing
-    // it, so none is allowed, with or without a description; the directive rule
-    // above replaces ban-ts-comment, which misreads the pragmas.
+    // implements. A TypeScript directive changes from a comment what the type
+    // checker reports, so none is allowed, with or without a description; the
+    // directive rule above replaces ban-ts-comment, which misreads the pragmas.
     linterOptions: { noInlineConfig: true },
     plugins: { "@typescript-eslint": tseslint.plugin, directives },
     rules: {
