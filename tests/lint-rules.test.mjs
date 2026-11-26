@@ -358,3 +358,39 @@ test('the timing rule leaves tests alone', () => {
   for (const file of ['server/a.test.ts', 'tests/simulation/run.mjs', 'tests/e2e/run.mjs'])
     passes(file, 'bounded(work, 5_000);');
 });
+
+// The one real Timers implementation is a boundary in the lint configuration:
+// its module may call the global setTimeout, and every other server rule still
+// applies to it.
+test('the real Timers module may call only the global setTimeout', () => {
+  passes('server/deadline.ts', 'const timer = setTimeout(callback, milliseconds);');
+  for (const code of [
+    'setTimeout(fire, 50);',
+    'timers.setTimeout(fire, 50);',
+    'setInterval(tick, TICK_MS);',
+    'setImmediate(fire);',
+    'globalThis.setImmediate(fire);',
+    'AbortSignal.timeout(REGISTRY_TIMEOUT_MS);',
+    "import { setTimeout } from 'node:timers/promises';",
+    "await import('node:timers');",
+  ]) flags('server/deadline.ts', code, /CODING_STANDARDS\.md "(Decisions apart from effects|Named timings)"/);
+  flags('server/a.ts', 'const timer = setTimeout(callback, milliseconds);', /CODING_STANDARDS\.md "Decisions apart from effects"/);
+});
+
+// The cleanup scope's process time limit is the boundary for real timers in
+// the support modules: its module may start a delayed global setTimeout, and
+// every other test-support rule still applies to it.
+test('the cleanup scope may start only a delayed global setTimeout', () => {
+  passes('tests/support/scope.ts', 'const limit = setTimeout(() => { child.timedOut = true; }, timeout);');
+  for (const code of [
+    'setInterval(poll, 10);',
+    'globalThis.setInterval(poll, 10);',
+    'AbortSignal.timeout(50);',
+    "import { setTimeout } from 'node:timers/promises';",
+    'mock.timers.tick(1);',
+    "mock.method(console, 'error');",
+    'try { await run(); } finally { await rm(dir); }',
+    'for (let i = 0; i < 100 && !done(); i++) await settle();',
+  ]) flags('tests/support/scope.ts', code, /CODING_STANDARDS\.md "Tests"/);
+  flags('tests/support/a.ts', 'const limit = setTimeout(() => { child.timedOut = true; }, timeout);', /CODING_STANDARDS\.md "Tests"/);
+});
