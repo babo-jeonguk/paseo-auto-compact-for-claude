@@ -414,11 +414,11 @@ test('a directive comment has no effect and is reported', () => {
     flags(file, '/* global fire */\nfire();', noEffect);
 });
 
-// A TypeScript directive hides a type error rather than fixing it, so none is
-// allowed, with or without a description, in any spelling TypeScript reads as
-// one: it reads @ts-check and @ts-nocheck in any case.
+// A TypeScript directive changes from a comment what the type checker
+// reports, so none is allowed, with or without a description, in any spelling
+// TypeScript reads as one: it reads @ts-check and @ts-nocheck in any case.
 test('every TypeScript directive is rejected', () => {
-  const directive = /TypeScript directive[^]*CODING_STANDARDS\.md "Comments say why"/;
+  const directive = /TypeScript directive \("@ts-[a-z-]+"\) changes from a comment what the type checker reports[^]*tsconfig\.json[^]*CODING_STANDARDS\.md "Comments say why"/;
   for (const file of ['server/a.ts', 'tests/a.test.mjs']) {
     for (const code of [
       '// @ts-ignore\nconst a = reply.count;',
@@ -445,6 +445,7 @@ test('ordinary comments are not directives', () => {
       '/* A ts-expect-error pragma would hide the type error here. */\nconst a = 1;',
       '// @ts-checked by the compiler on every build\nconst a = 1;',
       '/* @ts-nocheck is read only from a line comment */\nconst a = 1;',
+      '#!/@ts-ignore-tools/bin/run\nconst a = 1;',
     ]) passes(file, code);
   }
 });
