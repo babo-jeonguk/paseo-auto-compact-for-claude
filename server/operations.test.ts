@@ -7,6 +7,7 @@ import { changes } from "../tests/support/changes";
 import { fakeTimers } from "../tests/support/timers";
 import { cleanupScope } from "../tests/support/scope";
 import { drainer } from "../tests/support/drained";
+import { defects } from "../tests/support/defects";
 import { gate } from "../tests/support/gate";
 import { DEFAULT_SETTINGS, type Settings } from "../shared/settings";
 import { DeadlineExceeded, Stopped } from "./deadline";
@@ -257,11 +258,11 @@ test("the worker wakes itself for a retry instead of waiting for the next tick",
 type Held = { reached: Promise<void>; release(): void };
 type Fixture = ReturnType<typeof fixture>;
 const NATIVE = { id: "operation-a", launchId: "launch", generation: "gen-1", sessionId: "native", revision: 1 };
-// Sends as the gateway does: an attempt whose worker is no longer current
-// throws before the dispatch marker and stops at it after, and "a:sent" is
-// recorded only when the send itself happens.
+// Sends as the gateway does: an attempt whose worker has stopped before its
+// send deadline ends with Stopped before the dispatch marker and stops at it
+// after, and "a:sent" is recorded only when the send itself happens.
 async function send(f: Fixture, execution: ExecutionContext, native = false) {
-  if (!execution.current()) throw new Error("Send deadline passed or worker stopped before send");
+  if (!execution.current()) throw new Stopped();
   await execution.checkpoint({ dispatchStartedAt: f.time, ...native ? { native: NATIVE } : {} });
   if (!execution.current()) return { status: "unknown" as const, detail: "Worker stopped at dispatch boundary" };
   f.record("a:sent");
@@ -403,7 +404,7 @@ for (const [at, stopAt] of Object.entries(stopPoints)) {
     await drained();
     assert.equal(JSON.stringify(f.snapshot), state, `${at}: nothing is written`);
     assert.deepEqual(f.events.slice(events), [], `${at}: nothing is sent or released`);
-    assert.deepEqual(f.errors.slice(errors), [], `${at}: nothing is reported`);
+    assert.deepEqual(defects(f.errors.slice(errors)), [], `${at}: nothing but the stop is reported`);
     assert.equal(f.timers.pending, 0, `${at}: no wait or wake-up is armed`);
   });
 }
@@ -425,7 +426,7 @@ test("a worker stopped as its claim lands starts no host or settings read", asyn
   await worker.idle();
   assert.equal(f.operation.state, "dispatching", "the claim landed");
   assert.deepEqual(reads, [], "no read started after the stop");
-  assert.deepEqual([f.sends, f.errors.length, f.timers.pending], [0, 0, 0]);
+  assert.deepEqual([f.sends, defects(f.errors).length, f.timers.pending], [0, 0, 0]);
 });
 
 test("a gateway fault before the dispatch marker is retried; nothing is sent until it passes", async () => {
@@ -922,7 +923,6 @@ test("a read already issued when the worker stops still has its failure reported
   const defect = new Error("EIO: host read");
   fail(defect);
   await f.until(() => f.errors.includes(defect));
-  assert.ok(f.errors.every(error => error === defect || error instanceof Stopped),
-    "besides the stop itself, which the reporter keeps quiet, only the read's own failure is handed on");
+  assert.deepEqual(defects(f.errors), [String(defect)], "besides the stop itself, only the read's own failure is handed on");
   assert.equal(f.sends, 0);
 });

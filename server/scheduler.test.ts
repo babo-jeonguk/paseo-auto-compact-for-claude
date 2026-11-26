@@ -12,6 +12,7 @@ import { HISTORY_RETENTION_MS, HISTORY_SWEEP_INTERVAL_MS, type OperationReceipts
 import { changes } from "../tests/support/changes";
 import { fakeTimers, undefinedHandleTimers } from "../tests/support/timers";
 import { drainer } from "../tests/support/drained";
+import { defects } from "../tests/support/defects";
 import { gate, type Gate } from "../tests/support/gate";
 import { cleanupScope } from "../tests/support/scope";
 import type { Blocked } from "../shared/rpc";
@@ -2652,7 +2653,7 @@ for (const [at, stopAt] of Object.entries(schedulerStopPoints)) {
     const before = (state: State = f.state) => JSON.stringify({ state, reads: f.counts.reads,
       writes: f.counts.writes, settings: f.counts.settings, readiness: f.counts.readiness,
       refreshes: f.counts.refreshes.length, lists: f.counts.lists, sent: f.calls,
-      receipts: f.receiptCalls.length, errors: f.errors.map(String) });
+      receipts: f.receiptCalls.length, errors: defects(f.errors) });
     const snapshot = before(lands?.());
     s.stop();
     assert.equal(f.timers.pending, 0, `${at}: stopping ends every wait and clears its timer`);
@@ -2710,5 +2711,5 @@ test("a stopped scheduler starts no read, write, host call or timer for a call m
   assert.deepEqual({ reads, writes, lists, settings, readiness, refreshes },
     { reads: 0, writes: 0, lists: 0, settings: 0, readiness: 0, refreshes: [] },
     "nothing is read, written or asked of the host");
-  assert.deepEqual([f.calls, f.receiptCalls.length, f.errors.length, f.timers.pending], [0, 0, 0, 0]);
+  assert.deepEqual([f.calls, f.receiptCalls.length, defects(f.errors).length, f.timers.pending], [0, 0, 0, 0]);
 });

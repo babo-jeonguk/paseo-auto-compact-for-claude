@@ -97,7 +97,7 @@ for (const phase of ["issued", "unpublished"] as const) {
       compact: async (_agentId, _expected, execution) => {
         held = phase === "issued" ? holdRename(path) : holdWrite(path);
         void held.reached.then(reach);
-        await execution!.checkpoint({ native: { ...native, id: execution!.id } }).catch(() => {});
+        await execution.checkpoint({ native: { ...native, id: execution.id } }).catch(() => {});
         return { status: "unknown", detail: "stopped" };
       },
     });
