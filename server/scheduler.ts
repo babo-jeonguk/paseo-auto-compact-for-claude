@@ -109,8 +109,9 @@ export function createScheduler(options: {
   // and transactions, settings and host reads, readiness checks and receipt
   // work, and that I/O starts only while it lasts. Every side effect goes
   // through one owner that does nothing once it has ended: state writes
-  // (`store`), reports (`onError`), receipt removals and sweeps (`receipts`),
-  // and submissions to the worker, whose own lifetime ends with this one.
+  // (`store`), receipt removals and sweeps (`receipts`), and submissions to the
+  // worker, whose own lifetime ends with this one. Reports (`onError`) are not
+  // fenced: a failure of work issued before the stop still reaches the reporter.
   const lifetime = createLifetime(timers, error => onError(error));
   const { live, wait, begin } = lifetime;
   // Every write passes through syncJobs, the only writer of jobs' attempt fields.
@@ -666,7 +667,7 @@ export function createScheduler(options: {
       return agent?.eligible ? view(agent, current, config) : null;
     },
     list: async () => {
-      const [state, config, listing] = await Promise.all([
+      const [state, config, agents] = await Promise.all([
         serialize(() => store.read()),
         settings(),
         wait(begin(async () => {
@@ -683,12 +684,14 @@ export function createScheduler(options: {
           });
           const agents = (await Promise.all(observed)).filter((agent): agent is Observation => agent !== null);
           return { agents, incomplete };
-        }), INSPECT_TIMEOUT_MS),
+        }), INSPECT_TIMEOUT_MS).then(listing => {
+          // The list's own result, not a failure of its work, so it is raised
+          // after the wait: an incomplete list fails at once, after its
+          // failures were reported, and the screen keeps its Retry.
+          if (listing.incomplete) throw new Error("Conversation list incomplete: an observation failed");
+          return listing.agents;
+        }),
       ]);
-      // The list's own result, not a failure of its work: an incomplete list
-      // fails so the screen keeps its Retry, after its failures were reported.
-      if (listing.incomplete) throw new Error("Conversation list incomplete: an observation failed");
-      const { agents } = listing;
       return Promise.all(
         agents
           .filter(

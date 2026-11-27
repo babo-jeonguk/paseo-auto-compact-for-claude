@@ -138,14 +138,18 @@ export function createObserver(options: { home?: string; now?: () => number; wri
   const writes = options.writes ?? createDurableWrites();
   // The observer launch this plugin instance last started for each agent.
   const launchesStartedHere = new Map<string, string>();
-  // The preparation this instance last issued to each conversation's request
-  // file, keyed by the conversation's hashed directory. Its request is its
-  // attempt's to retire, never a leftover from an earlier instance. Only the
-  // last one can still be named by the file, so a newer issue supersedes it and
-  // a retirement that ends forgets it: the map holds at most one per conversation.
-  const issued = new Map<string, string>();
-  const forget = (key: string, preparation: string | undefined) => {
-    if (preparation !== undefined && issued.get(key) === preparation) issued.delete(key);
+  // The preparations this instance issued that a launch's request file may
+  // still name, keyed by the launch directory. Such a request is its attempt's
+  // to retire, never a leftover from an earlier instance. Whenever the file is
+  // read or written under the request queue, only the preparation it names as
+  // prepared is kept, so an entry goes once its request is retired, absent or
+  // superseded, whichever call's promise failed on the way.
+  const issued = new Map<string, Set<string>>();
+  const named = (directory: string, preparation: string | undefined) => {
+    const own = issued.get(directory);
+    if (!own) return;
+    for (const entry of own) if (entry !== preparation) own.delete(entry);
+    if (own.size === 0) issued.delete(directory);
   };
   // One writer of a conversation's request.json at a time (`requests`), shared
   // by preparation, retirement, release and recovery of that conversation, and
@@ -276,17 +280,19 @@ export function createObserver(options: { home?: string; now?: () => number; wri
       let request: Awaited<ReturnType<typeof readRequest>>;
       try { request = await readRequest(path); }
       catch (error) {
-        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
-        throw error;
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        named(directory, undefined);
+        return;
       }
+      named(directory, request.status === 'prepared' ? request.preparation : undefined);
       if (request.status !== 'prepared' || typeof request.id !== 'string') return;
       const { id, preparation } = request;
       const decision = choose({ id, ...(preparation !== undefined ? { preparation } : {}) });
       if (decision === null) return;
       await writes.replace(path, JSON.stringify(retiredRecord(id, preparation,
         await retiredStatus(directory, id, preparation, decision.sent))));
-      // The retired request names its preparation; a retirement forgets it.
-      forget(dirname(directory), preparation);
+      // The file now names no prepared request.
+      named(directory, undefined);
     });
   }
   function retirePrepared(directory: string,
@@ -427,8 +433,12 @@ export function createObserver(options: { home?: string; now?: () => number; wri
           // already holds this conversation, so no retirement or recovery asked
           // for before or after this can split the publication.
           target = { directory };
-          issued.set(key, preparation);
+          const own = issued.get(directory) ?? new Set<string>();
+          own.add(preparation);
+          issued.set(directory, own);
           await writes.replace(path, JSON.stringify(request));
+          // Published: it supersedes what this instance issued there before.
+          named(directory, preparation);
         });
         return { ...request, directory };
       });
@@ -437,8 +447,6 @@ export function createObserver(options: { home?: string; now?: () => number; wri
         if (!retired) return;
         await retireLocked(retired.directory, request =>
           request.id === id && request.preparation === preparation ? { sent } : null);
-        // Retired, or no longer named by the file: either way not its to keep.
-        forget(key, preparation);
       });
       return { ready, retire, settled: () => requests.idle(key) };
     },
@@ -500,7 +508,7 @@ export function createObserver(options: { home?: string; now?: () => number; wri
           await retirePrepared(directory, request => {
             // A request this instance prepared belongs to its own attempt and
             // is left alone.
-            if (request.preparation !== undefined && issued.get(parent) === request.preparation) return null;
+            if (request.preparation !== undefined && issued.get(directory)?.has(request.preparation)) return null;
             return decide(request);
           });
         } catch (error) {

@@ -158,7 +158,10 @@ export function createOperationWorker(options: {
   // Sending must start by sendBy, and automatic work within its delivery window.
   const expiredUnsent = (operation: StoredOperation) =>
     now() >= operation.sendBy! || now() > (operation.deliveryExpiresAt ?? Infinity);
-  async function finish(id: string, ending: Ending, owner: (error: unknown) => void = onError) {
+  // `carried` gives the faults an expiry reports, taken once the terminal write
+  // has landed so that a fault handed over during it still counts.
+  async function finish(id: string, ending: Ending, owner: (error: unknown) => void = onError,
+    carried: () => unknown[] = () => faults.get(id) ?? []) {
     outcomes.set(id, ending);
     const finished = await update(state => {
       const operation = state.operations.find(entry => entry.id === id);
@@ -167,9 +170,9 @@ export function createOperationWorker(options: {
       return structuredClone(operation);
     }, owner);
     outcomes.delete(id);
-    const fault = faults.get(id);
+    const fault = carried();
     faults.delete(id);
-    if (finished && ending === "expired" && fault?.length)
+    if (finished && ending === "expired" && fault.length)
       onError(fault.length === 1 ? fault[0]
         : new AggregateError(fault, "Compaction request expired after these faults"));
     if (finished) await release(finished);
@@ -317,10 +320,12 @@ export function createOperationWorker(options: {
       // fault handed over while it decides is not left behind: the diagnostic
       // first, then the faults beside it.
       const bound = (fault: unknown) => fault instanceof DeadlineExceeded || fault instanceof Stopped;
+      // A refusal is a condition, never a fault to report.
       const take = () => {
         const handed = joined.splice(0);
         const cause = bound(error) ? handed.findIndex(fault => !bound(fault)) : -1;
-        return cause < 0 ? [error, ...handed] : [handed[cause], ...handed.filter((_fault, index) => index !== cause)];
+        if (cause >= 0) return [handed[cause], ...handed.filter((_fault, index) => index !== cause)];
+        return error instanceof Refusal ? handed : [error, ...handed];
       };
       // The faults beside the diagnostic can no longer end the request, but
       // dropping them would hide a defect of work this run issued.
@@ -345,10 +350,11 @@ export function createOperationWorker(options: {
         if (next === "not-classified") return report();
         // A refusal is not a fault, but a fault that joined it still is.
         if (next === "refused") return await finish(id, { status: "failed", detail: (error as Refusal).message }, late);
+        // An expiry takes the run's faults once its terminal write has landed.
+        if (next === "expired") return await finish(id, "expired", late, take);
         // The faults of work being retried stay with its record: they are
         // reported if the request expires, and never again by this run.
         faults.set(id, take());
-        if (next === "expired") return await finish(id, "expired", late);
         // This operation wakes itself for its retry; other conversations keep running.
         armRetry(id, next);
       } catch (writeError) { onError(writeError); }

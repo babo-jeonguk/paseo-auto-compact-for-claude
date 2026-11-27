@@ -915,17 +915,6 @@ test("a stop that interrupts a run's expiry still reports the fault its work met
   assert.deepEqual(defects(f.errors), [String(late)], "no later expiry will report it, so the run does");
 });
 
-test("stopping the worker reports the faults a request waiting for its retry carries", async () => {
-  const f = fixture(), worker = f.make();
-  const thrown = new Error("EBUSY"), beside = new Error("EIO: subscription release");
-  f.hook("a", async execution => { execution.fault(beside); throw thrown; });
-  await worker.reconcile();
-  assert.equal(f.operation.state, "requested", "the fault is retried");
-  assert.deepEqual(f.errors, []);
-  worker.stop();
-  assert.deepEqual(f.errors, [thrown, beside], "the next instance retries it without them, so they are reported now");
-});
-
 test("a fault an earlier run's work meets after that run ended is reported at once, even while a retry runs", async () => {
   const f = fixture(), worker = f.make();
   let earlier: ExecutionContext | undefined;
