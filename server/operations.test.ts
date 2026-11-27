@@ -9,7 +9,7 @@ import { fakeTimers } from "../tests/support/timers";
 import { cleanupScope } from "../tests/support/scope";
 import { drainer } from "../tests/support/drained";
 import { defects } from "../tests/support/defects";
-import { gate } from "../tests/support/gate";
+import { gate, type Gate } from "../tests/support/gate";
 import { DEFAULT_SETTINGS, type Settings } from "../shared/settings";
 import { DeadlineExceeded, Stopped } from "./deadline";
 import { Refusal, type CompactOutcome, type ExecutionContext, type Gateway, type Observation,
@@ -75,15 +75,20 @@ function fixture(options: { agents?: string[] } = {}) {
     hold.reached();
     await hold.release;
   };
-  // The next transaction, or the one `skip` transactions later, fails with `error`.
-  let failing: { skip: number; error: Error } | null = null;
+  // The first transaction whose change makes the state match `when` is held
+  // before it is committed, or fails with `error` instead.
+  let committing: { when: (next: State) => boolean; held?: Gate; error?: Error } | null = null;
   const update = <T>(change: (state: State) => T): Promise<T> => {
     const result = queue.run(async () => {
       await holding(true);
-      const fail = failing;
-      if (fail && fail.skip-- === 0) { failing = null; throw fail.error; }
       const next = structuredClone(state);
       const value = change(next);
+      const commit = committing;
+      if (commit?.when(next)) {
+        committing = null;
+        if (commit.error) throw commit.error;
+        await commit.held?.pass();
+      }
       if (writesFail && next.operations[0].state === "succeeded") throw new Error("disk full");
       state = next;
       signal.changed();
@@ -139,8 +144,15 @@ function fixture(options: { agents?: string[] } = {}) {
     },
     // Holds the next state read before it reads.
     holdRead(): Held { readHold = gate(); return readHold; },
-    // Fails the next transaction, or the one `skip` transactions later.
-    failUpdate(error: Error, skip = 0) { failing = { skip, error }; },
+    // Holds the first transaction that would commit a state matching `when`,
+    // before it commits; `reached` resolves then.
+    holdCommit(when: (next: State) => boolean): Held {
+      const held = gate();
+      committing = { when, held };
+      return held;
+    },
+    // Fails the first transaction that would commit a state matching `when`.
+    failCommit(error: Error, when: (next: State) => boolean) { committing = { when, error }; },
     // Calls `hook` with each transaction's result as the worker gets it.
     onUpdate(hook: ((result: Promise<unknown>) => void) | null) { updated = hook; },
     advance(ms: number) { time += ms; },
@@ -295,6 +307,11 @@ function later(hold: () => Held) {
   return { arm() { held = hold(); void held.reached.then(arrive); }, held: { reached, release: () => held?.release() } };
 }
 // Each await of a run, held: what the worker reaches while the test holds it.
+// Observable steps of the first operation's record, for holding the
+// transaction that saves them.
+const expired = (next: State) => next.operations[0].state === "expired";
+const retrying = (next: State) => next.operations[0].state === "requested" && next.operations[0].nextAttemptAt !== undefined;
+
 // `met` is a fault the run met before the stop: work already issued, so the
 // stop does not make it expected, and it is reported once.
 const stopPoints: Record<string, (f: Fixture) => { worker: ReturnType<Fixture["make"]>; held: Held; met?: Error }> = {
@@ -868,8 +885,8 @@ test("a fault an attempt's work hands over while the run classifies its own faul
   const f = fixture(), worker = f.make();
   let execution: ExecutionContext | undefined;
   f.hook("a", async current => { execution = current; throw new DeadlineExceeded(); });
-  // The run's claim is the first transaction; its classification the second.
-  const classifying = f.holdNextUpdate(1, true);
+  // Held as the classification saves the retry.
+  const classifying = f.holdCommit(retrying);
   const run = worker.reconcile();
   await classifying.reached;
   const late = new Error("EACCES: request.json");
@@ -895,8 +912,8 @@ test("a fault an attempt's work hands over while its expiry is saved still takes
     f.advance(200_000);
     throw new DeadlineExceeded();
   });
-  // The claim, the classification, then the expiry's terminal write.
-  const expiring = f.holdNextUpdate(2, true);
+  // Held as the expiry's terminal write saves it.
+  const expiring = f.holdCommit(expired);
   const run = worker.reconcile();
   await expiring.reached;
   const late = new Error("EACCES: request.json");
@@ -917,7 +934,7 @@ test("a stop that interrupts a run's expiry still reports the fault its work met
     f.advance(200_000);
     throw new DeadlineExceeded();
   });
-  const expiring = f.holdNextUpdate(2, true);
+  const expiring = f.holdCommit(expired);
   const run = worker.reconcile();
   await expiring.reached;
   worker.stop();
@@ -930,8 +947,8 @@ test("the fault that ends a request is still reported when the expiry's first sa
   const f = fixture(), worker = f.make();
   const met = new Error("EACCES: request.json"), disk = new Error("EIO: state file");
   f.hook("a", async () => { f.advance(200_000); throw met; });
-  // The claim, the classification, then the expiry's terminal write, which fails once.
-  f.failUpdate(disk, 2);
+  // The expiry's terminal write fails once.
+  f.failCommit(disk, expired);
   await worker.reconcile();
   assert.deepEqual(f.errors, [disk], "the failed save is reported");
   await worker.reconcile();
@@ -1025,9 +1042,9 @@ test("a failure the work meets while the expiry is saved is the cause, whatever 
     f.advance(200_000);
     throw new DeadlineExceeded();
   });
-  // The retry is due; its claim, its classification, then the expiry's terminal write.
+  // The retry is due; held as its expiry's terminal write saves it.
   f.advance(2_000);
-  const expiring = f.holdNextUpdate(2, true);
+  const expiring = f.holdCommit(expired);
   const run = worker.reconcile();
   await expiring.reached;
   const late = new Error("EACCES: request.json");
