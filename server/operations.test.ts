@@ -967,11 +967,11 @@ test("a fault an earlier run's work meets after that run ended is reported at on
   worker.stop();
 });
 
-test("a cleanup fault of a run that ends otherwise is reported once that run ends, and leaves its outcome alone", async () => {
+test("a cleanup failure is reported when it happens, and leaves the run's outcome alone", async () => {
   const f = fixture(), worker = f.make();
   const cleanup = new Error("EIO: subscription release");
   f.hook("a", async execution => {
-    execution.fault(cleanup);
+    execution.cleanupFault(cleanup);
     await execution.checkpoint({ dispatchStartedAt: f.time });
     return { status: "completed", detail: "matching evidence" };
   });
@@ -981,20 +981,32 @@ test("a cleanup fault of a run that ends otherwise is reported once that run end
   worker.stop();
 });
 
-test("faults a retried run met beside its own are reported with it if the request expires", async () => {
+test("a fault beside a retried run's own is reported at once, and the run's own if the request expires", async () => {
   const f = fixture(), worker = f.make();
-  const thrown = new Error("EBUSY"), beside = new Error("EIO: subscription release");
+  const thrown = new Error("EBUSY"), beside = new Error("EACCES: request.json");
   f.hook("a", async execution => { execution.fault(beside); throw thrown; });
   await worker.reconcile();
-  assert.equal(f.errors.length, 0);
+  assert.deepEqual(f.errors, [beside], "it can no longer become the request's cause");
   f.advance(200_000);
   await worker.reconcile();
   assert.equal(f.operation.state, "expired");
-  assert.equal(f.errors.length, 1);
-  const [reported] = f.errors;
-  assert.ok(reported instanceof AggregateError, "one report carries the run's faults together");
-  assert.deepEqual(reported.errors, [thrown, beside]);
+  assert.deepEqual(f.errors, [beside, thrown]);
   worker.stop();
+});
+
+test("a cleanup failure of a retried run is reported once, whatever a later retry carries", async () => {
+  const f = fixture(), worker = f.make();
+  const cleanup = new Error("EACCES: retiring the request"), deadline = new DeadlineExceeded();
+  f.hook("a", async execution => { execution.cleanupFault(cleanup); throw new Error("EBUSY"); });
+  await worker.reconcile();
+  f.hook("a", async () => { throw deadline; });
+  f.advance(2_000);
+  await worker.reconcile();
+  assert.equal(f.operation.state, "requested", "the deadline-only retry is retried again");
+  worker.stop();
+  assert.equal(f.errors.length, 2);
+  assert.equal(f.errors[0], cleanup, "the cleanup failure was reported when it happened");
+  assert.equal(f.errors[1], deadline, "the stop reports the cause the request carries; the reporter keeps a deadline quiet");
 });
 
 test("a read already issued when the worker stops still has its failure reported", async () => {

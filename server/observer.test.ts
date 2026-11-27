@@ -552,7 +552,7 @@ test('after a reload the gateway sends nothing to the launch the previous instan
   // The worker's part in each attempt; nothing here is late, so its owner is handed nothing.
   const faults: unknown[] = [];
   const execution = (id: string): ExecutionContext => ({ id, sendBy: f.now() + 10_000, checkpoint: async () => {},
-    current: () => true, fault: error => { faults.push(error); } });
+    current: () => true, fault: error => { faults.push(error); }, cleanupFault: error => { faults.push(error); } });
   assert.equal((await host.gateway.refresh('a'))!.resumeRequired, true);
   await assert.rejects(host.gateway.compact('a', undefined, execution('stale')),
     (error: unknown) => error instanceof Refusal && error.message === SESSION_RESUME_REQUIRED);
