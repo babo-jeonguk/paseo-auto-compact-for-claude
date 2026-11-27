@@ -339,9 +339,9 @@ export function createGateway(options: {
       // on and a later failure reaches the attempt's owner through bounded().
       // Any other failure goes to that owner without changing the outcome.
       const cleanup = async (work: Promise<unknown>) => {
-        try { await bounded(work, cleanupMs, timers, execution.fault, stopping.signal); }
+        try { await bounded(work, cleanupMs, timers, execution.cleanupFault, stopping.signal); }
         catch (error) {
-          if (!(error instanceof DeadlineExceeded || error instanceof Stopped)) execution.fault(error);
+          if (!(error instanceof DeadlineExceeded || error instanceof Stopped)) execution.cleanupFault(error);
         }
       };
       releasing = true;

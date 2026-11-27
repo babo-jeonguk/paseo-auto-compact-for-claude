@@ -136,30 +136,23 @@ export function createOperationWorker(options: {
   };
   // Outcomes whose terminal write failed; they are written again, never re-earned.
   const outcomes = new Map<string, Ending>();
-  // The faults each request carries toward its expiry: those of the run that
-  // last handed its own over, and those that joined them since. Kept across a
-  // failed save, and reported once: when the request expires, or when this
-  // worker stops first and leaves the request to the next instance.
-  const faults = new Map<string, unknown[]>();
-  // A deadline or stop ended a wait; it is the diagnostic only when the work met
-  // no fault of its own, which otherwise explains why the attempt failed. One
-  // report carries the faults in the order they were met.
-  const reportFaults = (carried: readonly unknown[]) => {
-    const met = carried.filter(fault => !(fault instanceof DeadlineExceeded || fault instanceof Stopped));
-    const fault = met.length ? met : carried.slice(0, 1);
-    if (fault.length) onError(fault.length === 1 ? fault[0] : new AggregateError(fault, "Faults of one compaction request"));
+  // A deadline or stop that ended a wait, as opposed to a failure the work met.
+  const bound = (fault: unknown) => fault instanceof DeadlineExceeded || fault instanceof Stopped;
+  // The cause each request carries toward its expiry: the fault its last run
+  // ended with. The next run's cause replaces it, and it is reported once,
+  // when the request expires or when this worker stops first and leaves the
+  // request to the next instance. Kept across a failed save.
+  const causes = new Map<string, unknown>();
+  // From its classification on, a run's cause is its request's. A stopped
+  // worker carries nothing to a later expiry, so it reports it at once.
+  const handOver = (id: string, cause: unknown) => {
+    if (live()) causes.set(id, cause);
+    else onError(cause);
   };
-  // From its classification on, a run's faults are its request's. A stopped
-  // worker carries nothing to a later expiry, so it reports them at once.
-  const handOver = (id: string, carried: unknown[]) => {
-    if (live()) faults.set(id, carried);
-    else reportFaults(carried);
-  };
-  // A fault that joins a request's faults after its run handed them over, or
-  // after they were reported, which is then reported at once.
+  // A failure the work met takes the place of a carried deadline or stop; any
+  // other fault can no longer become the cause, and is reported at once.
   const carry = (id: string, error: unknown) => {
-    const carried = faults.get(id);
-    if (carried) carried.push(error);
+    if (causes.has(id) && bound(causes.get(id)) && !bound(error)) causes.set(id, error);
     else onError(error);
   };
   let lastConnected = true;
@@ -190,10 +183,10 @@ export function createOperationWorker(options: {
       return structuredClone(operation);
     }, owner);
     outcomes.delete(id);
-    // Read once the terminal write has landed, so a fault that joined during it counts.
-    const carried = faults.get(id);
-    faults.delete(id);
-    if (finished && ending === "expired" && carried) reportFaults(carried);
+    // Read once the terminal write has landed, so a fault met during it counts.
+    const carried = causes.has(id), cause = causes.get(id);
+    causes.delete(id);
+    if (finished && ending === "expired" && carried) onError(cause);
     if (finished) await release(finished);
   }
   // One owner of this worker's retry wake-ups. A retry saved by a worker that
@@ -229,11 +222,12 @@ export function createOperationWorker(options: {
   }
   async function run(candidate: StoredOperation, connected: boolean) {
     let claimed: StoredOperation | undefined;
-    // A fault this attempt's work meets after a wait on it ended, or in its
-    // cleanup, joins the run while it is going, and its request once the run
-    // handed its faults over; after the run ended, it is reported at once. A
-    // refusal is a condition the run classifies itself; the reporter keeps the
-    // plugin's own stop quiet.
+    // A fault this attempt's work meets after a wait on it ended joins the run
+    // while it is going, and its request once the run handed its cause over;
+    // after the run ended, it is reported at once. A refusal is a condition the
+    // run classifies itself; the reporter keeps the plugin's own stop quiet. A
+    // failure of the attempt's cleanup never explains its outcome, so it is
+    // reported when it happens.
     let ended = false;
     let handed: string | null = null;
     const joined: unknown[] = [];
@@ -306,6 +300,7 @@ export function createOperationWorker(options: {
         // marker, so a stopped worker sends nothing.
         current: () => live() && now() < (observeUntil ?? sendBy),
         fault: late,
+        cleanupFault: (error: unknown) => onError(error),
         checkpoint: async (evidence: NonNullable<StoredOperation["evidence"]>) => {
           await update(state => {
             const current = state.operations.find(entry => entry.id === operation.id);
@@ -336,12 +331,22 @@ export function createOperationWorker(options: {
       // only the fault that ends it is reported. The decision is made on the
       // stored record, never on the copy taken at claim: work whose marker was
       // written during this run is not ours to expire, and is never resent.
-      // The run's own faults, a refusal aside, which is a condition. A run that
-      // ends without handing them to its request reports them as it ends: they
-      // can no longer end the request, but dropping them would hide a defect of
-      // work this run issued.
-      const own = () => [...(error instanceof Refusal ? [] : [error]), ...joined.splice(0)];
-      const report = () => reportFaults(own());
+      // The run's cause: its own fault, or the first failure its work met in
+      // place of a deadline or stop that ended a wait, which then only marks
+      // the wait's end. A refusal is a condition, never a cause. Every other
+      // failure the run met can no longer become a cause, so it is reported
+      // now, as is the cause of a run that does not hand it to its request:
+      // dropping either would hide a defect.
+      const settle = () => {
+        const met = [...(error instanceof Refusal ? [] : [error]), ...joined.splice(0)];
+        const at = Math.max(0, met.findIndex(fault => !bound(fault)));
+        met.forEach((fault, index) => { if (index !== at && !bound(fault)) onError(fault); });
+        return met.length ? { cause: met[at] } : null;
+      };
+      const report = () => {
+        const settled = settle();
+        if (settled) onError(settled.cause);
+      };
       if (!claimed || outcomes.has(claimed.id)) return report();
       const id = claimed.id;
       let next: "not-classified" | "refused" | "expired" | number;
@@ -361,7 +366,7 @@ export function createOperationWorker(options: {
           return delay;
         }, late);
       } catch (writeError) {
-        // The classification was not saved, so nothing carries the run's faults on.
+        // The classification was not saved, so nothing carries the run's cause on.
         onError(writeError);
         return report();
       }
@@ -370,10 +375,11 @@ export function createOperationWorker(options: {
         // A refusal is not a fault, but a fault that joined it still is: it is
         // reported as the run ends.
         if (next === "refused") return await finish(id, { status: "failed", detail: (error as Refusal).message }, late);
-        // Handed over before the terminal write, so a failed save keeps them for
-        // the expiry written again later. They are reported if the request
+        // Handed over before the terminal write, so a failed save keeps it for
+        // the expiry written again later. It is reported if the request
         // expires, and never again by this run.
-        handOver(id, own());
+        const settled = settle();
+        if (settled) handOver(id, settled.cause);
         handed = id;
         if (next === "expired") return await finish(id, "expired", late);
         // This operation wakes itself for its retry; other conversations keep running.
@@ -381,7 +387,7 @@ export function createOperationWorker(options: {
       } catch (writeError) { onError(writeError); }
     } finally {
       ended = true;
-      reportFaults(joined.splice(0));
+      for (const fault of joined.splice(0)) onError(fault);
     }
   }
   return { reconcile, stop() {
@@ -389,9 +395,9 @@ export function createOperationWorker(options: {
     for (const timer of retries.values()) timers.clearTimeout(timer);
     retries.clear();
     // Requests waiting here go on in the next instance, which never sees the
-    // faults they carry, so they are reported now.
-    for (const carried of faults.values()) reportFaults(carried);
-    faults.clear();
+    // causes they carry, so they are reported now.
+    for (const cause of causes.values()) onError(cause);
+    causes.clear();
   },
   // Resolves once the runs in flight now have ended, including those a stopped
   // worker is still finishing, so a caller can see what they left behind.

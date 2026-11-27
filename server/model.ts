@@ -63,9 +63,12 @@ export interface ExecutionContext {
   sendBy: number;
   checkpoint(evidence: OperationEvidence): Promise<void>;
   current(): boolean;
-  // The owner of a fault the attempt's work meets after a wait on it ended, or
-  // in the attempt's cleanup: the worker run that started the attempt.
+  // The owners of the attempt's late and cleanup faults: the worker run that
+  // started the attempt. `fault` takes a fault the attempt's work meets after
+  // a wait on it ended, which can explain why the attempt failed;
+  // `cleanupFault` a failure of the attempt's cleanup, which never does.
   fault(error: unknown): void;
+  cleanupFault(error: unknown): void;
 }
 // "failed" never says whether anything was sent; the persisted dispatch marker does.
 export type CompactOutcome = { status: "completed" | "failed" | "unknown"; detail: string };
