@@ -755,7 +755,33 @@ test("a failed retirement or subscription release goes to the attempt's owner an
   };
   const outcome = await host.gateway.automatic!((await host.gateway.refresh("a"))!);
   assert.equal(outcome.status, "completed", "the attempt's own outcome is kept");
+  assert.equal(host.faults.length, 2, "each cleanup failure reaches its owner once");
   assert.deepEqual(new Set(host.faults), new Set([retirement, release]), "each cleanup failure reaches its owner");
+});
+
+test("readiness a subscription loses because the attempt's cleanup released it is no fault", async (t) => {
+  const scope = cleanupScope(t);
+  const host = fixture(scope, [{ type: "compaction", status: "completed", trigger: "manual" }],
+    undefined, false, undefined, { timeoutMs: 50, cleanupTimeoutMs: 5 });
+  let subscribed = false;
+  const subscribe = host.ref.timeline.subscribe;
+  host.ref.timeline.subscribe = listener => {
+    const result = subscribe(listener);
+    // As the Paseo client does: a release before the first snapshot rejects
+    // the readiness it never reached.
+    let lose!: (error: Error) => void;
+    result.ready = new Promise<void>((_resolve, reject) => { lose = reject; });
+    const release = result.release;
+    result.release = async () => { lose(new Error("Subscription released")); return release(); };
+    subscribed = true;
+    return result;
+  };
+  const attempt = host.gateway.compact("a", undefined, { id: "released", sendBy: host.clock.now() + 50,
+    checkpoint: async () => {}, current: () => true, fault: host.fault });
+  await host.clock.until(() => subscribed && host.clock.timers.pendingWithin(50) > 0);
+  await host.clock.tick(50);
+  await assert.rejects(attempt, DeadlineExceeded);
+  assert.deepEqual(host.faults, [], "the deadline that ended the wait is the attempt's fault");
 });
 
 test("stopping the gateway also ends the wait on an attempt's cleanup", async (t) => {

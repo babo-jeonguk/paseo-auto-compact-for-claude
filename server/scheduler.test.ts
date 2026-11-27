@@ -2801,6 +2801,7 @@ test("a full scan whose listing page fails records nothing, and still delivers t
     throw page;
   };
   const causes = causesOf(await failureOf(s.observe({ kind: "full" })));
+  assert.equal(causes.length, 2, "each failure is delivered once");
   assert.deepEqual(new Set(causes), new Set([page, read]), "neither failure hides the other");
   assert.deepEqual(reserved(f), [], "a partial full scan records nothing");
 });
@@ -2827,6 +2828,28 @@ test("an observation that fails while the settings list is still paging is repor
     if (later === "fails") assert.equal(error, listing, "a failed listing takes precedence");
     assert.deepEqual(f.errors, [observation], `${later}: the observation's failure is reported once`);
   }
+});
+
+test("a settings list that outlasts its bound reports an observation's failure as itself, once", async () => {
+  const f = fixture();
+  const s = f.make();
+  await s.ready;
+  const page = gate();
+  const observation = new Error("EIO: ledger");
+  let fail!: (error: Error) => void;
+  f.gateway.list = async observe => {
+    observe(new Promise<never>((_resolve, reject) => { fail = reject; }));
+    await page.pass();
+  };
+  const outcome = failureOf(s.list());
+  await page.reached;
+  await readBound(f);
+  await f.timers.tick(INSPECT_TIMEOUT_MS);
+  assert.ok(await outcome instanceof DeadlineExceeded, "the list fails at its bound, so the screen offers Retry");
+  fail(observation);
+  page.release();
+  await f.drained();
+  assert.deepEqual(f.errors, [observation], "only the observation's own failure is reported, not the list's");
 });
 
 test("a host read already issued when the scheduler stops still has its failure reported", async () => {

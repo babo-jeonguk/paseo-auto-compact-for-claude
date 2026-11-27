@@ -853,6 +853,28 @@ test("a fault an attempt's work met explains the run's fault in place of the dea
   worker.stop();
 });
 
+test("a fault an attempt's work hands over while the run classifies its own fault is kept with it", async () => {
+  const f = fixture(), worker = f.make();
+  let execution: ExecutionContext | undefined;
+  f.hook("a", async current => { execution = current; throw new DeadlineExceeded(); });
+  // The run's claim is the first transaction; its classification the second.
+  const classifying = f.holdNextUpdate(1, true);
+  const run = worker.reconcile();
+  await classifying.reached;
+  const late = new Error("EACCES: request.json");
+  assert.ok(execution, "the run handed the gateway its execution");
+  execution.fault(late);
+  classifying.release();
+  await run;
+  assert.equal(f.operation.state, "requested", "a fault before the marker is retried");
+  assert.deepEqual(f.errors, [], "a retried fault is not reported");
+  f.advance(200_000);
+  await worker.reconcile();
+  assert.equal(f.operation.state, "expired");
+  assert.deepEqual(f.errors, [late], "the fault the work met during classification ends the request, not the deadline");
+  worker.stop();
+});
+
 test("a fault an earlier run's work meets after that run ended is reported at once, even while a retry runs", async () => {
   const f = fixture(), worker = f.make();
   let earlier: ExecutionContext | undefined;

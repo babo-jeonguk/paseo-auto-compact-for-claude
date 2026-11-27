@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { mkdir, readFile, readdir, rename, rm, symlink, utimes, writeFile } from 'node:fs/promises';
-import { join, delimiter } from 'node:path';
+import { join, delimiter, dirname } from 'node:path';
 import { createObserver, QUERY_RESTARTED_REFUSAL } from './observer';
 import { CLOCK_STEP_TOLERANCE_MS } from './deadline';
 import { observerAsset } from './observer-assets.generated';
@@ -824,6 +824,21 @@ test('retiring a preparation that never reached the request file changes nothing
   await refused.settled();
   assert.equal(await readFile(join(f.directory, 'request.json'), 'utf8'), before, 'the earlier request is untouched');
   assert.equal((await requestFile(f.directory)).preparation, earlier.preparation);
+});
+
+test('a preparation that fails before it issues its request leaves even an unreadable request file alone', async (t) => {
+  const f = await fixture(cleanupScope(t));
+  // The receipts folder cannot be made, so the request is never issued.
+  const receipts = join(dirname(f.directory), 'receipts');
+  await rm(receipts, { recursive: true, force: true });
+  await writeFile(receipts, '');
+  const path = join(f.directory, 'request.json');
+  await writeFile(path, '{ torn');
+  const failed = f.observer.prepare(f.agent, false, 1_030_000, 'failed');
+  const failure = await failed.ready.then(() => null, (error: unknown) => error);
+  assert.ok(failure instanceof Error && !(failure instanceof Refusal), `a file fault, not ${String(failure)}`);
+  await failed.retire(false);
+  assert.equal(await readFile(path, 'utf8'), '{ torn', 'nothing was issued, so nothing is read or retired');
 });
 
 test('a preparation whose rename failed leaves the earlier request, which its retirement does not touch', async (t) => {
