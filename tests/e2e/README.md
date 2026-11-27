@@ -32,7 +32,7 @@ npm run test:e2e -- --paseo 0.16.2 --to <branch, tag or commit>
 
 | Flag | Meaning |
 |---|---|
-| `--paseo` | A version pinned in `tests/simulation/paseo-versions.mjs`, such as `0.16.2` or `0.17.1` (default `0.16.2`) |
+| `--paseo` | A version pinned in `tests/simulation/paseo-versions.mjs`, such as `0.16.2` or `0.18.0` (default `0.16.2`) |
 | `--from` | Release installed first and rolled back to (default `v1.2.2`, the latest release; `v1.0.2` checks the migration from state without operation history) |
 | `--to` | Ref under test (default `main`) |
 | `--source` | Plugin Git source (default `git:babo-jeonguk/paseo-auto-compact-for-claude`) |
