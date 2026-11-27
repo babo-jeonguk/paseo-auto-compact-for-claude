@@ -2,12 +2,14 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { DeadlineExceeded, INSPECT_TIMEOUT_MS, OBSERVATION_MS, Stopped } from "./deadline";
-import { Refusal, type OperationEvidence, type StoredOperation } from "./model";
+import { randomUUID } from "node:crypto";
+import { DeadlineExceeded, INSPECT_TIMEOUT_MS, OBSERVATION_MS, SEND_DEADLINE_MS, Stopped } from "./deadline";
+import { Refusal, type ExecutionContext, type OperationEvidence, type StoredOperation } from "./model";
 import { createGateway, EVIDENCE_POLL_MS } from "./gateway";
 import { createObserver, QUERY_RESTARTED_REFUSAL } from "./observer";
 import { createOperationWorker } from "./operations";
 import { createScheduler } from "./scheduler";
+import { createKeyedQueue, createQueue } from "./queue";
 import { DEFAULT_SETTINGS } from "../shared/settings";
 import { changes } from "../tests/support/changes";
 import { fakeTimers } from "../tests/support/timers";
@@ -128,8 +130,28 @@ function fixture(
     config: { get: async () => ({ config: { providers: {} } }) },
     agents: { ref: () => ref },
   } as unknown as PluginHandlerContext["paseo"]);
-  return Object.assign(host, { ref, clock, sendCount: () => sends,
-    setAgent: (patch: Record<string, unknown>) => Object.assign(agent, patch) });
+  return { ...host, ...attempts(host, clock.now), ref, clock, sendCount: () => sends,
+    setAgent: (patch: Record<string, unknown>) => Object.assign(agent, patch) };
+}
+
+// The worker's part in an attempt a test starts without one: a fresh
+// identity, the send deadline the worker gives a new request of that kind, and
+// an owner that keeps the faults the attempt hands it (`faults`).
+function attempts(host: ReturnType<typeof createGateway>, now: () => number) {
+  const faults: unknown[] = [], cleanups: unknown[] = [];
+  const fault = (error: unknown) => { faults.push(error); };
+  const cleanupFault = (error: unknown) => { cleanups.push(error); };
+  const execution = (kind: keyof typeof SEND_DEADLINE_MS): ExecutionContext => ({
+    id: randomUUID(), sendBy: now() + SEND_DEADLINE_MS[kind], checkpoint: async () => {}, current: () => true,
+    fault, cleanupFault,
+  });
+  const { compact, automatic } = host.gateway;
+  return { faults, fault, cleanups, cleanupFault, gateway: { ...host.gateway,
+    compact: (id: string, expected?: Parameters<typeof compact>[1], given?: ExecutionContext) =>
+      compact(id, expected, given ?? execution("manual")),
+    automatic: automatic && ((expected: Parameters<typeof automatic>[0], guard?: Parameters<typeof automatic>[1],
+      given?: ExecutionContext) => automatic(expected, guard, given ?? execution("automatic"))),
+  } };
 }
 
 test("gateway requires completed manual boundary from command turn and same persistence session", async (t) => {
@@ -226,22 +248,34 @@ type Receipt = { status: 'completed' | 'failed' | 'unknown'; detail: string };
 function observer(result: Receipt | null) {
   const operation = { id: 'operation-1', launchId: 'launch', generation: 'generation',
     sessionId: 'native-a', revision: 1, preparedAt: Date.now(), expiresAt: Date.now() + 30000,
-    directory: '/unused', status: 'prepared', requireCache: true };
-  return {
+    directory: '/unused', status: 'prepared', requireCache: true } as unknown as Prepared;
+  const native = {
     read: async () => ({ directory: '/unused', ledger: {
       version: 1 as const, launchId: 'launch', generation: 'generation', sessionId: 'native-a',
       updatedAt: Date.now(), revision: 1, activeTurns: [], pendingInputs: 0, ordinaryEndedAt: 1000,
       ordinaryRevision: 1, cacheDeadline: Date.now() + 300000, compact: null, closed: false,
     } }),
     prepareSession: async (request: never) => request,
-    prepare: async (_agent: unknown, _cache: boolean, _expires: number, id: string) => ({ ...operation, id }),
+    prepare: (_agent: unknown, _cache: boolean, _expires: number, id: string) =>
+      preparation(async () => ({ ...operation, id })),
     readiness: async () => null,
     startedHere: (_agentId: string, _launchId: string) => true,
     result: async () => result,
     receipt: async () => result,
-    cancel: async () => {},
-  } as unknown as NonNullable<Parameters<typeof createGateway>[0]>['observer'];
+  } as unknown as Observer;
+  // A preparation as the observer hands one over: its retirement, and the end
+  // of its file work, follow the preparation through the same serial queue.
+  function preparation(prepare: () => Promise<Prepared>,
+    retire: (sent: boolean, prepared: Prepared | undefined) => Promise<void> = async () => {}) {
+    let landed: Prepared | undefined;
+    const ready = files.run("a", async () => { landed = await prepare(); return landed; });
+    return { ready, retire: (sent: boolean) => files.run("a", () => retire(sent, landed)), settled: () => files.idle("a") };
+  }
+  const files = createKeyedQueue<string>();
+  return Object.assign(native, { preparation, operation });
 }
+type Observer = NonNullable<Parameters<typeof createGateway>[0]>['observer'] & {};
+type Prepared = Awaited<ReturnType<Observer['prepare']>['ready']>;
 
 test('automatic public dispatch requires both its own boundary and matching native completion', async (t) => {
   const scope = cleanupScope(t);
@@ -287,7 +321,7 @@ async function overlap(scope: CleanupScope, { receipt = { status: 'completed', d
   };
   const saved: OperationEvidence[] = [];
   const result = await host.gateway.automatic!((await host.gateway.refresh('a'))!, undefined, {
-    id: 'overlap', sendBy: host.clock.now() + 30_000, checkpoint: async evidence => { saved.push(evidence); }, current: () => true,
+    id: 'overlap', sendBy: host.clock.now() + 30_000, checkpoint: async evidence => { saved.push(evidence); }, current: () => true, fault: host.fault, cleanupFault: host.cleanupFault,
   });
   assert.equal(host.sendCount(), 1, '/compact is never sent twice');
   return { result, evidence: saved.at(-1) };
@@ -348,8 +382,8 @@ test('last-moment off policy and expired delivery prevent public send', async (t
 test('before sending, a refusal and any other error are both thrown for the worker to classify', async (t) => {
   const scope = cleanupScope(t);
   for (const error of [new Refusal('Claude is still working'), new Error('EIO')]) {
-    const native = observer(null)!;
-    native.prepare = async () => { throw error; };
+    const native = observer(null);
+    native.prepare = () => native.preparation(async () => { throw error; });
     const host = fixture(scope, [], undefined, false, [], { observer: native });
     const agent = (await host.gateway.refresh('a'))!;
     await assert.rejects(host.gateway.compact('a', agent), error);
@@ -369,14 +403,14 @@ test('a second call for a conversation already compacting is a refusal', async (
 
 test('Claude admits the compaction for as long as it can be observed, not only until sending must start', async (t) => {
   const scope = cleanupScope(t);
-  const native = observer(null)!;
+  const native = observer(null);
   const prepare = native.prepare;
   let admitted = 0;
-  native.prepare = async (agent, cache, expiresAt, id) => { admitted = expiresAt; return prepare(agent, cache, expiresAt, id); };
+  native.prepare = (agent, cache, expiresAt, id) => { admitted = expiresAt; return prepare(agent, cache, expiresAt, id); };
   const host = fixture(scope, [], undefined, false, [], { observer: native });
   const sendBy = host.clock.now() + 1_000;
   await host.gateway.automatic!((await host.gateway.refresh('a'))!, { expiresAt: host.clock.now() + 500, allowed: async () => true },
-    { id: 'late-admission', sendBy, checkpoint: async () => {}, current: () => true });
+    { id: 'late-admission', sendBy, checkpoint: async () => {}, current: () => true, fault: host.fault, cleanupFault: host.cleanupFault });
   assert.equal(admitted, sendBy + OBSERVATION_MS);
   assert.equal(host.sendCount(), 1);
 });
@@ -395,7 +429,7 @@ test('a send that starts just before its deadline is still observed in full', as
   // The send takes past its deadline, so the boundary arrives after it.
   host.ref.send = async (text, options) => { time += 80; return send(text, options); };
   const result = await host.gateway.compact("a", undefined, {
-    id: "late-request", sendBy: time + 40, checkpoint: async () => {}, current: () => true,
+    id: "late-request", sendBy: time + 40, checkpoint: async () => {}, current: () => true, fault: host.fault, cleanupFault: host.cleanupFault,
   });
   assert.equal(result.status, "completed");
   assert.equal(host.sendCount(), 1);
@@ -403,7 +437,7 @@ test('a send that starts just before its deadline is still observed in full', as
 
 test('an unreadable observer is reported on the observation and is a fault before sending', async (t) => {
   const scope = cleanupScope(t);
-  const native = observer(null)!;
+  const native = observer(null);
   native.read = async () => { throw new Error('Claude observer could not be read'); };
   const host = fixture(scope, [], undefined, false, [], { observer: native });
   const agent = (await host.gateway.refresh('a'))!;
@@ -414,7 +448,7 @@ test('an unreadable observer is reported on the observation and is a fault befor
 
 test('a session whose observer this plugin instance did not start never receives a send until it resumes', async (t) => {
   const scope = cleanupScope(t);
-  const native = observer(null)!;
+  const native = observer(null);
   native.startedHere = () => false;
   const host = fixture(scope, [], undefined, false, [], { observer: native });
   assert.equal((await host.gateway.refresh('a'))!.resumeRequired, true);
@@ -428,7 +462,7 @@ test('a session whose observer this plugin instance did not start never receives
 
 test('observer ownership is rechecked at the dispatch boundary, in memory, and ends the attempt at once', async (t) => {
   const scope = cleanupScope(t);
-  const native = observer(null)!;
+  const native = observer(null);
   let ownershipChecks = 0;
   let markerPersisted = false;
   native.startedHere = () => { ownershipChecks++; return !markerPersisted; };
@@ -437,7 +471,7 @@ test('observer ownership is rechecked at the dispatch boundary, in memory, and e
   const result = await host.gateway.compact('a', (await host.gateway.refresh('a'))!, {
     id: 'ownership-race', sendBy: host.clock.now() + 30_000,
     checkpoint: async evidence => { saved.push(evidence); markerPersisted ||= evidence.dispatchStartedAt !== undefined; },
-    current: () => true,
+    current: () => true, fault: host.fault, cleanupFault: host.cleanupFault,
   });
   assert.equal(result.status, 'unknown');
   assert.match(result.detail, /observer changed.*no automatic retry/i);
@@ -450,10 +484,10 @@ test('observer ownership is rechecked at the dispatch boundary, in memory, and e
 test('an absent or unreadable observer is not misreported as a session awaiting reload, and reading it never throws', async (t) => {
   const scope = cleanupScope(t);
   for (const read of [async () => null, async () => { throw new Error('Claude observer could not be read'); }]) {
-    const native = observer(null)!;
+    const native = observer(null);
     native.read = read;
     native.startedHere = () => false;
-    native.prepare = async () => { throw new Refusal('Claude observer unavailable'); };
+    native.prepare = () => native.preparation(async () => { throw new Refusal('Claude observer unavailable'); });
     const host = fixture(scope, [], undefined, false, [], { observer: native });
       const agent = (await host.gateway.refresh('a'))!;
     assert.equal(agent.resumeRequired, undefined);
@@ -465,7 +499,7 @@ test('an absent or unreadable observer is not misreported as a session awaiting 
 
 test('idle pending input is distinguished from an active reply without allowing dispatch', async (t) => {
   const scope = cleanupScope(t);
-  const native = observer(null)!;
+  const native = observer(null);
   const read = native.read;
   let pendingInputs = 3;
   let activeTurns: string[] = [];
@@ -514,7 +548,7 @@ test("every external gateway wait is bounded, including send and release", async
     // A wait that expires before sending is a fault for the worker to retry.
     if (stalled === "subscribe" || stalled === "refresh") {
       const attempt = host.gateway.compact("a", undefined, { id: "stalled", sendBy: host.clock.now() + 50,
-        checkpoint: async () => {}, current: () => true });
+        checkpoint: async () => {}, current: () => true, fault: host.fault, cleanupFault: host.cleanupFault });
       // The stalled call's wait ends at the send deadline, not before.
       await bound(50);
       await host.clock.tick(49);
@@ -576,22 +610,22 @@ test("stopping the gateway ends a waiting attempt at once and leaves none of its
   assert.equal(after.clock.timers.pending, 0, "the history read's deadline is cleared");
 });
 
-test("a native request whose preparation outlives the wait on it is retired once it is prepared", async (t) => {
+test("an attempt that gave up on its preparation still has it retired, as unsent, once it lands", async (t) => {
   const scope = cleanupScope(t);
   for (const ending of ["deadline", "stop"] as const) {
-    const native = observer(null)!;
-    const prepare = native.prepare;
+    const native = observer(null);
     let reach!: () => void;
     const reached = new Promise<void>(resolve => { reach = resolve; });
     let land!: () => void;
     const landed = new Promise<void>(resolve => { land = resolve; });
-    native.prepare = async (...args: Parameters<typeof prepare>) => { reach(); await landed; return prepare(...args); };
     let retire!: (value: string) => void;
     const retired = new Promise<string>(resolve => { retire = resolve; });
-    native.cancel = async (operation: { id: string }, sent?: boolean) => { retire(`${operation.id}:${sent}`); };
+    native.prepare = (_agent, _cache, _expires, id = native.operation.id) => native.preparation(
+      async () => { reach(); await landed; return { ...native.operation, id }; },
+      async (sent, prepared) => { retire(`${prepared?.id}:${sent}`); });
     const host = fixture(scope, [], undefined, false, [], { observer: native });
     const attempt = host.gateway.automatic!((await host.gateway.refresh("a"))!, undefined, {
-      id: `late-${ending}`, sendBy: host.clock.now() + 30_000, checkpoint: async () => {}, current: () => true,
+      id: `late-${ending}`, sendBy: host.clock.now() + 30_000, checkpoint: async () => {}, current: () => true, fault: host.fault, cleanupFault: host.cleanupFault,
     });
     const ended = attempt.then(() => null, (error: unknown) => error);
     await reached;
@@ -615,21 +649,21 @@ test("a native request whose preparation outlives the wait on it is retired once
 // An observer whose first preparation of a request lands only when the test
 // lets it, recording each write to the request as it happens.
 function stalledPreparation() {
-  const native = observer(null)!;
-  const prepare = native.prepare;
+  const native = observer(null);
   const writes: string[] = [];
   let preparations = 0;
   let reach!: () => void;
   const reached = new Promise<void>(resolve => { reach = resolve; });
   let land!: () => void;
   const landed = new Promise<void>(resolve => { land = resolve; });
-  native.prepare = async (...args: Parameters<typeof prepare>) => {
+  native.prepare = (_agent, _cache, _expires, id = native.operation.id) => {
     const preparation = ++preparations;
-    if (preparation === 1) { reach(); await landed; }
-    writes.push(`prepare ${preparation}`);
-    return { ...await prepare(...args), preparedAt: preparation };
+    return native.preparation(async () => {
+      if (preparation === 1) { reach(); await landed; }
+      writes.push(`prepare ${preparation}`);
+      return { ...native.operation, id };
+    }, async () => { writes.push(`retire ${preparation}`); });
   };
-  native.cancel = async (operation: { id: string; preparedAt?: number }) => { writes.push(`retire ${operation.preparedAt}`); };
   native.release = async () => { writes.push("release"); };
   return { native, writes, reached, land };
 }
@@ -638,7 +672,7 @@ function stalledPreparation() {
 // and then on its cleanup.
 async function abandonedPreparation(host: ReturnType<typeof fixture>, reached: Promise<void>, id: string) {
   const attempt = host.gateway.automatic!((await host.gateway.refresh("a"))!, undefined, {
-    id, sendBy: host.clock.now() + 30_000, checkpoint: async () => {}, current: () => true,
+    id, sendBy: host.clock.now() + 30_000, checkpoint: async () => {}, current: () => true, fault: host.fault, cleanupFault: host.cleanupFault,
   }).then(() => null, (error: unknown) => error);
   await reached;
   await host.clock.armed(INSPECT_TIMEOUT_MS);
@@ -654,7 +688,7 @@ test("a retry prepares a conversation's native request only after an earlier att
   const host = fixture(scope, [], undefined, false, [], { observer: native });
   await abandonedPreparation(host, reached, "retried");
   const agent = (await host.gateway.refresh("a"))!;
-  const execution = () => ({ id: "retried", sendBy: host.clock.now() + 30_000, checkpoint: async () => {}, current: () => true });
+  const execution = () => ({ id: "retried", sendBy: host.clock.now() + 30_000, checkpoint: async () => {}, current: () => true, fault: host.fault, cleanupFault: host.cleanupFault });
   // While that preparation is still being written, a retry waits for it as a
   // read before sending, and gives up at the read deadline.
   const waiting = host.gateway.automatic!(agent, undefined, execution()).then(() => null, (error: unknown) => error);
@@ -680,6 +714,109 @@ test("releasing a finished operation's native request waits for an attempt's lat
   land();
   await released;
   assert.deepEqual(writes, ["prepare 1", "retire 1", "release"]);
+});
+
+test("a preparation that fails after the attempt stopped waiting on it reaches the attempt's owner", async (t) => {
+  const scope = cleanupScope(t);
+  const native = observer(null);
+  let reach!: () => void;
+  const reached = new Promise<void>(resolve => { reach = resolve; });
+  let fail!: (error: Error) => void;
+  native.prepare = () => native.preparation(() => {
+    reach();
+    return new Promise<never>((_resolve, reject) => { fail = reject; });
+  });
+  native.release = async () => {};
+  const host = fixture(scope, [], undefined, false, [], { observer: native });
+  await abandonedPreparation(host, reached, "late-failure");
+  assert.deepEqual(host.faults, [], "nothing has failed yet");
+  // A permission error on the request file, after the attempt gave up on it.
+  const failure = new Error("EACCES: request.json");
+  fail(failure);
+  // A finished operation's release takes the conversation's turn only once
+  // that preparation's file work has ended.
+  await host.gateway.release!({ id: "late-failure", agentId: "a", evidence: { native: {
+    id: "late-failure", launchId: "launch", generation: "generation", sessionId: "native-a", revision: 1 } } } as StoredOperation);
+  assert.deepEqual(host.faults, [failure], "the failure reaches the run that started the attempt");
+});
+
+test("a failed retirement or subscription release goes to the attempt's owner and leaves its outcome alone", async (t) => {
+  const scope = cleanupScope(t);
+  const boundary = [{ type: "compaction", status: "completed", trigger: "manual" }];
+  const native = observer({ status: "completed", detail: "Native PostCompact" });
+  const retirement = new Error("EIO: retiring the request"), release = new Error("EIO: releasing the subscription");
+  native.prepare = (_agent, _cache, _expires, id = native.operation.id) =>
+    native.preparation(async () => ({ ...native.operation, id }), async () => { throw retirement; });
+  const host = fixture(scope, boundary, undefined, false, boundary, { observer: native, timeoutMs: 1_000 });
+  const subscribe = host.ref.timeline.subscribe;
+  host.ref.timeline.subscribe = listener => {
+    const result = subscribe(listener);
+    result.release = async () => { throw release; };
+    return result;
+  };
+  const outcome = await host.gateway.automatic!((await host.gateway.refresh("a"))!);
+  assert.equal(outcome.status, "completed", "the attempt's own outcome is kept");
+  assert.equal(host.cleanups.length, 2, "each cleanup failure reaches its owner once");
+  assert.deepEqual(new Set(host.cleanups), new Set([retirement, release]), "each cleanup failure reaches its owner");
+  assert.deepEqual(host.faults, [], "a cleanup failure never explains the attempt");
+});
+
+test("readiness a subscription loses because the attempt's cleanup released it is no fault", async (t) => {
+  const scope = cleanupScope(t);
+  const host = fixture(scope, [{ type: "compaction", status: "completed", trigger: "manual" }],
+    undefined, false, undefined, { timeoutMs: 50, cleanupTimeoutMs: 5 });
+  let subscribed = false;
+  const subscribe = host.ref.timeline.subscribe;
+  host.ref.timeline.subscribe = listener => {
+    const result = subscribe(listener);
+    // As the Paseo client does: a release before the first snapshot rejects
+    // the readiness it never reached.
+    let lose!: (error: Error) => void;
+    result.ready = new Promise<void>((_resolve, reject) => { lose = reject; });
+    const release = result.release;
+    result.release = async () => { lose(new Error("Subscription released")); return release(); };
+    subscribed = true;
+    return result;
+  };
+  const attempt = host.gateway.compact("a", undefined, { id: "released", sendBy: host.clock.now() + 50,
+    checkpoint: async () => {}, current: () => true, fault: host.fault, cleanupFault: host.cleanupFault });
+  await host.clock.until(() => subscribed && host.clock.timers.pendingWithin(50) > 0);
+  await host.clock.tick(50);
+  await assert.rejects(attempt, DeadlineExceeded);
+  assert.deepEqual(host.faults, [], "the deadline that ended the wait is the attempt's fault");
+});
+
+test("a retirement or subscription release that fails after the cleanup wait still reaches the attempt's owner", async (t) => {
+  const scope = cleanupScope(t);
+  const drained = drainer();
+  const boundary = [{ type: "compaction", status: "completed", trigger: "manual" }];
+  const native = observer({ status: "completed", detail: "Native PostCompact" });
+  let failRetirement: ((error: Error) => void) | undefined, failRelease: ((error: Error) => void) | undefined;
+  native.prepare = (_agent, _cache, _expires, id = native.operation.id) =>
+    native.preparation(async () => ({ ...native.operation, id }),
+      () => new Promise<never>((_resolve, reject) => { failRetirement = reject; }));
+  const host = fixture(scope, boundary, undefined, false, boundary, { observer: native, timeoutMs: 1_000, cleanupTimeoutMs: 5 });
+  const subscribe = host.ref.timeline.subscribe;
+  host.ref.timeline.subscribe = listener => {
+    const result = subscribe(listener);
+    result.release = () => new Promise<never>((_resolve, reject) => { failRelease = reject; });
+    return result;
+  };
+  const attempt = host.gateway.automatic!((await host.gateway.refresh("a"))!);
+  // Both cleanup steps have started and their waits are armed once nothing else is left to run.
+  await host.clock.armed(5);
+  await drained();
+  assert.ok(failRetirement && failRelease, "both cleanup steps were asked for");
+  await host.clock.tick(5);
+  assert.equal((await attempt).status, "completed", "the cleanup wait ended; the attempt's outcome is kept");
+  assert.deepEqual(host.cleanups, [], "nothing has failed yet");
+  const retirement = new Error("EIO: retiring the request"), release = new Error("EIO: releasing the subscription");
+  failRetirement(retirement);
+  failRelease(release);
+  await drained();
+  assert.equal(host.cleanups.length, 2, "each cleanup failure reaches its owner once");
+  assert.deepEqual(new Set(host.cleanups), new Set([retirement, release]));
+  assert.deepEqual(host.faults, [], "a cleanup failure never explains the attempt");
 });
 
 test("stopping the gateway also ends the wait on an attempt's cleanup", async (t) => {
@@ -717,7 +854,7 @@ test("stable identity and durable send marker precede provider dispatch", async 
   };
   const result = await host.gateway.compact("a", undefined, {
     id: "caller-request", sendBy: host.clock.now() + 1000,
-    checkpoint: async evidence => { checkpoints.push(evidence); }, current: () => true,
+    checkpoint: async evidence => { checkpoints.push(evidence); }, current: () => true, fault: host.fault, cleanupFault: host.cleanupFault,
   });
   assert.equal(result.status, "completed");
   assert.equal(checkpoints.at(-1)?.boundary, true);
@@ -731,7 +868,7 @@ test("failed marker persistence never sends and late send rejection is consumed"
   // A fault before sending is the worker's to retry, so it is thrown, not an outcome.
   await assert.rejects(host.gateway.compact("a", undefined, {
     id: "caller-request", sendBy: host.clock.now() + 1000,
-    checkpoint: async () => { throw new Error("disk full"); }, current: () => true,
+    checkpoint: async () => { throw new Error("disk full"); }, current: () => true, fault: host.fault, cleanupFault: host.cleanupFault,
   }), /disk full/);
   assert.equal(host.sendCount(), 0);
   let reject!: (error: Error) => void;
@@ -748,7 +885,7 @@ test("failed marker persistence never sends and late send rejection is consumed"
 
 test("recovery requires both the native receipt and the exact message's command boundary", async (t) => {
   const scope = cleanupScope(t);
-  const native = observer({ status: "completed", detail: "receipt" })!;
+  const native = observer({ status: "completed", detail: "receipt" });
   const host = fixture(scope, [], undefined, false, [], { observer: native });
   const operation: StoredOperation = {
     id: "caller-request", agentId: "a", revision: "rev", target: { sessionId: "native-a", activityKey: null },
@@ -784,7 +921,7 @@ test("recovery requires both the native receipt and the exact message's command 
 
 test('native activity identity survives compaction without restoring its scheduling window', async (t) => {
   const scope = cleanupScope(t);
-  const native = observer(null)!;
+  const native = observer(null);
   const initial = (await native.read('a'))!;
   let ledger = initial.ledger!;
   native.read = async () => ({ directory: initial.directory, ledger });
@@ -835,7 +972,7 @@ function directory(scope: CleanupScope, pageSize = 2, { slow = [] as string[], b
   // scheduler was given (`observed <id>`, see directoryScheduler), in order.
   const calls: string[] = [];
   let listCalls = 0;
-  const native = observer(null)!;
+  const native = observer(null);
   const read = native.read;
   // A defect, not an unreadable file: the observation itself fails.
   native.startedHere = (id: string) => {
@@ -881,9 +1018,15 @@ const INELIGIBLE = ["archived", "internal", "child", "unavailable", "closed", "c
 test("the full list still observes every agent, but reads native ledgers only for eligible Claude agents", async (t) => {
   const scope = cleanupScope(t);
   const { host, reads } = directory(scope);
-  const listed: Promise<import("./model").Observation>[] = [];
-  await host.gateway.list((observation) => { listed.push(observation); });
-  const observations = await Promise.all(listed);
+  // Each observation is handled from the moment it is handed over, as the
+  // gateway's contract asks of its caller.
+  const listed: Promise<{ agent: import("./model").Observation } | { error: unknown }>[] = [];
+  await host.gateway.list((observation) => {
+    listed.push(observation.then(agent => ({ agent }), (error: unknown) => ({ error })));
+  });
+  const outcomes = await Promise.all(listed);
+  assert.deepEqual(outcomes.flatMap(outcome => "error" in outcome ? [outcome.error] : []), [], "no observation fails");
+  const observations = outcomes.flatMap(outcome => "agent" in outcome ? [outcome.agent] : []);
   assert.deepEqual(observations.map(agent => agent.agentId),
     ["a", "b", "c", ...INELIGIBLE], "every listed agent is still reported");
   assert.deepEqual(observations.filter(agent => agent.eligible).map(agent => agent.agentId), ["a", "b", "c"]);
@@ -903,23 +1046,27 @@ test("the full list still observes every agent, but reads native ledgers only fo
 test("each listed agent's observation settles on its own, so a slow or failing one hides no other", async (t) => {
   const scope = cleanupScope(t);
   const dir = directory(scope, 2, { slow: ["b"], broken: ["c"] }), { host } = dir;
-  const listed: Promise<import("./model").Observation>[] = [];
-  await host.gateway.list((observation) => { listed.push(observation); });
+  // Each outcome is captured as its observation is handed over, so c's
+  // failure, which can arrive while later pages are listed, is never unhandled.
+  const listed: Promise<{ agent: string } | { error: string }>[] = [];
+  await host.gateway.list((observation) => {
+    listed.push(observation.then(agent => ({ agent: agent.agentId }), (error: unknown) => ({ error: String(error) })));
+  });
   assert.equal(dir.listCalls, Math.ceil((3 + INELIGIBLE.length) / 2), "every page is listed without waiting for b");
   assert.equal(listed.length, 3 + INELIGIBLE.length, "b is still listed");
   // Everything but b settles although b's read never ends.
-  const results = await Promise.allSettled(listed.filter((_, index) => index !== 1));
-  const fulfilled = results.flatMap(result => result.status === "fulfilled" ? [result.value.agentId] : []);
-  assert.deepEqual(fulfilled, ["a", ...INELIGIBLE], "every other observation is returned");
-  const failures = results.flatMap(result => result.status === "rejected" ? [String(result.reason)] : []);
-  assert.deepEqual(failures, ["Error: observer failed for c"], "c's failure is returned with them");
+  const results = await Promise.all(listed.filter((_, index) => index !== 1));
+  assert.deepEqual(results.flatMap(result => "agent" in result ? [result.agent] : []), ["a", ...INELIGIBLE],
+    "every other observation is returned");
+  assert.deepEqual(results.flatMap(result => "error" in result ? [result.error] : []),
+    ["Error: observer failed for c"], "c's failure is returned with them");
   host.stop();
 });
 
 // A scheduler over the real gateway, with state kept in memory. `listing()` is
 // the scheduler's latest agent listing, so a test can wait for paging to end.
 // Its timers run only when a test moves them on, and arming one wakes `until`.
-// Each listed observation is recorded in `dir.calls` as it is fulfilled.
+// Each listed observation is recorded in `dir.calls` as it is fulfilled, before the scheduler sees it.
 // `drained()` resolves once nothing is left to run but what the test holds.
 function directoryScheduler(scope: CleanupScope, dir: ReturnType<typeof directory>) {
   const { host } = dir;
@@ -930,11 +1077,10 @@ function directoryScheduler(scope: CleanupScope, dir: ReturnType<typeof director
   const timers = fakeTimers(signal.changed);
   const scheduler = createScheduler({
     store: { read: async () => structuredClone(state), write: async next => { state = structuredClone(next); } },
+    // The scheduler handles each observation as it is handed over; recording a
+    // fulfilled one is a step of that same chain.
     gateway: { ...host.gateway, list: observe => (listing = host.gateway.list(observation => {
-      observe(observation);
-      // The scheduler gets the same promise and handles its rejection; a
-      // rejected observation names no conversation to record.
-      observation.then(agent => { dir.calls.push(`observed ${agent.agentId}`); }, () => {});
+      observe(observation.then(agent => { dir.calls.push(`observed ${agent.agentId}`); return agent; }));
     })) },
     settings: async () => ({ ...DEFAULT_SETTINGS }),
     now: () => 1_000_000,
@@ -955,12 +1101,17 @@ test("a scan whose later listing page fails stays single-flight until reads star
   });
   const { scheduler, drained } = directoryScheduler(scope, dir);
   await scheduler.ready;
-  await assert.rejects(scheduler.observe({ kind: "full" }), /page failed/);
+  // The failed scan still delivers what a's read, started on the first page, meets.
+  const scan = scheduler.observe({ kind: "full" }).then(() => null, (error: unknown) => error);
+  await drained();
   const from = dir.calls.length;
   const next = scheduler.observe({ kind: "agent", agentId: "b" });
   await drained();
   assert.deepEqual(dir.calls.slice(from), [], "b is not read while a's read from the failed scan still runs");
   releaseA();
+  const failed = await scan;
+  assert.ok(failed instanceof AggregateError && failed.errors.some(cause => cause instanceof Error &&
+    cause.message === "page failed"), "the scan fails with its listing page");
   await next;
   // The gateway asks the host for b as the scheduler starts b's read, so a
   // start in the moment after the release is recorded before a's observation.
@@ -981,7 +1132,7 @@ test("a listed conversation's read is bounded from when it starts, not from when
     holdRead: id => { if (id === "a") { startedA(); return heldA; } },
     holdPage: start => start === 1 ? page : undefined,
   });
-  const { scheduler, timers, until, listing, reserved } = directoryScheduler(scope, dir);
+  const { scheduler, timers, until, listing, reserved, drained } = directoryScheduler(scope, dir);
   try {
     await scheduler.ready;
     let settled: unknown = "pending";
@@ -996,6 +1147,8 @@ test("a listed conversation's read is bounded from when it starts, not from when
     await timers.tick(4_000);
     releasePage();
     await listing();
+    // The scan's wait on the listing ends with the callbacks the listing queued.
+    await drained();
     // The deadline itself, not the scan's outcome: a rejection the 4 s tick
     // fired might not have reached the scan yet.
     assert.deepEqual([timers.pendingWithin(999), timers.pendingWithin(1_000)], [0, 1],
@@ -1063,7 +1216,7 @@ test("a live view lost while completion is verified is proved again from history
   let reads = 0;
   host.ref.timeline.refetch = async () => { reads++; return { entries: [command("verify"), { turnId: "compact-1", item: BOUNDARY_ITEM }] }; };
   const result = await host.gateway.automatic!((await refresh().then(() => host.gateway.refresh("a")))!, undefined, {
-    id: "verify", sendBy: host.clock.now() + 30_000, checkpoint: async () => {}, current: () => true,
+    id: "verify", sendBy: host.clock.now() + 30_000, checkpoint: async () => {}, current: () => true, fault: host.fault, cleanupFault: host.cleanupFault,
   });
   assert.equal(result.status, "completed");
   assert.ok(reads > 0, "the proof seen before the loss was not trusted on its own");
@@ -1103,7 +1256,7 @@ async function lostView(scope: CleanupScope, lost: typeof LOST_VIEW[number], { l
   const id = `lost-${lost}`;
   const saved: OperationEvidence[] = [];
   const result = await host.gateway.automatic!((await host.gateway.refresh("a"))!, undefined, {
-    id, sendBy: now(host.clock.now()) + 30_000, checkpoint: async evidence => { saved.push(evidence); }, current: () => true,
+    id, sendBy: now(host.clock.now()) + 30_000, checkpoint: async evidence => { saved.push(evidence); }, current: () => true, fault: host.fault, cleanupFault: host.cleanupFault,
   });
   assert.equal(host.sendCount(), 1, "/compact is never sent twice");
   return { result, evidence: saved.at(-1), reads };
@@ -1207,7 +1360,7 @@ function pollSignal() {
 test("after a lost live view, history is read at most once a second while completion is awaited", async (t) => {
   const scope = cleanupScope(t);
   let time = Date.now();
-  const native = observer({ status: "completed", detail: "Native PostCompact" })!;
+  const native = observer({ status: "completed", detail: "Native PostCompact" });
   const polls = pollSignal();
   const receipt = native.receipt;
   native.receipt = (...args) => { polls.poll(); return receipt(...args); };
@@ -1224,7 +1377,7 @@ test("after a lost live view, history is read at most once a second while comple
   // The page never shows the boundary, so the attempt keeps polling.
   host.ref.timeline.refetch = async () => { reads++; return { entries: [command("interval")] }; };
   const attempt = host.gateway.automatic!((await host.gateway.refresh("a"))!, undefined, {
-    id: "interval", sendBy: time + 30_000, checkpoint: async () => {}, current: () => true,
+    id: "interval", sendBy: time + 30_000, checkpoint: async () => {}, current: () => true, fault: host.fault, cleanupFault: host.cleanupFault,
   });
   // Past the live deadline, so the attempt ends even if the test stops early,
   // at a failed assertion or at the test runner's bound.
@@ -1274,15 +1427,11 @@ test("an attempt that ends unknown after a lost live view stays open for reconci
     id: "lost-view", agentId: "a", revision: agent.revision!, target: { sessionId: agent.sessionId, activityKey: agent.activityKey ?? null },
     kind: "manual", state: "requested", createdAt: time, updatedAt: time, result: null, inputFingerprint: "lost-view",
     sendBy: time + 10_000, attempt: 0 }] };
-  let tail: Promise<unknown> = Promise.resolve();
+  const queue = createQueue();
   const errors: unknown[] = [];
   const worker = createOperationWorker({
     store: { read: async () => structuredClone(state), write: async next => { state = structuredClone(next); } },
-    update: change => {
-      const result = tail.then(() => { const next = structuredClone(state); const value = change(next); state = next; return value; });
-      tail = result.catch(() => {});
-      return result;
-    },
+    update: change => queue.run(async () => { const next = structuredClone(state); const value = change(next); state = next; return value; }),
     gateway: host.gateway, settings: async () => ({ ...DEFAULT_SETTINGS }), now: host.clock.now, timers: host.clock.timers, onError: error => errors.push(error),
   });
   await worker.reconcile();
@@ -1368,7 +1517,7 @@ test("live observation reports a confirmed query-restart refusal promptly for bo
       });
     };
     const agent = (await host.gateway.refresh("a"))!;
-    const execution = { id: `op-${kind}`, sendBy: time + 30_000, checkpoint: async () => {}, current: () => true };
+    const execution = { id: `op-${kind}`, sendBy: time + 30_000, checkpoint: async () => {}, current: () => true, fault: host.fault, cleanupFault: host.cleanupFault };
     const outcome = kind === "automatic"
       ? await host.gateway.automatic!(agent, { expiresAt: time + 30_000, allowed: async () => true }, execution)
       : await host.gateway.compact("a", agent, execution);
@@ -1412,7 +1561,7 @@ test("a generation change without a matching refusal stays pending until the obs
   const agent = (await host.gateway.refresh("a"))!;
   let settled = false;
   attempt = host.gateway.compact("a", agent, {
-    id: "gen-only", sendBy: time + 30_000, checkpoint: async () => {}, current: () => true,
+    id: "gen-only", sendBy: time + 30_000, checkpoint: async () => {}, current: () => true, fault: host.fault, cleanupFault: host.cleanupFault,
   });
   void attempt.finally(() => { settled = true; });
   const until = (done: () => boolean) =>
@@ -1448,7 +1597,7 @@ test("stopping the plugin after dispatch preserves request.json so a query-resta
   const agent = (await host.gateway.refresh("a"))!;
   const outcome = await host.gateway.compact("a", agent, {
     id: "stop-after-dispatch", sendBy: time + 30_000,
-    checkpoint: async evidence => { saved = evidence; }, current: () => true,
+    checkpoint: async evidence => { saved = evidence; }, current: () => true, fault: host.fault, cleanupFault: host.cleanupFault,
   });
   assert.equal(outcome.status, "unknown");
   assert.equal(host.sendCount(), 1);
@@ -1525,14 +1674,14 @@ test("recovery accepts a confirmed query-restart refusal within the deadline and
 
 test("the gateway records which preparation of the native request it sends against", async (t) => {
   const scope = cleanupScope(t);
-  const native = observer(null)!;
-  const prepare = native.prepare;
-  native.prepare = async (...args: Parameters<typeof prepare>) => ({ ...await prepare(...args), preparation: "preparation-1" });
+  const native = observer(null);
+  native.prepare = (_agent, _cache, _expires, id = native.operation.id) =>
+    native.preparation(async () => ({ ...native.operation, id, preparation: "preparation-1" }));
   const host = fixture(scope, [], undefined, false, [], { observer: native });
   const saved: OperationEvidence[] = [];
   await host.gateway.compact("a", (await host.gateway.refresh("a"))!, {
     id: "operation-1", sendBy: host.clock.now() + 30_000,
-    checkpoint: async evidence => { saved.push(evidence); }, current: () => true,
+    checkpoint: async evidence => { saved.push(evidence); }, current: () => true, fault: host.fault, cleanupFault: host.cleanupFault,
   });
   assert.equal(saved[0]?.native?.preparation, "preparation-1");
   assert(saved.every(evidence => evidence.native?.preparation === "preparation-1"));

@@ -39,9 +39,11 @@ function instance(scope: CleanupScope, path: string, files?: DurableFiles, gatew
     ...options,
   });
   scope.defer(() => scheduler.stop());
-  // What the plugin's cleanup does: close the writes, stop, then drain.
-  const stop = () => { writes.close(); scheduler.stop(); return writes.drain(); };
-  return { writes, scheduler, stop };
+  // What the plugin's cleanup does: close the writes, stop, then drain. The
+  // failures the writes hand over once closed are kept in `torndown`.
+  const torndown: unknown[] = [];
+  const stop = () => { writes.close(error => { torndown.push(error); }); scheduler.stop(); return writes.drain(); };
+  return { writes, scheduler, stop, torndown };
 }
 const stored = async (path: string): Promise<State> => JSON.parse(await readFile(path, "utf8"));
 
@@ -97,7 +99,7 @@ for (const phase of ["issued", "unpublished"] as const) {
       compact: async (_agentId, _expected, execution) => {
         held = phase === "issued" ? holdRename(path) : holdWrite(path);
         void held.reached.then(reach);
-        await execution!.checkpoint({ native: { ...native, id: execution!.id } }).catch(() => {});
+        await execution.checkpoint({ native: { ...native, id: execution.id } }).catch(() => {});
         return { status: "unknown", detail: "stopped" };
       },
     });

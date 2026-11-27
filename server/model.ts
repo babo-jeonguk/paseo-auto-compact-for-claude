@@ -63,6 +63,12 @@ export interface ExecutionContext {
   sendBy: number;
   checkpoint(evidence: OperationEvidence): Promise<void>;
   current(): boolean;
+  // The owners of the attempt's late and cleanup faults: the worker run that
+  // started the attempt. `fault` takes a fault the attempt's work meets after
+  // a wait on it ended, which can explain why the attempt failed;
+  // `cleanupFault` a failure of the attempt's cleanup, which never does.
+  fault(error: unknown): void;
+  cleanupFault(error: unknown): void;
 }
 // "failed" never says whether anything was sent; the persisted dispatch marker does.
 export type CompactOutcome = { status: "completed" | "failed" | "unknown"; detail: string };
@@ -140,15 +146,15 @@ export interface Gateway {
   refresh(agentId: string): Promise<Observation | null>;
   compact(
     agentId: string,
-    expected?: Observation,
-    execution?: ExecutionContext
+    expected: Observation | undefined,
+    execution: ExecutionContext
   ): Promise<CompactOutcome>;
   /** Automatic dispatch observes native activity; TTL may use the disclosed default. */
   readiness?: (expected: Observation, dueAt?: number) => Promise<Blocked | null>;
   automatic?: (
     expected: Observation,
-    guard?: DispatchGuard,
-    execution?: ExecutionContext
+    guard: DispatchGuard | undefined,
+    execution: ExecutionContext
   ) => Promise<CompactOutcome>;
   inspect?: (operation: StoredOperation) => Promise<CompactOutcome | null>;
   /** Retire a finished operation's native request; best effort. */

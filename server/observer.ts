@@ -1,7 +1,7 @@
 import type { PluginSessionOpenRequest } from '@getpaseo/plugin/server';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile, readdir, writeFile, lstat, rm } from 'node:fs/promises';
-import { join, delimiter, sep } from 'node:path';
+import { join, delimiter, sep, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { z } from 'zod';
 import { observerAsset } from './observer-assets.generated';
@@ -11,6 +11,7 @@ import { createCacheReader } from './cache';
 import { CLOCK_STEP_TOLERANCE_MS } from './deadline';
 import { createDurableWrites, type DurableWrites } from './durable';
 import type { LeftoverDecision } from './model';
+import { createKeyedQueue } from './queue';
 
 // Must equal QUERY_RESTARTED_REFUSAL in server/observer-source.mjs.
 export const QUERY_RESTARTED_REFUSAL = 'query_restarted';
@@ -137,27 +138,24 @@ export function createObserver(options: { home?: string; now?: () => number; wri
   const writes = options.writes ?? createDurableWrites();
   // The observer launch this plugin instance last started for each agent.
   const launchesStartedHere = new Map<string, string>();
-  // Every preparation of a native request this instance made. Its own request
-  // is its attempt's to retire, never a leftover from an earlier instance.
-  const preparations = new Set<string>();
-  // One writer of a file at a time in this instance, in call order. The next
-  // waits for the previous one's actual file work to settle, not for a bounded
-  // wait on it, so a delayed write lands where it was asked to; the entry goes
-  // once that chain has ended.
-  function serialize<K>(chains: Map<K, Promise<unknown>>) {
-    return <T>(key: K, work: () => Promise<T>): Promise<T> => {
-      const earlier = chains.get(key) ?? Promise.resolve();
-      const result = earlier.then(work, work);
-      const done = result.then(() => {}, () => {});
-      chains.set(key, done);
-      void done.then(() => { if (chains.get(key) === done) chains.delete(key); });
-      return result;
-    };
-  }
-  // One writer of a conversation's request.json, and one preparation of a
-  // conversation's next launch (its current.json), at a time.
-  const requestLock = serialize(new Map<string, Promise<unknown>>());
-  const sessionLock = serialize(new Map<string, Promise<unknown>>());
+  // The request this instance last published to each conversation, keyed by
+  // the conversation's hashed directory, until it is retired. Such a request is
+  // its attempt's to retire, never a leftover from an earlier instance. The
+  // entry changes only with what lands in that request file: a publication
+  // supersedes it, and a retirement, an absent file or a pruned launch forgets
+  // it, so the map holds at most one entry per conversation.
+  const issued = new Map<string, { directory: string; preparation: string }>();
+  const forgetAt = (directory: string) => {
+    const key = dirname(directory);
+    if (issued.get(key)?.directory === directory) issued.delete(key);
+  };
+  // One writer of a conversation's request.json at a time (`requests`), shared
+  // by preparation, retirement, release and recovery of that conversation, and
+  // one preparation of its next launch at a time (`sessions`). Both are keyed by
+  // the conversation's hashed directory. The next entry starts once the
+  // previous one's actual file work ended, not when a bounded wait on it did.
+  const requests = createKeyedQueue<string>();
+  const sessions = createKeyedQueue<string>();
   const cacheWindow = createCacheReader();
   const agentDirectory = (id: string) => join(base, createHash('sha256').update(id).digest('hex'));
   const receiptName = (id: string) => encodeURIComponent(id) + '.json';
@@ -253,6 +251,8 @@ export function createObserver(options: { home?: string; now?: () => number; wri
         if (!closed && now() - info.mtimeMs < 24 * 60 * 60_000) continue;
       } catch { continue; }
       await rm(directory, { recursive: true, force: true }).catch(() => {});
+      // A pruned launch is never the active one, which is all recovery reads.
+      forgetAt(directory);
     }
   }
   function reason(ledger: Ledger | undefined, agent: Observation, dueAt = now()): Blocked | null {
@@ -266,23 +266,36 @@ export function createObserver(options: { home?: string; now?: () => number; wri
       detail: `Idle delay exceeds the ${ledger.cache?.ttlMinutes}-minute cache window (${ledger.cache?.source})` };
     return null;
   }
-  // One retirement path for a launch directory's request.json. The read, the
-  // check and the write are one writer of this file, so they cannot be split by
-  // a newer preparation landing in between. Only a prepared request is retired:
-  // retiring a retired one again could turn `settled` into `cancelled`, and a
-  // state this release does not know is not ours to rewrite.
-  async function retirePrepared(directory: string,
+  // One retirement path for a launch directory's request.json, under durable
+  // writes but without taking the request queue: the caller already holds it.
+  // The read, the check and the write are one writer of this file, so they
+  // cannot be split by a newer preparation landing in between. Only a prepared
+  // request is retired: retiring a retired one again could turn `settled` into
+  // `cancelled`, and a state this release does not know is not ours to rewrite.
+  // A missing request file is absence; any other read or parse failure throws.
+  async function retireLocked(directory: string,
     choose: (request: { id: string; preparation?: string }) => { sent: boolean } | null) {
     const path = join(directory, 'request.json');
-    await writes.run(() => requestLock(path, async () => {
-      const request = await readRequest(path);
+    return writes.run(async () => {
+      let request: Awaited<ReturnType<typeof readRequest>>;
+      try { request = await readRequest(path); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        forgetAt(directory);
+        return;
+      }
       if (request.status !== 'prepared' || typeof request.id !== 'string') return;
       const { id, preparation } = request;
       const decision = choose({ id, ...(preparation !== undefined ? { preparation } : {}) });
       if (decision === null) return;
+      // Once it lands, the file names no prepared request.
       await writes.replace(path, JSON.stringify(retiredRecord(id, preparation,
-        await retiredStatus(directory, id, preparation, decision.sent))));
-    }));
+        await retiredStatus(directory, id, preparation, decision.sent))), () => forgetAt(directory));
+    });
+  }
+  function retirePrepared(directory: string,
+    choose: (request: { id: string; preparation?: string }) => { sent: boolean } | null) {
+    return requests.run(dirname(directory), () => retireLocked(directory, choose));
   }
   async function cancel(operation: { directory: string; id: string; preparation?: string }, sent = true) {
     // Retire only the preparation this call is about; a retry's newer
@@ -339,7 +352,7 @@ export function createObserver(options: { home?: string; now?: () => number; wri
       // One preparation of a conversation at a time, so its launches, and the
       // current.json publication of each, land in call order: a delayed earlier
       // publication cannot replace a newer active launch.
-      return sessionLock(parent, () => writes.run(async () => {
+      return sessions.run(parent, () => writes.run(async () => {
         const launchId = randomUUID();
         const directory = join(parent, launchId), mod = join(directory, 'mod');
         await mkdir(join(mod, '.claude-plugin'), { recursive: true, mode: 0o700 });
@@ -377,38 +390,60 @@ export function createObserver(options: { home?: string; now?: () => number; wri
       if (current?.ledger === null) return placeholderReason(current.preparedAt, agent);
       return reason(current?.ledger, agent, dueAt);
     },
-    async prepare(agent: Observation, requireCache: boolean, expiresAt: number, id: string = randomUUID()) {
-      const current = await read(agent.agentId);
-      if (current?.ledger === null) {
-        const placeholder = placeholderReason(current.preparedAt, agent);
-        // A starting observer is a fault: retried until the send deadline.
-        if (placeholder.reason === 'observer_starting') throw new Error(placeholder.detail);
-        throw new Refusal(placeholder.detail);
-      }
-      if (!current || current.ledger.sessionId !== agent.sessionId) throw new Refusal('Claude observer unavailable');
-      const { ledger, directory } = current;
-      if (ledger.activeTurns.length || ledger.pendingInputs || ledger.compact?.status === 'running')
-        throw new Refusal('Claude is still working');
-      if (requireCache) { const blocked = reason(ledger, agent); if (blocked) throw new Refusal(blocked.detail); }
+    // Preparing a conversation's native request: `ready` is its outcome, and
+    // `retire(sent)` retires exactly this preparation once its file work has
+    // ended, if that work reached the request file; `settled()` resolves once
+    // the request queue's work queued so far has ended. A rejected `ready` does
+    // not prove nothing was published (a rename can land before its temporary
+    // file fails to go): `target`, set once the request has landed, decides
+    // whether retirement looks, and the preparation identity whether it may retire.
+    prepare(agent: Observation, requireCache: boolean, expiresAt: number, id: string = randomUUID()) {
+      const key = agentDirectory(agent.agentId);
       const preparation: string = randomUUID();
-      const request = { id, preparation, launchId: ledger.launchId, generation: ledger.generation,
-        sessionId: ledger.sessionId, revision: ledger.revision, preparedAt: now(), expiresAt,
-        requireCache, cacheDeadline: ledger.cacheDeadline, clockEpoch: ledger.clockEpoch, status: 'prepared' };
-      // Remembered before the write, so a recovery scan running meanwhile can
-      // tell this instance's preparation from a leftover even before it lands.
-      preparations.add(preparation);
-      const receipts = join(agentDirectory(agent.agentId), 'receipts');
-      const path = join(directory, 'request.json');
-      return writes.run(async () => {
-        await mkdir(receipts, { recursive: true, mode: 0o700 });
-        // Pre-create the file for the Mod filesystem capability. Never erase a receipt.
-        await writeFile(receiptPath(agent.agentId, id), '{}', { mode: 0o600, flag: 'wx' })
-          .catch(error => { if (error.code !== 'EEXIST') throw error; });
-        // Serialized with this request's other writers, so a delayed retirement
-        // cannot replace this newer preparation.
-        await requestLock(path, () => writes.replace(path, JSON.stringify(request)));
+      // Set once the request is in place; a preparation that failed before then
+      // left nothing on disk to retire.
+      let target: { directory: string } | null = null;
+      const ready = requests.run(key, async () => {
+        const current = await read(agent.agentId);
+        if (current?.ledger === null) {
+          const placeholder = placeholderReason(current.preparedAt, agent);
+          // A starting observer is a fault: retried until the send deadline.
+          if (placeholder.reason === 'observer_starting') throw new Error(placeholder.detail);
+          throw new Refusal(placeholder.detail);
+        }
+        if (!current || current.ledger.sessionId !== agent.sessionId) throw new Refusal('Claude observer unavailable');
+        const { ledger, directory } = current;
+        if (ledger.activeTurns.length || ledger.pendingInputs || ledger.compact?.status === 'running')
+          throw new Refusal('Claude is still working');
+        if (requireCache) { const blocked = reason(ledger, agent); if (blocked) throw new Refusal(blocked.detail); }
+        const request = { id, preparation, launchId: ledger.launchId, generation: ledger.generation,
+          sessionId: ledger.sessionId, revision: ledger.revision, preparedAt: now(), expiresAt,
+          requireCache, cacheDeadline: ledger.cacheDeadline, clockEpoch: ledger.clockEpoch, status: 'prepared' };
+        const receipts = join(key, 'receipts');
+        const path = join(directory, 'request.json');
+        await writes.run(async () => {
+          await mkdir(receipts, { recursive: true, mode: 0o700 });
+          // Pre-create the file for the Mod filesystem capability. Never erase a receipt.
+          await writeFile(receiptPath(agent.agentId, id), '{}', { mode: 0o600, flag: 'wx' })
+            .catch(error => { if (error.code !== 'EEXIST') throw error; });
+          // The request queue already holds this conversation, so no retirement
+          // or recovery asked for before or after this can split the
+          // publication, and once it lands, a recovery scan tells this
+          // instance's preparation from a leftover.
+          await writes.replace(path, JSON.stringify(request), () => {
+            target = { directory };
+            issued.set(key, { directory, preparation });
+          });
+        });
         return { ...request, directory };
       });
+      const retire = (sent: boolean) => requests.run(key, async () => {
+        const retired = target;
+        if (!retired) return;
+        await retireLocked(retired.directory, request =>
+          request.id === id && request.preparation === preparation ? { sent } : null);
+      });
+      return { ready, retire, settled: () => requests.idle(key) };
     },
     async receipt(agentId: string, operation: NativeOperation) {
       try {
@@ -468,7 +503,8 @@ export function createObserver(options: { home?: string; now?: () => number; wri
           await retirePrepared(directory, request => {
             // A request this instance prepared belongs to its own attempt and
             // is left alone.
-            if (request.preparation !== undefined && preparations.has(request.preparation)) return null;
+            const own = issued.get(parent);
+            if (own?.directory === directory && own.preparation === request.preparation) return null;
             return decide(request);
           });
         } catch (error) {

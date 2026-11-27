@@ -1,12 +1,12 @@
 import type { PluginHandlerContext, PluginHookEvents } from "@getpaseo/plugin/server";
-import { randomUUID } from "node:crypto";
 import { Refusal, readable, targetOf, unchanged, type Gateway, type Observation, type DispatchGuard, type ExecutionContext,
   type LeftoverDecision, type OperationEvidence, type StoredOperation } from "./model";
 import type { createObserver } from "./observer";
-import { bounded, CLEANUP_TIMEOUT_MS, deadlineOf, LIVE_OBSERVATION_MS, observationEndBy, pause, readWithin, SEND_DEADLINE_MS,
-  SEND_TIMEOUT_MS, systemTimers, type Timers } from "./deadline";
+import { bounded, CLEANUP_TIMEOUT_MS, deadlineOf, DeadlineExceeded, LIVE_OBSERVATION_MS, observationEndBy, pause, readWithin,
+  SEND_TIMEOUT_MS, Stopped, systemTimers, type Timers } from "./deadline";
 import { claudeProvider } from "../shared/providers";
 import { SESSION_RESUME_REQUIRED } from "../shared/rpc";
+import { createKeyedQueue } from "./queue";
 export { claudeProvider } from "../shared/providers";
 
 type Api = PluginHandlerContext["paseo"];
@@ -55,18 +55,9 @@ export function createGateway(options: {
   const pending = new Map<string, { turnId: string | null }>();
   const busy = new Set<string>();
   // One writer of a conversation's native request at a time: a turn ends with
-  // its last write, not with the wait on it.
-  const writers = new Map<string, { done: Promise<void>; end: () => void }>();
-  const takeTurn = (agentId: string) => {
-    const earlier = writers.get(agentId)?.done ?? Promise.resolve();
-    let end!: () => void;
-    const own = new Promise<void>(resolve => { end = resolve; });
-    const turn = { done: earlier.then(() => own), end };
-    writers.set(agentId, turn);
-    // Drop the entry once this chain has ended, unless a newer turn replaced it.
-    void turn.done.then(() => { if (writers.get(agentId) === turn) writers.delete(agentId); });
-    return { wait: earlier, end };
-  };
+  // its last write, not with the wait on it. The observer's own file work runs
+  // inside a turn.
+  const turns = createKeyedQueue<string>();
   // Stopping the gateway aborts this signal, which ends every wait on it at
   // once, cleanup waits included, and clears their timers.
   const stopping = new AbortController();
@@ -127,12 +118,9 @@ export function createGateway(options: {
         const page = await requireApi().agents.list({ filter: { includeBackground: true },
           page: { limit: 200, ...(cursor ? { cursor } : {}) } });
         // Observations run while later pages are listed. The caller handles
-        // each one from the moment it starts; until then a rejection must not
-        // count as unhandled.
+        // each one from the moment it is handed over (the Gateway.list contract).
         for (const { agent } of page.entries) {
-          const observed = observation(agent, config.providers);
-          observed.catch(() => {});
-          observe(observed);
+          observe(observation(agent, config.providers));
         }
         cursor = page.pageInfo.hasMore ? page.pageInfo.nextCursor ?? undefined : undefined;
       } while (cursor);
@@ -142,18 +130,14 @@ export function createGateway(options: {
       return current ? observation(current.agent) : null;
     },
     ...(observer ? {
-      automatic: (expected: Observation, guard?: DispatchGuard, execution?: ExecutionContext) => compact(expected.agentId, expected, true, guard, execution),
+      automatic: (expected: Observation, guard: DispatchGuard | undefined, execution: ExecutionContext) =>
+        compact(expected.agentId, expected, true, guard, execution),
       readiness: (expected: Observation, dueAt?: number) => observer.readiness(expected, dueAt),
       async release(operation: StoredOperation) {
         const native = operation.evidence?.native;
         if (!native) return;
-        const turn = takeTurn(operation.agentId);
-        await turn.wait;
-        try {
-          await observer.release(operation.agentId, native, operation.evidence?.dispatchStartedAt !== undefined);
-        } finally {
-          turn.end();
-        }
+        await turns.run(operation.agentId, () => observer.release(operation.agentId, native,
+          operation.evidence?.dispatchStartedAt !== undefined));
       },
       // Startup retires what an earlier instance left prepared, as the
       // scheduler's leftover decision says; each conversation's failure is the
@@ -178,7 +162,7 @@ export function createGateway(options: {
   const history = async (agentId: string, id: string) =>
     pinnedCommand((await requireApi().agents.ref(agentId).timeline.refetch({ limit: 200 })).entries, id);
   async function compact(agentId: string, expected: Observation | undefined, automatic: boolean,
-    guard?: DispatchGuard, execution?: ExecutionContext): ReturnType<Gateway["compact"]> {
+    guard: DispatchGuard | undefined, execution: ExecutionContext): ReturnType<Gateway["compact"]> {
     if (stopped) throw new Error("Plugin stopped");
     // A concurrent dispatch of this conversation is a condition, not a fault.
     if (busy.has(agentId)) throw new Refusal("Compaction already running for this conversation");
@@ -186,18 +170,18 @@ export function createGateway(options: {
     // the send deadline applies; after it a fresh observation budget, so a late
     // send is still observed in full.
     const live = options.timeoutMs ?? LIVE_OBSERVATION_MS;
-    const sendBy = execution?.sendBy ?? now() + SEND_DEADLINE_MS[automatic ? "automatic" : "manual"];
+    const sendBy = execution.sendBy;
     let deadline = sendBy;
-    const wait = <T>(work: Promise<T>) => bounded(work, deadline - now(), timers, stopping.signal);
-    const read = <T>(work: Promise<T>) => readWithin(work, deadline, now(), timers, stopping.signal);
-    const currentWorker = () => !stopped && (execution?.current() ?? true) && now() < deadline;
+    const wait = <T>(work: Promise<T>) => bounded(work, deadline - now(), timers, execution.fault, stopping.signal);
+    const read = <T>(work: Promise<T>) => readWithin(work, deadline, now(), timers, execution.fault, stopping.signal);
+    const currentWorker = () => !stopped && execution.current() && now() < deadline;
     const ref = requireApi().agents.ref(agentId);
     busy.add(agentId);
-    const id = execution?.id ?? randomUUID();
-    let operation: Awaited<ReturnType<Observer['prepare']>> | undefined;
-    let preparing: ReturnType<Observer['prepare']> | undefined;
-    let turn: ReturnType<typeof takeTurn> | undefined;
-    let sent = false, armed = false, ownershipLost = false;
+    const id = execution.id;
+    let operation: Awaited<ReturnType<Observer['prepare']>['ready']> | undefined;
+    let preparation: ReturnType<Observer['prepare']> | undefined;
+    let turn: ReturnType<typeof turns.hold> | undefined;
+    let sent = false, armed = false, ownershipLost = false, releasing = false;
     let boundary = false;
     // Lost live views so far. After one, the live command turn and boundary
     // prove nothing on their own; `pinned` holds what history read since the
@@ -212,7 +196,6 @@ export function createGateway(options: {
     const endings = new Map<string, End>();
     let saved = "", lastCheckpoint = 0;
     async function checkpoint(force = false) {
-      if (!execution) return;
       const { turnId, boundary } = proof();
       // A lost live view is not a change: the evidence stays valid, so
       // reconciliation keeps checking it until the observation deadline.
@@ -224,8 +207,8 @@ export function createGateway(options: {
     }
     try {
       if (observer) {
-        turn = takeTurn(agentId);
-        await read(turn.wait);
+        turn = turns.hold(agentId);
+        await read(turn.ready);
       }
       const before = readable(await read(gateway.refresh(agentId)));
       if (!before?.sessionId || !before.idle || !before.eligible ||
@@ -236,8 +219,8 @@ export function createGateway(options: {
       // for as long as it can still be observed.
       const startBy = Math.min(guard?.expiresAt ?? Infinity, sendBy);
       if (observer) {
-        preparing = observer.prepare(before, automatic, observationEndBy(sendBy), id);
-        operation = await read(preparing);
+        preparation = observer.prepare(before, automatic, observationEndBy(sendBy), id);
+        operation = await read(preparation.ready);
         const { launchId, generation, sessionId, revision } = operation;
         // The preparation names this exact request, so a receipt from another
         // preparation of the same operation cannot settle it.
@@ -255,10 +238,16 @@ export function createGateway(options: {
         if (event.item.type === "user_message" && event.item.clientMessageId === id) entry.turnId = event.turnId ?? null;
         if (commandBoundary(event.item, event.turnId, entry.turnId)) boundary = true;
       });
-      await read(subscription.ready);
+      // The Paseo client rejects readiness it never reached once the
+      // subscription is released, which only this attempt's cleanup does: a
+      // rejection then is that release's result, not a fault of the read.
+      await readWithin(subscription.ready, deadline, now(), timers,
+        error => { if (!releasing) execution.fault(error); }, stopping.signal);
       const current = readable(await read(gateway.refresh(agentId)));
-      // Running out of time or being stopped is not a reading of the session.
-      if (!currentWorker() || now() > startBy) throw new Error("Send deadline passed or worker stopped before send");
+      // Running out of time is a fault the worker retries until the send
+      // deadline; before then, a worker that is no longer current has stopped.
+      if (now() > startBy || now() >= deadline) throw new Error("Send deadline passed before send");
+      if (stopped || !execution.current()) throw new Stopped();
       if (!current?.idle || !unchanged({ revision: before.revision, target: targetOf(before) }, current) ||
           (guard && !await read(guard.allowed())))
         throw new Refusal("Reservation cancelled or session changed before send");
@@ -285,8 +274,10 @@ export function createGateway(options: {
       sent = true;
       const send = ref.send("/compact", { messageId: id });
       // A rejection/timeout may still mean delivery. Inspect evidence until the
-      // original deadline; late send rejection is consumed by bounded().
-      await bounded(send, Math.min(options.dispatchTimeoutMs ?? SEND_TIMEOUT_MS, deadline - now()), timers, stopping.signal)
+      // original deadline; a rejection after the send's own wait ended goes to
+      // the attempt's owner through bounded().
+      await bounded(send, Math.min(options.dispatchTimeoutMs ?? SEND_TIMEOUT_MS, deadline - now()), timers, execution.fault,
+        stopping.signal)
         .catch(() => {});
       while (currentWorker()) {
         await checkpoint();
@@ -342,18 +333,21 @@ export function createGateway(options: {
       // Once the plugin's durable writes have closed (it stopped after dispatch),
       // the retirement is refused and the next instance's startup recovery
       // retires the request, so a restarting query can still attribute its refusal.
-      const prepared = operation !== undefined ? Promise.resolve(operation) : preparing;
-      const retire = prepared && !(sent && stopped)
-        ? prepared.then(value => observer!.cancel(value, sent), () => undefined)
-        : undefined;
-      const writes = retire ?? prepared;
-      if (turn) {
-        if (writes) void writes.then(turn.end, turn.end);
-        else turn.end();
-      }
+      const retirement = preparation && !(sent && stopped) ? preparation.retire(sent) : undefined;
+      turn?.release(preparation?.settled());
+      // The cleanup wait's own deadline or the stop is expected: the work goes
+      // on and a later failure reaches the attempt's owner through bounded().
+      // Any other failure goes to that owner without changing the outcome.
+      const cleanup = async (work: Promise<unknown>) => {
+        try { await bounded(work, cleanupMs, timers, execution.cleanupFault, stopping.signal); }
+        catch (error) {
+          if (!(error instanceof DeadlineExceeded || error instanceof Stopped)) execution.cleanupFault(error);
+        }
+      };
+      releasing = true;
       await Promise.all([
-        retire ? bounded(retire, cleanupMs, timers, stopping.signal).catch(() => {}) : undefined,
-        subscription ? bounded(Promise.resolve(subscription.release()), cleanupMs, timers, stopping.signal).catch(() => {}) : undefined,
+        retirement && cleanup(retirement),
+        subscription && cleanup(Promise.resolve(subscription.release())),
       ]);
       busy.delete(agentId);
     }

@@ -58,50 +58,72 @@ export const deadlineOf = (operation: Pick<StoredOperation, "sendBy" | "evidence
 // this, so Claude may admit its compaction until then.
 export const observationEndBy = (sendBy: number) => sendBy + OBSERVATION_MS;
 
-// Attaching both handlers also consumes late rejections after the timer wins.
-// A timeout bounds waiting; it does not cancel a remote side effect. The wait
-// runs on the caller's timers, and `stop`, when given, ends it early when the
-// caller stops, rejecting at once without arming a timer if it has already
-// stopped. `Infinity` means no deadline of its own: no timer is armed, and the
-// wait ends only when the work settles or `stop` aborts. It settles once: a
-// late settle, abort or deadline after it ended does nothing. However it ends,
-// a timer it armed is cleared; a wait that armed none clears none.
-export function bounded<T>(work: Promise<T>, milliseconds: number, timers: Timers, stop?: AbortSignal): Promise<T> {
+// One wait's deadline and stop: `deadline` or `stopped` settles it once, unless
+// it has already ended. `Infinity` arms no timer. A wait that starts after
+// `stop` aborted arms nothing and ends at once with `stopped`. However it ends,
+// a timer it armed is cleared and its stop listener detached; a later settle,
+// abort or deadline does nothing.
+function limit(milliseconds: number, timers: Timers, stop: AbortSignal | undefined,
+  deadline: () => void, stopped: () => void) {
+  let ended = false;
+  let armed = false;
+  let timer: unknown;
+  const end = (settle: () => void) => {
+    if (ended) return;
+    ended = true;
+    if (armed) timers.clearTimeout(timer);
+    stop?.removeEventListener("abort", abort);
+    settle();
+  };
+  const abort = () => end(stopped);
+  // Never hand Infinity to setTimeout: Node turns it into 1 ms. A wait after
+  // stop arms nothing, since it ends at once.
+  if (milliseconds !== Infinity && !stop?.aborted) {
+    timer = timers.setTimeout(() => end(deadline), Math.max(0, milliseconds));
+    armed = true;
+  }
+  if (stop?.aborted) abort();
+  else stop?.addEventListener("abort", abort, { once: true });
+  return { get ended() { return ended; }, end };
+}
+
+// A timeout bounds waiting; it does not cancel a remote side effect. A work
+// that rejects while the wait is still open rejects the wait; one that rejects
+// after the wait already ended at its deadline or its stop is handed to `late`
+// with the original error, never to both. The wait runs on the caller's timers,
+// and `stop`, when given, ends it early when the caller stops, rejecting at
+// once without arming a timer if it has already stopped. `Infinity` means no
+// deadline of its own: no timer is armed, and the wait ends only when the work
+// settles or `stop` aborts. It settles once: a late settle, abort or deadline
+// after it ended does nothing. However it ends, a timer it armed is cleared; a
+// wait that armed none clears none.
+export function bounded<T>(work: Promise<T>, milliseconds: number, timers: Timers, late: (error: unknown) => void,
+  stop?: AbortSignal): Promise<T> {
   return new Promise((resolve, reject) => {
-    let ended = false;
-    let armed = false;
-    let timer: unknown;
-    const end = (settle: () => void) => {
-      if (ended) return;
-      ended = true;
-      if (armed) timers.clearTimeout(timer);
-      stop?.removeEventListener("abort", stopped);
-      settle();
-    };
-    const stopped = () => end(() => reject(new Stopped()));
-    // Never hand Infinity to setTimeout: Node turns it into 1 ms. A wait after
-    // stop arms nothing, since it ends at once.
-    if (milliseconds !== Infinity && !stop?.aborted) {
-      timer = timers.setTimeout(() => end(() => reject(new DeadlineExceeded())), Math.max(0, milliseconds));
-      armed = true;
-    }
-    work.then(value => end(() => resolve(value)), error => end(() => reject(error)));
-    if (stop?.aborted) stopped();
-    else stop?.addEventListener("abort", stopped, { once: true });
+    const waiting = limit(milliseconds, timers, stop,
+      () => reject(new DeadlineExceeded()), () => reject(new Stopped()));
+    work.then(
+      value => waiting.end(() => resolve(value)),
+      error => {
+        // A rejection the ended wait no longer waits for is its work's own.
+        if (waiting.ended) late(error);
+        else waiting.end(() => reject(error));
+      });
   });
 }
 // A component's one lifetime, which `end()` ends. Every await of the
 // component goes through `wait`: bounded by its own deadline where it has one
 // and by the lifetime where it has none, so ending the lifetime ends them all
 // at once and clears their timers. `begin` starts I/O only while the lifetime
-// lasts and returns it as it is, for the caller to wait on. Each side effect goes
-// through an owner that does nothing once `live()` is false, so no step of the
-// component checks for itself.
-export function createLifetime(timers: Timers) {
+// lasts and returns it as it is, for the caller to wait on. A rejection that
+// arrives after its wait ended goes to the wait's owner, `late` unless the
+// caller names another; each owner decides what a stopped component still
+// reports.
+export function createLifetime(timers: Timers, late: (error: unknown) => void) {
   const controller = new AbortController();
   const live = () => !controller.signal.aborted;
-  const wait = <T>(work: Promise<T>, milliseconds = Infinity) =>
-    bounded(work, milliseconds, timers, controller.signal);
+  const wait = <T>(work: Promise<T>, milliseconds = Infinity, owner = late) =>
+    bounded(work, milliseconds, timers, owner, controller.signal);
   return {
     signal: controller.signal,
     live,
@@ -111,12 +133,13 @@ export function createLifetime(timers: Timers) {
   };
 }
 
-// A pause of `milliseconds`, which `stop` ends early.
+// A pause of `milliseconds`, which `stop` ends early with `Stopped`.
 export const pause = (milliseconds: number, timers: Timers, stop?: AbortSignal) =>
-  bounded(new Promise<never>(() => {}), milliseconds, timers, stop).catch((error: unknown) => {
-    if (!(error instanceof DeadlineExceeded)) throw error;
+  new Promise<void>((resolve, reject) => {
+    limit(milliseconds, timers, stop, resolve, () => reject(new Stopped()));
   });
 
 // A pre-send read: at most INSPECT_TIMEOUT_MS, and never past `deadline`.
-export const readWithin = <T>(work: Promise<T>, deadline: number, now: number, timers: Timers, stop?: AbortSignal) =>
-  bounded(work, Math.min(INSPECT_TIMEOUT_MS, deadline - now), timers, stop);
+export const readWithin = <T>(work: Promise<T>, deadline: number, now: number, timers: Timers,
+  late: (error: unknown) => void, stop?: AbortSignal) =>
+  bounded(work, Math.min(INSPECT_TIMEOUT_MS, deadline - now), timers, late, stop);

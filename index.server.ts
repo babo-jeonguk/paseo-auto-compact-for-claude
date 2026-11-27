@@ -152,7 +152,7 @@ export default function contribute(server: PluginServerContext, options: { files
     // later). Closing first stops new writes; draining last lets a write
     // already issued land before the next instance starts, while a publication
     // that was never issued never happens at all.
-    writes.close();
+    writes.close(reporter.teardown);
     reporter.dispose();
     clearInterval(timer);
     scheduler.stop();
