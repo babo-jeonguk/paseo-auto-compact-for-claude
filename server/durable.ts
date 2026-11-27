@@ -7,7 +7,9 @@ import { createGroup } from "./group";
 export type DurableFiles = Pick<typeof fs, "writeFile" | "rename" | "rm">;
 export type DurableWrites = {
   run<T>(work: () => Promise<T>): Promise<T>;
-  replace(path: string, contents: string): Promise<void>;
+  // `published` runs as soon as the new contents are in place, before the
+  // temporary file is removed: a replacement that then fails has still landed.
+  replace(path: string, contents: string, published?: () => void): Promise<void>;
   // Closes the writes, and hands every failure of a write still in flight to
   // `teardown` as it settles (its caller still gets it too).
   close(teardown: (error: unknown) => void): void;
@@ -39,7 +41,7 @@ export function createDurableWrites(files: DurableFiles = fs): DurableWrites {
       throw error;
     }
   };
-  const replace = (path: string, contents: string) => run(async () => {
+  const replace = (path: string, contents: string, published?: () => void) => run(async () => {
     const temporary = `${path}.${randomUUID()}.tmp`;
     let publication: { error: unknown } | null = null;
     try {
@@ -48,6 +50,7 @@ export function createDurableWrites(files: DurableFiles = fs): DurableWrites {
       // unpublished, and the file keeps what the last landed write left.
       if (teardown) throw new Stopped();
       await files.rename(temporary, path);
+      published?.();
     } catch (error) {
       publication = { error };
     }
