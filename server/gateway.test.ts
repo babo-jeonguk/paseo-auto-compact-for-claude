@@ -814,6 +814,7 @@ test("a retirement or subscription release that fails after the cleanup wait sti
   failRetirement(retirement);
   failRelease(release);
   await drained();
+  assert.equal(host.cleanups.length, 2, "each cleanup failure reaches its owner once");
   assert.deepEqual(new Set(host.cleanups), new Set([retirement, release]));
   assert.deepEqual(host.faults, [], "a cleanup failure never explains the attempt");
 });

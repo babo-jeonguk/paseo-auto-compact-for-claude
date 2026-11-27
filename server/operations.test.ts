@@ -1012,6 +1012,34 @@ test("a cleanup failure is reported while its run is still going", async () => {
   worker.stop();
 });
 
+test("a failure the work meets while the expiry is saved is the cause, whatever an earlier run carried", async () => {
+  const f = fixture(), worker = f.make();
+  const earlier = new Error("EIO: settings");
+  f.hook("a", async () => { throw earlier; });
+  await worker.reconcile();
+  assert.equal(f.operation.state, "requested", "the earlier run's fault is retried");
+  let execution: ExecutionContext | undefined;
+  f.hook("a", async current => {
+    execution = current;
+    // The wait ended at the send deadline, so this run expires the request.
+    f.advance(200_000);
+    throw new DeadlineExceeded();
+  });
+  // The retry is due; its claim, its classification, then the expiry's terminal write.
+  f.advance(2_000);
+  const expiring = f.holdNextUpdate(2, true);
+  const run = worker.reconcile();
+  await expiring.reached;
+  const late = new Error("EACCES: request.json");
+  assert.ok(execution, "the run handed the gateway its execution");
+  execution.fault(late);
+  expiring.release();
+  await run;
+  assert.equal(f.operation.state, "expired");
+  assert.deepEqual(f.errors, [late], "this run's own failure ends the request, the same as during classification");
+  worker.stop();
+});
+
 test("a group of failures counts as its separate failures: one is the cause, the others are reported at once", async () => {
   const f = fixture(), worker = f.make();
   const publication = new Error("EACCES: request.json"), removal = new Error("EPERM: request.json.tmp");
