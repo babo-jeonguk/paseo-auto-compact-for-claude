@@ -75,9 +75,13 @@ function fixture(options: { agents?: string[] } = {}) {
     hold.reached();
     await hold.release;
   };
+  // The next transaction, or the one `skip` transactions later, fails with `error`.
+  let failing: { skip: number; error: Error } | null = null;
   const update = <T>(change: (state: State) => T): Promise<T> => {
     const result = queue.run(async () => {
       await holding(true);
+      const fail = failing;
+      if (fail && fail.skip-- === 0) { failing = null; throw fail.error; }
       const next = structuredClone(state);
       const value = change(next);
       if (writesFail && next.operations[0].state === "succeeded") throw new Error("disk full");
@@ -135,6 +139,8 @@ function fixture(options: { agents?: string[] } = {}) {
     },
     // Holds the next state read before it reads.
     holdRead(): Held { readHold = gate(); return readHold; },
+    // Fails the next transaction, or the one `skip` transactions later.
+    failUpdate(error: Error, skip = 0) { failing = { skip, error }; },
     // Calls `hook` with each transaction's result as the worker gets it.
     onUpdate(hook: ((result: Promise<unknown>) => void) | null) { updated = hook; },
     advance(ms: number) { time += ms; },
@@ -289,7 +295,9 @@ function later(hold: () => Held) {
   return { arm() { held = hold(); void held.reached.then(arrive); }, held: { reached, release: () => held?.release() } };
 }
 // Each await of a run, held: what the worker reaches while the test holds it.
-const stopPoints: Record<string, (f: Fixture) => { worker: ReturnType<Fixture["make"]>; held: Held }> = {
+// `met` is a fault the run met before the stop: work already issued, so the
+// stop does not make it expected, and it is reported once.
+const stopPoints: Record<string, (f: Fixture) => { worker: ReturnType<Fixture["make"]>; held: Held; met?: Error }> = {
   "the scan of pending work": f => ({ worker: f.make(), held: f.holdRead() }),
   "the claim, queued behind another transaction": f => ({ worker: f.make(), held: f.holdNextUpdate(0, true) }),
   "the claim": f => ({ worker: f.make(), held: f.holdNextUpdate() }),
@@ -369,26 +377,28 @@ const stopPoints: Record<string, (f: Fixture) => { worker: ReturnType<Fixture["m
   },
   "a fault's retry write": f => {
     const write = later(() => f.holdNextUpdate());
-    f.hook("a", async () => { write.arm(); throw new Error("disconnected"); });
-    return { worker: f.make(), held: write.held };
+    const met = new Error("disconnected");
+    f.hook("a", async () => { write.arm(); throw met; });
+    return { worker: f.make(), held: write.held, met };
   },
   "the expiry's write after a fault": f => {
     // The classification finds the send deadline passed; the expiry is the transaction after it.
     const write = later(() => f.holdNextUpdate(1));
-    f.hook("a", async () => { f.advance(180_000); write.arm(); throw new Error("disconnected"); });
-    return { worker: f.make(), held: write.held };
+    const met = new Error("disconnected");
+    f.hook("a", async () => { f.advance(180_000); write.arm(); throw met; });
+    return { worker: f.make(), held: write.held, met };
   },
 };
 
 // One test each, so a run that outlives its stop fails at the runner's bound
 // on its own.
 for (const [at, stopAt] of Object.entries(stopPoints)) {
-  test(`a worker stopped at ${at} ends the run at once, and writes, sends, releases, arms and reports nothing`, async (t) => {
+  test(`a worker stopped at ${at} ends the run at once, writes, sends, releases and arms nothing, and reports only a fault met before`, async (t) => {
     const scope = cleanupScope(t);
     const f = fixture();
     const drained = drainer();
     f.gateway.release ??= async operation => { f.record(`${operation.id}:released`); };
-    const { worker, held } = stopAt(f);
+    const { worker, held, met } = stopAt(f);
     scope.defer(() => worker.stop());
     const run = worker.reconcile();
     await held.reached;
@@ -405,7 +415,8 @@ for (const [at, stopAt] of Object.entries(stopPoints)) {
     await drained();
     assert.equal(JSON.stringify(f.snapshot), state, `${at}: nothing is written`);
     assert.deepEqual(f.events.slice(events), [], `${at}: nothing is sent or released`);
-    assert.deepEqual(defects(f.errors.slice(errors)), [], `${at}: nothing but the stop is reported`);
+    assert.deepEqual(defects(f.errors.slice(errors)), met ? [String(met)] : [],
+      `${at}: besides the stop, only a fault the run met before it is reported, once`);
     assert.equal(f.timers.pending, 0, `${at}: no wait or wake-up is armed`);
   });
 }
@@ -427,7 +438,7 @@ test("a worker stopped as its claim lands starts no host or settings read", asyn
   await worker.idle();
   assert.equal(f.operation.state, "dispatching", "the claim landed");
   assert.deepEqual(reads, [], "no read started after the stop");
-  assert.deepEqual([f.sends, defects(f.errors).length, f.timers.pending], [0, 0, 0]);
+  assert.deepEqual([f.sends, defects(f.errors), f.timers.pending], [0, [], 0]);
 });
 
 test("a gateway fault before the dispatch marker is retried; nothing is sent until it passes", async () => {
@@ -913,6 +924,20 @@ test("a stop that interrupts a run's expiry still reports the fault its work met
   expiring.release();
   await run;
   assert.deepEqual(defects(f.errors), [String(late)], "no later expiry will report it, so the run does");
+});
+
+test("the fault that ends a request is still reported when the expiry's first save fails", async () => {
+  const f = fixture(), worker = f.make();
+  const met = new Error("EACCES: request.json"), disk = new Error("EIO: state file");
+  f.hook("a", async () => { f.advance(200_000); throw met; });
+  // The claim, the classification, then the expiry's terminal write, which fails once.
+  f.failUpdate(disk, 2);
+  await worker.reconcile();
+  assert.deepEqual(f.errors, [disk], "the failed save is reported");
+  await worker.reconcile();
+  assert.equal(f.operation.state, "expired");
+  assert.deepEqual(f.errors, [disk, met], "the expiry written again reports the fault that ended the request");
+  worker.stop();
 });
 
 test("a fault an earlier run's work meets after that run ended is reported at once, even while a retry runs", async () => {

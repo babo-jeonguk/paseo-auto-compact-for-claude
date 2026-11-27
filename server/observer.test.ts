@@ -886,6 +886,24 @@ test('a request this instance issued stays its own after its retirement and a ne
   assert.equal(request.preparation, issued.preparation);
 });
 
+test('a preparation whose rename failed has nothing to retire, so its retirement reads nothing', async (t) => {
+  const failure = new Error('EIO: rename');
+  let failNext = false;
+  const files: DurableFiles = { writeFile, rm,
+    rename: async (from, to) => {
+      if (failNext) { failNext = false; throw failure; }
+      return rename(from, to);
+    } };
+  const f = await fixture(cleanupScope(t), files);
+  const path = join(f.directory, 'request.json');
+  await writeFile(path, '{ torn');
+  failNext = true;
+  const failed = f.observer.prepare(f.agent, false, 1_030_000, 'failed');
+  assert.equal(await failed.ready.then(() => null, (error: unknown) => error), failure);
+  await failed.retire(false);
+  assert.equal(await readFile(path, 'utf8'), '{ torn', 'the request never landed, so the file is not read or retired');
+});
+
 test('a preparation that published before its temporary file failed to go is still retired, and a newer one is left alone', async (t) => {
   const cleanup = new Error('EACCES: rm');
   let failNext = false;
