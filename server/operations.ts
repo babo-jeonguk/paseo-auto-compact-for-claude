@@ -7,6 +7,7 @@ import type { Settings } from "../shared/settings";
 import { createLifetime, DeadlineExceeded, deadlineOf, INSPECT_TIMEOUT_MS, OBSERVATION_MS, readWithin, Stopped, systemTimers,
   type Timers } from "./deadline";
 import { automaticBlock } from "./policy";
+import { causesOf } from "./report";
 
 export function inputFingerprint(agentId: string, revision: string, target?: CompactTarget) {
   // Preserve omitted legacy target as part of caller intent. Never re-fingerprint
@@ -139,15 +140,17 @@ export function createOperationWorker(options: {
   // A deadline or stop that ended a wait, as opposed to a failure the work met.
   const bound = (fault: unknown) => fault instanceof DeadlineExceeded || fault instanceof Stopped;
   // The cause each request carries toward its expiry: the fault its last run
-  // ended with. The next run's cause replaces it, and it is reported once,
-  // when the request expires or when this worker stops first and leaves the
-  // request to the next instance. Kept across a failed save.
+  // ended with. The next run's cause replaces it, unless that is only a
+  // deadline or stop and the carried one is a failure the work met, which then
+  // explains the request better. It is reported once, when the request expires
+  // or when this worker stops first and leaves the request to the next
+  // instance. Kept across a failed save.
   const causes = new Map<string, unknown>();
   // From its classification on, a run's cause is its request's. A stopped
   // worker carries nothing to a later expiry, so it reports it at once.
   const handOver = (id: string, cause: unknown) => {
-    if (live()) causes.set(id, cause);
-    else onError(cause);
+    if (!live()) onError(cause);
+    else if (!bound(cause) || !causes.has(id) || bound(causes.get(id))) causes.set(id, cause);
   };
   // A failure the work met takes the place of a carried deadline or stop; any
   // other fault can no longer become the cause, and is reported at once.
@@ -231,11 +234,14 @@ export function createOperationWorker(options: {
     let ended = false;
     let handed: string | null = null;
     const joined: unknown[] = [];
+    // A group of failures counts as its separate failures.
     const late = (error: unknown) => {
-      if (error instanceof Refusal) return;
-      if (ended) onError(error);
-      else if (handed !== null) carry(handed, error);
-      else joined.push(error);
+      for (const failure of causesOf(error)) {
+        if (failure instanceof Refusal) continue;
+        if (ended) onError(failure);
+        else if (handed !== null) carry(handed, failure);
+        else joined.push(failure);
+      }
     };
     try {
       if (!outcomes.has(candidate.id) && now() < (candidate.nextAttemptAt ?? 0) && now() < deadlineOf(candidate)) return;
@@ -338,7 +344,7 @@ export function createOperationWorker(options: {
       // now, as is the cause of a run that does not hand it to its request:
       // dropping either would hide a defect.
       const settle = () => {
-        const met = [...(error instanceof Refusal ? [] : [error]), ...joined.splice(0)];
+        const met = [...causesOf(error).filter(failure => !(failure instanceof Refusal)), ...joined.splice(0)];
         const at = Math.max(0, met.findIndex(fault => !bound(fault)));
         met.forEach((fault, index) => { if (index !== at && !bound(fault)) onError(fault); });
         return met.length ? { cause: met[at] } : null;

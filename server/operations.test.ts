@@ -1033,8 +1033,8 @@ test("a group of failures counts as its separate failures: one is the cause, the
 
 test("a cleanup failure of a retried run is reported once, whatever a later retry carries", async () => {
   const f = fixture(), worker = f.make();
-  const cleanup = new Error("EACCES: retiring the request"), deadline = new DeadlineExceeded();
-  f.hook("a", async execution => { execution.cleanupFault(cleanup); throw new Error("EBUSY"); });
+  const cleanup = new Error("EACCES: retiring the request"), deadline = new DeadlineExceeded(), busy = new Error("EBUSY");
+  f.hook("a", async execution => { execution.cleanupFault(cleanup); throw busy; });
   await worker.reconcile();
   f.hook("a", async () => { throw deadline; });
   f.advance(2_000);
@@ -1043,7 +1043,7 @@ test("a cleanup failure of a retried run is reported once, whatever a later retr
   worker.stop();
   assert.equal(f.errors.length, 2);
   assert.equal(f.errors[0], cleanup, "the cleanup failure was reported when it happened");
-  assert.equal(f.errors[1], deadline, "the stop reports the cause the request carries; the reporter keeps a deadline quiet");
+  assert.equal(f.errors[1], busy, "the stop reports the cause the request carries, which a later deadline did not replace");
 });
 
 test("a read already issued when the worker stops still has its failure reported", async () => {

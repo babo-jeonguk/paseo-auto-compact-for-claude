@@ -7,8 +7,9 @@ const hostUnavailable = (error: unknown) => error instanceof DeadlineExceeded ||
   (error instanceof Error && error.message === "Daemon client closed");
 
 // Every cause of a group, recursively; anything else is its own single cause.
-const causes = (error: unknown): unknown[] =>
-  error instanceof AggregateError ? error.errors.flatMap(causes) : [error];
+// The one rule for taking a group apart, for the reporter and the worker.
+export const causesOf = (error: unknown): unknown[] =>
+  error instanceof AggregateError ? error.errors.flatMap(causesOf) : [error];
 
 // How long the host may stay unavailable before it is reported.
 export const REPORT_GRACE_MS = 30_000;
@@ -32,7 +33,7 @@ export function createReporter(log: (message: string) => void, graceMs = REPORT_
   // A failing step of cleanup itself, which can settle after dispose. The host
   // having closed its API then is expected; anything else is a defect.
   const teardown = (error: unknown) => {
-    for (const cause of causes(error)) {
+    for (const cause of causesOf(error)) {
       if (!defect(cause) || logged.has(cause)) continue;
       logged.add(cause);
       log(String(cause));
@@ -42,7 +43,7 @@ export function createReporter(log: (message: string) => void, graceMs = REPORT_
     report(error: unknown) {
       // Work issued before the stop can still fail after it.
       if (disposed) return teardown(error);
-      for (const cause of causes(error)) {
+      for (const cause of causesOf(error)) {
         if (cause instanceof Stopped) continue;
         if (!hostUnavailable(cause)) { log(String(cause)); continue; }
         const timer = timers.setTimeout(() => { waiting.delete(timer); log(String(cause)); }, graceMs);
