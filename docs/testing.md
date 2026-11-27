@@ -14,11 +14,11 @@ npm run test:update
 
 In Windows PowerShell, `npm.cmd run test:update` also works when execution policy blocks `npm.ps1`. Run with **Windows Node** to test Windows; WSL Node tests Linux. The runner records `process.platform`, architecture, OS release, Node/Claude/Paseo versions and product source hashes.
 
-The update command runs observer consistency, type checks, the fast regression suite and lint. After committing, run `npm run test:release` for those checks and the full native matrix on an isolated snapshot with Paseo **0.16.2** and **0.17.1**. Install the pinned native tools once with `npm ci --prefix tests/simulation --ignore-scripts`. This needs network access and can take several minutes; later runs reuse them. Nothing is installed globally and no Claude login is required.
+The update command runs observer consistency, type checks, the fast regression suite and lint. After committing, run `npm run test:release` for those checks and the full native matrix on an isolated snapshot with Paseo **0.16.2**, **0.17.6** and **0.18.0**. Install the pinned native tools once with `npm ci --prefix tests/simulation --ignore-scripts`. This needs network access and can take several minutes; later runs reuse them. Nothing is installed globally and no Claude login is required.
 
 ## What is real and what is simulated
 
-Each simulation starts stock **Paseo 0.16.2 or 0.17.1**, native **Claude Code 2.1.306**, and this checkout's actual plugin. The client handshake uses the selected toolchain's real version. Only model responses come from a synthetic loopback HTTP server. Native transcript creation, Mod loading, public RPC, settings persistence, process restart and automatic timers run normally. The fixture reports a 500k context to a 1M model so the real 400k threshold can be exercised without sending a huge prompt.
+Each simulation starts the selected stock **Paseo** version, native **Claude Code 2.1.306**, and this checkout's actual plugin. The client handshake uses the selected toolchain's real version. Only model responses come from a synthetic loopback HTTP server. Native transcript creation, Mod loading, public RPC, settings persistence, process restart and automatic timers run normally. The fixture reports a 500k context to a 1M model so the real 400k threshold can be exercised without sending a huge prompt.
 
 Each run uses temporary HOME/USERPROFILE, Claude settings, Paseo configuration, agents and ports. The native process receives a synthetic API key and a local model URL. Existing Paseo and Claude sessions/settings are not used. Successful runs stop their process trees and delete the temporary home. Failed runs retain the temporary path in `report.json` for diagnosis.
 
@@ -26,7 +26,7 @@ The automatic timer test first verifies real **55- and 50-minute reservation val
 
 ## Restart and browser reconnect checks
 
-The development SDK is the 0.16.2 minimum, and the SDK and native CI matrices test the versions listed under [CI](#ci). The focused restart/reconnect suite uses the 0.16.2 alias installed by the native tools above by default (`--paseo 0.17.0-beta.1` or `0.17.1` selects that version), or a separate CLI directory:
+The development SDK is the 0.16.2 minimum, and the SDK and native CI matrices test the versions listed under [CI](#ci). The focused restart/reconnect suite uses the 0.16.2 alias installed by the native tools above by default (`--paseo 0.18.0` selects that version), or a separate CLI directory:
 
 ```sh
 npm install --prefix /tmp/auto-compact-paseo-0162 --ignore-scripts --no-audit --no-fund @getpaseo/cli@0.16.2
@@ -100,11 +100,11 @@ node --no-maglev tests/simulation/browser.mjs --paseo 0.16.2 \
   --report-dir /absolute/path/to/results
 ```
 
-Repeat with `--paseo 0.17.1`. Each run writes a browser report and completed-state screenshot under `browser-<version>/`. An unavailable Windows runtime or browser is an untested environment, not a passing result; WSL execution reports Linux.
+Repeat with `--paseo 0.17.6` or `--paseo 0.18.0`. Each run writes a browser report and completed-state screenshot under `browser-<version>/`. An unavailable Windows runtime or browser is an untested environment, not a passing result; WSL execution reports Linux.
 
 ## Session reopening and idle cleanup
 
-The focused lifecycle harness covers Paseo's deferred session reopening and idle-runtime cleanup separately from the default matrix. It runs Paseo 0.16.2 by default; `--paseo 0.17.1` selects that version:
+The focused lifecycle harness covers Paseo's deferred session reopening and idle-runtime cleanup separately from the default matrix. It runs Paseo 0.16.2 by default; `--paseo 0.18.0` selects that version:
 
 ```sh
 node --no-maglev tests/simulation/lifecycle.mjs reload
@@ -132,15 +132,16 @@ Run only the native simulation:
 npm run test:simulation
 npm run test:simulation:0.16.2 -- --expect-platform linux
 npm run test:simulation:0.17 -- --expect-platform win32
+npm run test:simulation:0.18 -- --expect-platform linux
 ```
 
-The first command runs every version in the matrix: 0.16.2 and 0.17.1. 0.17.0-beta.1 stays pinned and runs through its own script. The version-specific commands accept `--claude /absolute/native/claude`, `--tools /npm/prefix`, or `--report-dir /results`. A custom tools prefix may contain the matching ordinary `@getpaseo/cli` package or the versioned aliases used by this repository. Overrides still use an isolated home and the local model server. `npm run test:simulation:0.16.2 -- --help` lists the options.
+The first command runs the stable pins in `tests/simulation/paseo-versions.mjs`: 0.16.2, 0.17.6 and 0.18.0. 0.17.0-beta.1 stays pinned and runs through its own script. The version-specific commands accept `--claude /absolute/native/claude`, `--tools /npm/prefix`, or `--report-dir /results`. A custom tools prefix may contain the matching ordinary `@getpaseo/cli` package or the versioned aliases used by this repository. Overrides still use an isolated home and the local model server. `npm run test:simulation:0.16.2 -- --help` lists the options.
 
-To change a tested Claude/Paseo version, edit its exact alias in `tests/simulation/package.json` and its entry in `tests/simulation/paseo-versions.mjs`, regenerate the lockfile with `npm install --prefix tests/simulation --ignore-scripts`, and run the full suite on both OSes. Commit both package and lockfile. Keep the declared minimum, 0.16.2, in the matrix. Do not infer native compatibility from the unit suite alone.
+To change a tested Claude/Paseo version, edit its exact alias in `tests/simulation/package.json` and its entry in `tests/simulation/paseo-versions.mjs`, update both CI version lists in `.github/workflows/check.yml`, regenerate the lockfile with `npm install --prefix tests/simulation --ignore-scripts`, and run the full suite on both OSes. Commit both package and lockfile. Keep the declared minimum, 0.16.2, in the matrix. Do not infer native compatibility from the unit suite alone.
 
 ## CI
 
-[Check workflow](https://github.com/babo-jeonguk/paseo-auto-compact-for-claude/blob/main/.github/workflows/check.yml) has native simulation jobs for Paseo 0.16.2 and 0.17.1 on **ubuntu-latest** and **windows-latest**, in addition to fast SDK checks for the same versions on Linux, macOS and Windows. Pull requests, main-branch pushes and manual workflow dispatch run them and upload their reports/logs even when a test fails. No API secret is needed. [View workflow runs](https://github.com/babo-jeonguk/paseo-auto-compact-for-claude/actions/workflows/check.yml). Native macOS execution is not covered by the fast macOS checks.
+[Check workflow](https://github.com/babo-jeonguk/paseo-auto-compact-for-claude/blob/main/.github/workflows/check.yml) has native simulation jobs for Paseo 0.16.2, 0.17.6 and 0.18.0 on **ubuntu-latest** and **windows-latest**, in addition to fast SDK checks for the same versions on Linux, macOS and Windows. Pull requests, main-branch pushes and manual workflow dispatch run them and upload their reports/logs even when a test fails. No API secret is needed. [View workflow runs](https://github.com/babo-jeonguk/paseo-auto-compact-for-claude/actions/workflows/check.yml). Native macOS execution is not covered by the fast macOS checks.
 
 ## Fast feedback and isolated runs
 

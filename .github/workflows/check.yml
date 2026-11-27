@@ -15,7 +15,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        paseo-sdk: [0.16.2, 0.17.1]
+        paseo-sdk: [0.16.2, 0.17.6, 0.18.0]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
@@ -33,7 +33,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        paseo: [0.16.2, 0.17.1]
+        paseo: [0.16.2, 0.17.6, 0.18.0]
         os: [ubuntu-latest, windows-latest]
         include:
           - os: ubuntu-latest

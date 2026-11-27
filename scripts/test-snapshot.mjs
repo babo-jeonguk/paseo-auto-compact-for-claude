@@ -9,8 +9,12 @@ import { fileURLToPath } from 'node:url';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const git = async (...args) => (await promisify(execFile)('git', ['-C', root, ...args], { windowsHide: true })).stdout.trim();
 const options = new Map([['--suite', 'check'], ['--ref', 'HEAD'], ['--paseo', 'all']]);
+const pkg = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
+const versions = Object.entries(pkg.scripts)
+  .filter(([name]) => name.startsWith('test:simulation:'))
+  .flatMap(([, command]) => command.match(/ --paseo (\S+)$/)?.[1] ?? []);
 if (process.argv.includes('--help')) {
-  console.log('npm run test:snapshot -- [--suite check|simulation|release] [--ref HEAD|<commit>] [--paseo all|0.16.2|0.17.0-beta.1|0.17.1]');
+  console.log(`npm run test:snapshot -- [--suite check|simulation|release] [--ref HEAD|<commit>] [--paseo ${['all', ...versions].join('|')}]`);
   process.exit(0);
 }
 for (let i = 2; i < process.argv.length; i += 2) {
@@ -19,10 +23,7 @@ for (let i = 2; i < process.argv.length; i += 2) {
 }
 const suite = options.get('--suite'), paseo = options.get('--paseo');
 assert(['check', 'simulation', 'release'].includes(suite), `Unknown suite: ${suite}`);
-const pkg = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
-const versionScript = Object.keys(pkg.scripts).find(name => name.startsWith('test:simulation:') &&
-  pkg.scripts[name].endsWith(`--paseo ${paseo}`));
-assert(paseo === 'all' || versionScript, `Unsupported Paseo version: ${paseo}`);
+assert(paseo === 'all' || versions.includes(paseo), `Unsupported Paseo version: ${paseo}`);
 assert(process.env.npm_execpath, 'Run through npm run test:snapshot');
 assert.equal(await git('status', '--porcelain', '--untracked-files=normal'), '', 'Commit changes first: snapshot tests run committed files only. Use npm run check while editing.');
 const revision = await git('rev-parse', '--verify', `${options.get('--ref')}^{commit}`);

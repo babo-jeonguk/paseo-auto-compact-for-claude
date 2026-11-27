@@ -30,7 +30,8 @@
     "test:release": "node scripts/test-snapshot.mjs --suite release",
     "test:simulation:0.16.2": "node --no-maglev tests/simulation/run.mjs --paseo 0.16.2",
     "test:simulation:0.17-beta": "node --no-maglev tests/simulation/run.mjs --paseo 0.17.0-beta.1",
-    "test:simulation:0.17": "node --no-maglev tests/simulation/run.mjs --paseo 0.17.1"
+    "test:simulation:0.17": "node --no-maglev tests/simulation/run.mjs --paseo 0.17.6",
+    "test:simulation:0.18": "node --no-maglev tests/simulation/run.mjs --paseo 0.18.0"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
