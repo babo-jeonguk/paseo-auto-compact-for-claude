@@ -2852,6 +2852,23 @@ test("a settings list that outlasts its bound reports an observation's failure a
   assert.deepEqual(f.errors, [observation], "only the observation's own failure is reported, not the list's");
 });
 
+test("an incomplete settings list fails at once, without waiting for a held state read", async () => {
+  const f = fixture();
+  const s = f.make();
+  await s.ready;
+  const observation = new Error("EIO: ledger");
+  f.gateway.list = async observe => { observe(Promise.reject(observation)); };
+  const read = f.holdRead();
+  let settled = false;
+  const outcome = failureOf(s.list()).then(error => { settled = true; return error; });
+  await read.reached;
+  await f.drained();
+  assert.equal(settled, true, "the list fails as soon as its own listing is incomplete");
+  assert.ok(await outcome instanceof Error, "so the screen offers Retry");
+  assert.deepEqual(f.errors, [observation]);
+  read.release();
+});
+
 test("a host read already issued when the scheduler stops still has its failure reported", async () => {
   const f = fixture();
   const s = f.make();

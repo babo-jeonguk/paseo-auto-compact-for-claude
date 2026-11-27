@@ -860,6 +860,32 @@ test('a preparation whose rename failed leaves the earlier request, which its re
   assert.equal(request.preparation, earlier.preparation);
 });
 
+test('a request this instance issued stays its own after its retirement and a newer preparation both failed', async (t) => {
+  const failure = new Error('EIO: rename');
+  let failing = 0;
+  const files: DurableFiles = { writeFile, rm,
+    rename: async (from, to) => {
+      if (failing > 0) { failing--; throw failure; }
+      return rename(from, to);
+    } };
+  const f = await fixture(cleanupScope(t), files);
+  const first = f.observer.prepare(f.agent, false, 1_030_000, 'first');
+  const issued = await first.ready;
+  // Its retirement fails, and so does the next preparation's publication.
+  failing = 2;
+  assert.equal(await first.retire(true).then(() => null, (error: unknown) => error), failure);
+  const second = f.observer.prepare(f.agent, false, 1_030_000, 'second');
+  assert.equal(await second.ready.then(() => null, (error: unknown) => error), failure);
+  await second.retire(false);
+  const reported: unknown[] = [];
+  await f.observer.recoverPrepared(() => assert.fail('a request this instance issued is not a leftover'),
+    error => { reported.push(error); });
+  assert.deepEqual(reported, []);
+  const request = await requestFile(f.directory);
+  assert.equal(request.status, 'prepared');
+  assert.equal(request.preparation, issued.preparation);
+});
+
 test('a preparation that published before its temporary file failed to go is still retired, and a newer one is left alone', async (t) => {
   const cleanup = new Error('EACCES: rm');
   let failNext = false;

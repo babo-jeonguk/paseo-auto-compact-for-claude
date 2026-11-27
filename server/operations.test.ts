@@ -875,6 +875,57 @@ test("a fault an attempt's work hands over while the run classifies its own faul
   worker.stop();
 });
 
+test("a fault an attempt's work hands over while its expiry is saved still takes the deadline's place", async () => {
+  const f = fixture(), worker = f.make();
+  let execution: ExecutionContext | undefined;
+  f.hook("a", async current => {
+    execution = current;
+    // The wait ended at the send deadline, so the request expires.
+    f.advance(200_000);
+    throw new DeadlineExceeded();
+  });
+  // The claim, the classification, then the expiry's terminal write.
+  const expiring = f.holdNextUpdate(2, true);
+  const run = worker.reconcile();
+  await expiring.reached;
+  const late = new Error("EACCES: request.json");
+  assert.ok(execution, "the run handed the gateway its execution");
+  execution.fault(late);
+  expiring.release();
+  await run;
+  assert.equal(f.operation.state, "expired");
+  assert.deepEqual(f.errors, [late], "the work's own fault ends the request, reported once");
+  worker.stop();
+});
+
+test("a stop that interrupts a run's expiry still reports the fault its work met", async () => {
+  const f = fixture(), worker = f.make();
+  const late = new Error("EACCES: request.json");
+  f.hook("a", async execution => {
+    execution.fault(late);
+    f.advance(200_000);
+    throw new DeadlineExceeded();
+  });
+  const expiring = f.holdNextUpdate(2, true);
+  const run = worker.reconcile();
+  await expiring.reached;
+  worker.stop();
+  expiring.release();
+  await run;
+  assert.deepEqual(defects(f.errors), [String(late)], "no later expiry will report it, so the run does");
+});
+
+test("stopping the worker reports the faults a request waiting for its retry carries", async () => {
+  const f = fixture(), worker = f.make();
+  const thrown = new Error("EBUSY"), beside = new Error("EIO: subscription release");
+  f.hook("a", async execution => { execution.fault(beside); throw thrown; });
+  await worker.reconcile();
+  assert.equal(f.operation.state, "requested", "the fault is retried");
+  assert.deepEqual(f.errors, []);
+  worker.stop();
+  assert.deepEqual(f.errors, [thrown, beside], "the next instance retries it without them, so they are reported now");
+});
+
 test("a fault an earlier run's work meets after that run ended is reported at once, even while a retry runs", async () => {
   const f = fixture(), worker = f.make();
   let earlier: ExecutionContext | undefined;
