@@ -140,17 +140,16 @@ export function createOperationWorker(options: {
   // A deadline or stop that ended a wait, as opposed to a failure the work met.
   const bound = (fault: unknown) => fault instanceof DeadlineExceeded || fault instanceof Stopped;
   // The cause each request carries toward its expiry: the fault its last run
-  // ended with. The next run's cause replaces it, unless that is only a
-  // deadline or stop and the carried one is a failure the work met, which then
-  // explains the request better. It is reported once, when the request expires
-  // or when this worker stops first and leaves the request to the next
+  // ended with. The next run's cause replaces it, since only the fault that
+  // finally ends a request is reported. It is reported once, when the request
+  // expires or when this worker stops first and leaves the request to the next
   // instance. Kept across a failed save.
   const causes = new Map<string, unknown>();
   // From its classification on, a run's cause is its request's. A stopped
   // worker carries nothing to a later expiry, so it reports it at once.
   const handOver = (id: string, cause: unknown) => {
-    if (!live()) onError(cause);
-    else if (!bound(cause) || !causes.has(id) || bound(causes.get(id))) causes.set(id, cause);
+    if (live()) causes.set(id, cause);
+    else onError(cause);
   };
   // A failure the work met takes the place of a carried deadline or stop; any
   // other fault can no longer become the cause, and is reported at once.

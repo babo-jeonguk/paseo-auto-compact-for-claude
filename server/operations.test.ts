@@ -1049,14 +1049,16 @@ test("a group of failures counts as its separate failures: one is the cause, the
   await worker.reconcile();
   assert.equal(f.operation.state, "requested", "the fault is retried");
   assert.deepEqual(f.errors, [removal], "the failure beside the cause is reported at once");
-  // A retry that meets only a deadline does not take the place of a failure the work met.
+  // The retry's own cause replaces it: only the fault that finally ends the request is reported.
   const deadline = new DeadlineExceeded();
   f.hook("a", async () => { throw deadline; });
   f.advance(2_000);
   await worker.reconcile();
   assert.equal(f.operation.state, "requested");
   worker.stop();
-  assert.deepEqual(f.errors, [removal, publication], "the stop reports the cause the request carries");
+  assert.equal(f.errors.length, 2);
+  assert.equal(f.errors[0], removal);
+  assert.equal(f.errors[1], deadline, "the stop reports the cause the request carries; the reporter keeps a deadline quiet");
 });
 
 test("a cleanup failure of a retried run is reported once, whatever a later retry carries", async () => {
@@ -1071,7 +1073,7 @@ test("a cleanup failure of a retried run is reported once, whatever a later retr
   worker.stop();
   assert.equal(f.errors.length, 2);
   assert.equal(f.errors[0], cleanup, "the cleanup failure was reported when it happened");
-  assert.equal(f.errors[1], busy, "the stop reports the cause the request carries, which a later deadline did not replace");
+  assert.equal(f.errors[1], deadline, "the stop reports the cause the request carries; the reporter keeps a deadline quiet");
 });
 
 test("a read already issued when the worker stops still has its failure reported", async () => {
