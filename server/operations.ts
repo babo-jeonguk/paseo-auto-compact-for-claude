@@ -127,8 +127,9 @@ export function createOperationWorker(options: {
   // retirement, because its durable writes have closed (the plugin's stop closes
   // them first); a request left prepared is retired by the next instance's
   // startup recovery, and until then the observer checks at most one /compact
-  // against it. A release that fails or outlasts its wait is not reported
-  // either: the operation has already ended (docs/runtime.md).
+  // against it. A release that fails while it is waited on is not reported,
+  // since the operation has already ended; one that fails after its wait ended
+  // goes to the error owner, as every late failure does.
   const release = async (operation: StoredOperation) => {
     if (live() && operation.evidence?.native && gateway.release)
       await wait(gateway.release(operation), INSPECT_TIMEOUT_MS).catch(() => {});
@@ -312,17 +313,18 @@ export function createOperationWorker(options: {
       // written during this run is not ours to expire, and is never resent.
       // A deadline or stop that ended a wait on the attempt's work is replaced
       // by the fault that work handed over: it explains why the attempt failed.
+      // Taken only once the run has decided what to do with its fault, so a
+      // fault handed over while it decides is not left behind: the diagnostic
+      // first, then the faults beside it.
       const bound = (fault: unknown) => fault instanceof DeadlineExceeded || fault instanceof Stopped;
-      const cause = bound(error) ? joined.findIndex(fault => !bound(fault)) : -1;
-      const diagnostic = cause < 0 ? error : joined[cause];
-      const beside = joined.filter((_fault, index) => index !== cause);
+      const take = () => {
+        const handed = joined.splice(0);
+        const cause = bound(error) ? handed.findIndex(fault => !bound(fault)) : -1;
+        return cause < 0 ? [error, ...handed] : [handed[cause], ...handed.filter((_fault, index) => index !== cause)];
+      };
       // The faults beside the diagnostic can no longer end the request, but
       // dropping them would hide a defect of work this run issued.
-      const report = () => {
-        joined.length = 0;
-        onError(diagnostic);
-        for (const fault of beside) onError(fault);
-      };
+      const report = () => { for (const fault of take()) onError(fault); };
       if (!claimed || outcomes.has(claimed.id)) return report();
       const id = claimed.id;
       try {
@@ -345,8 +347,7 @@ export function createOperationWorker(options: {
         if (next === "refused") return await finish(id, { status: "failed", detail: (error as Refusal).message }, late);
         // The faults of work being retried stay with its record: they are
         // reported if the request expires, and never again by this run.
-        faults.set(id, [diagnostic, ...beside]);
-        joined.length = 0;
+        faults.set(id, take());
         if (next === "expired") return await finish(id, "expired", late);
         // This operation wakes itself for its retry; other conversations keep running.
         armRetry(id, next);

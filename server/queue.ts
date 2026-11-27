@@ -2,6 +2,8 @@
 // whatever its outcome, and its caller gets its own work's outcome.
 export function createKeyedQueue<K>(): {
   run<T>(key: K, work: () => Promise<T>): Promise<T>;
+  // `release(after)` hands the slot on once `after` has also resolved. `after`
+  // must never reject, as an `idle` never does: the key's tail would reject.
   hold(key: K): { ready: Promise<void>; release(after?: Promise<void>): void };
   idle(key: K): Promise<void>;
 } {

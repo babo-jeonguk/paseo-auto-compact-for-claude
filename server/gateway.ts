@@ -181,7 +181,7 @@ export function createGateway(options: {
     let operation: Awaited<ReturnType<Observer['prepare']>['ready']> | undefined;
     let preparation: ReturnType<Observer['prepare']> | undefined;
     let turn: ReturnType<typeof turns.hold> | undefined;
-    let sent = false, armed = false, ownershipLost = false;
+    let sent = false, armed = false, ownershipLost = false, releasing = false;
     let boundary = false;
     // Lost live views so far. After one, the live command turn and boundary
     // prove nothing on their own; `pinned` holds what history read since the
@@ -238,7 +238,11 @@ export function createGateway(options: {
         if (event.item.type === "user_message" && event.item.clientMessageId === id) entry.turnId = event.turnId ?? null;
         if (commandBoundary(event.item, event.turnId, entry.turnId)) boundary = true;
       });
-      await read(subscription.ready);
+      // The Paseo client rejects readiness it never reached once the
+      // subscription is released, which only this attempt's cleanup does: a
+      // rejection then is that release's result, not a fault of the read.
+      await readWithin(subscription.ready, deadline, now(), timers,
+        error => { if (!releasing) execution.fault(error); }, stopping.signal);
       const current = readable(await read(gateway.refresh(agentId)));
       // Running out of time is a fault the worker retries until the send
       // deadline; before then, a worker that is no longer current has stopped.
@@ -270,7 +274,8 @@ export function createGateway(options: {
       sent = true;
       const send = ref.send("/compact", { messageId: id });
       // A rejection/timeout may still mean delivery. Inspect evidence until the
-      // original deadline; late send rejection is consumed by bounded().
+      // original deadline; a rejection after the send's own wait ended goes to
+      // the attempt's owner through bounded().
       await bounded(send, Math.min(options.dispatchTimeoutMs ?? SEND_TIMEOUT_MS, deadline - now()), timers, execution.fault,
         stopping.signal)
         .catch(() => {});
@@ -339,6 +344,7 @@ export function createGateway(options: {
           if (!(error instanceof DeadlineExceeded || error instanceof Stopped)) execution.fault(error);
         }
       };
+      releasing = true;
       await Promise.all([
         retirement && cleanup(retirement),
         subscription && cleanup(Promise.resolve(subscription.release())),

@@ -666,27 +666,29 @@ export function createScheduler(options: {
       return agent?.eligible ? view(agent, current, config) : null;
     },
     list: async () => {
-      const [state, config, agents] = await Promise.all([
+      const [state, config, listing] = await Promise.all([
         serialize(() => store.read()),
         settings(),
         wait(begin(async () => {
           const observed: Promise<Observation | null>[] = [];
           let incomplete = false;
           await gateway.list((observation) => {
-            // Every observation defect reaches the reporter, even when a later
-            // page fails or hangs. An incomplete list still rejects so the
-            // screen keeps its Retry.
+            // Every observation defect reaches the reporter as itself, even
+            // when a later page fails or hangs or the list outlasts its wait.
             observed.push(observation.catch((error: unknown) => {
               incomplete = true;
               onError(error);
               return null;
             }));
           });
-          const agents = await Promise.all(observed);
-          if (incomplete) throw new Error("Conversation list incomplete: an observation failed");
-          return agents.filter((agent): agent is Observation => agent !== null);
+          const agents = (await Promise.all(observed)).filter((agent): agent is Observation => agent !== null);
+          return { agents, incomplete };
         }), INSPECT_TIMEOUT_MS),
       ]);
+      // The list's own result, not a failure of its work: an incomplete list
+      // fails so the screen keeps its Retry, after its failures were reported.
+      if (listing.incomplete) throw new Error("Conversation list incomplete: an observation failed");
+      const { agents } = listing;
       return Promise.all(
         agents
           .filter(
