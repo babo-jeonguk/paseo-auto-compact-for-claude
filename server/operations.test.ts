@@ -994,6 +994,43 @@ test("a fault beside a retried run's own is reported at once, and the run's own 
   worker.stop();
 });
 
+test("a cleanup failure is reported while its run is still going", async () => {
+  const f = fixture(), worker = f.make();
+  const cleanup = new Error("EIO: subscription release"), held = gate();
+  f.hook("a", async execution => {
+    execution.cleanupFault(cleanup);
+    await held.pass();
+    await execution.checkpoint({ dispatchStartedAt: f.time });
+    return { status: "completed", detail: "matching evidence" };
+  });
+  const run = worker.reconcile();
+  await held.reached;
+  assert.deepEqual(f.errors, [cleanup], "it never explains the attempt, so nothing waits for the run to end");
+  held.release();
+  await run;
+  assert.deepEqual(f.errors, [cleanup]);
+  worker.stop();
+});
+
+test("a group of failures counts as its separate failures: one is the cause, the others are reported at once", async () => {
+  const f = fixture(), worker = f.make();
+  const publication = new Error("EACCES: request.json"), removal = new Error("EPERM: request.json.tmp");
+  f.hook("a", async () => {
+    throw new AggregateError([publication, removal], "Durable replacement failed and its temporary file could not be removed");
+  });
+  await worker.reconcile();
+  assert.equal(f.operation.state, "requested", "the fault is retried");
+  assert.deepEqual(f.errors, [removal], "the failure beside the cause is reported at once");
+  // A retry that meets only a deadline does not take the place of a failure the work met.
+  const deadline = new DeadlineExceeded();
+  f.hook("a", async () => { throw deadline; });
+  f.advance(2_000);
+  await worker.reconcile();
+  assert.equal(f.operation.state, "requested");
+  worker.stop();
+  assert.deepEqual(f.errors, [removal, publication], "the stop reports the cause the request carries");
+});
+
 test("a cleanup failure of a retried run is reported once, whatever a later retry carries", async () => {
   const f = fixture(), worker = f.make();
   const cleanup = new Error("EACCES: retiring the request"), deadline = new DeadlineExceeded();

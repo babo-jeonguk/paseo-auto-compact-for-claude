@@ -786,6 +786,38 @@ test("readiness a subscription loses because the attempt's cleanup released it i
   assert.deepEqual(host.faults, [], "the deadline that ended the wait is the attempt's fault");
 });
 
+test("a retirement or subscription release that fails after the cleanup wait still reaches the attempt's owner", async (t) => {
+  const scope = cleanupScope(t);
+  const drained = drainer();
+  const boundary = [{ type: "compaction", status: "completed", trigger: "manual" }];
+  const native = observer({ status: "completed", detail: "Native PostCompact" });
+  let failRetirement: ((error: Error) => void) | undefined, failRelease: ((error: Error) => void) | undefined;
+  native.prepare = (_agent, _cache, _expires, id = native.operation.id) =>
+    native.preparation(async () => ({ ...native.operation, id }),
+      () => new Promise<never>((_resolve, reject) => { failRetirement = reject; }));
+  const host = fixture(scope, boundary, undefined, false, boundary, { observer: native, timeoutMs: 1_000, cleanupTimeoutMs: 5 });
+  const subscribe = host.ref.timeline.subscribe;
+  host.ref.timeline.subscribe = listener => {
+    const result = subscribe(listener);
+    result.release = () => new Promise<never>((_resolve, reject) => { failRelease = reject; });
+    return result;
+  };
+  const attempt = host.gateway.automatic!((await host.gateway.refresh("a"))!);
+  // Both cleanup steps have started and their waits are armed once nothing else is left to run.
+  await host.clock.armed(5);
+  await drained();
+  assert.ok(failRetirement && failRelease, "both cleanup steps were asked for");
+  await host.clock.tick(5);
+  assert.equal((await attempt).status, "completed", "the cleanup wait ended; the attempt's outcome is kept");
+  assert.deepEqual(host.cleanups, [], "nothing has failed yet");
+  const retirement = new Error("EIO: retiring the request"), release = new Error("EIO: releasing the subscription");
+  failRetirement(retirement);
+  failRelease(release);
+  await drained();
+  assert.deepEqual(new Set(host.cleanups), new Set([retirement, release]));
+  assert.deepEqual(host.faults, [], "a cleanup failure never explains the attempt");
+});
+
 test("stopping the gateway also ends the wait on an attempt's cleanup", async (t) => {
   const scope = cleanupScope(t);
   for (const at of ["cleanup", "observation"] as const) {
