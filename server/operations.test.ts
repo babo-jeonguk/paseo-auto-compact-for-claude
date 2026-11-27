@@ -76,22 +76,23 @@ function fixture(options: { agents?: string[] } = {}) {
     await hold.release;
   };
   // The first transaction whose change makes the state match `when` is held
-  // before it is committed, or fails with `error` instead.
-  let committing: { when: (next: State) => boolean; held?: Gate; error?: Error } | null = null;
+  // before it is committed, or after when `after`, or fails with `error` instead.
+  let committing: { when: (next: State) => boolean; held?: Gate; after?: boolean; error?: Error } | null = null;
   const update = <T>(change: (state: State) => T): Promise<T> => {
     const result = queue.run(async () => {
       await holding(true);
       const next = structuredClone(state);
       const value = change(next);
-      const commit = committing;
-      if (commit?.when(next)) {
+      const commit = committing?.when(next) ? committing : null;
+      if (commit) {
         committing = null;
         if (commit.error) throw commit.error;
-        await commit.held?.pass();
+        if (!commit.after) await commit.held?.pass();
       }
       if (writesFail && next.operations[0].state === "succeeded") throw new Error("disk full");
       state = next;
       signal.changed();
+      if (commit?.after) await commit.held?.pass();
       await holding(false);
       return value;
     });
@@ -145,10 +146,10 @@ function fixture(options: { agents?: string[] } = {}) {
     // Holds the next state read before it reads.
     holdRead(): Held { readHold = gate(); return readHold; },
     // Holds the first transaction that would commit a state matching `when`,
-    // before it commits; `reached` resolves then.
-    holdCommit(when: (next: State) => boolean): Held {
+    // before it commits, or once it has when `after`; `reached` resolves then.
+    holdCommit(when: (next: State) => boolean, after = false): Held {
       const held = gate();
-      committing = { when, held };
+      committing = { when, held, after };
       return held;
     },
     // Fails the first transaction that would commit a state matching `when`.
@@ -306,12 +307,12 @@ function later(hold: () => Held) {
   const reached = new Promise<void>(resolve => { arrive = resolve; });
   return { arm() { held = hold(); void held.reached.then(arrive); }, held: { reached, release: () => held?.release() } };
 }
-// Each await of a run, held: what the worker reaches while the test holds it.
 // Observable steps of the first operation's record, for holding the
 // transaction that saves them.
 const expired = (next: State) => next.operations[0].state === "expired";
 const retrying = (next: State) => next.operations[0].state === "requested" && next.operations[0].nextAttemptAt !== undefined;
 
+// Each await of a run, held: what the worker reaches while the test holds it.
 // `met` is a fault the run met before the stop: work already issued, so the
 // stop does not make it expected, and it is reported once.
 const stopPoints: Record<string, (f: Fixture) => { worker: ReturnType<Fixture["make"]>; held: Held; met?: Error }> = {
@@ -393,17 +394,17 @@ const stopPoints: Record<string, (f: Fixture) => { worker: ReturnType<Fixture["m
     return { worker: f.make(), held };
   },
   "a fault's retry write": f => {
-    const write = later(() => f.holdNextUpdate());
+    const held = f.holdCommit(retrying, true);
     const met = new Error("disconnected");
-    f.hook("a", async () => { write.arm(); throw met; });
-    return { worker: f.make(), held: write.held, met };
+    f.hook("a", async () => { throw met; });
+    return { worker: f.make(), held, met };
   },
   "the expiry's write after a fault": f => {
-    // The classification finds the send deadline passed; the expiry is the transaction after it.
-    const write = later(() => f.holdNextUpdate(1));
+    // The classification finds the send deadline passed; held once the expiry is written.
+    const held = f.holdCommit(expired, true);
     const met = new Error("disconnected");
-    f.hook("a", async () => { f.advance(180_000); write.arm(); throw met; });
-    return { worker: f.make(), held: write.held, met };
+    f.hook("a", async () => { f.advance(180_000); throw met; });
+    return { worker: f.make(), held, met };
   },
 };
 
